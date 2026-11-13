@@ -6,6 +6,50 @@ called out explicitly.
 
 ---
 
+## Locked decisions (2026-11-13)
+
+| Decision | Choice | Rationale |
+| --- | --- | --- |
+| Runtime | **Rust** | Matches the official Grok CLI; strong stdlib for crypto and HTTP; excellent single-binary distribution. |
+| Upstream | **`api.x.ai/v1`** | Full model catalog (`grok-4.7`, `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-*`). The Grok Build proxy exposes one model and renames models to `-build` variants. |
+| Login | **Browser loopback**, `--device` fallback | Best desktop UX; device code covers headless/SSH and needs no port. |
+| OAuth callback port | **Random ephemeral loopback**, independent of the API port | Lets `login` run while the daemon is up and survives a `port` change. |
+| Config format | **TOML** at `~/.config/grokproxy/config.toml` | Same as the official Grok CLI; comment-friendly for `$EDITOR`; no parser dependency beyond one crate. |
+| Daemon model | **Self-contained, PID-file based** | Identical behaviour on macOS and Linux; no root, no install step, no platform branching. |
+| Async runtime | **None** — blocking, thread-per-connection | Keeps the dependency tree small and the SSE proxying code straightforward. |
+
+### Rust toolchain and dependency plan
+
+- **MSRV `1.85`** (the floor for Edition 2024), declared as `rust-version` in
+  `Cargo.toml`. Edition 2024's resolver (`resolver = "3"`) picks dependency
+  versions compatible with the MSRV, which is the main lever for long-term
+  maintainability. No `rust-toolchain.toml` pin — pinning forces a specific
+  download on every contributor and machine.
+- **No nightly.** Stable only.
+
+Planned dependencies (all pure-Rust except where noted):
+
+| Crate | Purpose | Why |
+| --- | --- | --- |
+| `serde`, `serde_json` | JSON | Token + upstream payloads |
+| `toml` | Config file | Comments, stable format |
+| `ureq` | Outbound HTTP | Blocking, rustls, streaming response reader for SSE |
+| `tiny_http` | Inbound HTTP | Blocking, thread-per-connection, supports streamed response bodies |
+| `sha2`, `base64` | PKCE | `SHA256` → base64url no-pad |
+| `rand` | Randomness | `state`, `nonce`, PKCE verifier |
+| `daemonize` | Daemonization | Double-fork, `setsid`, stdio redirect, PID file |
+| `signal-hook` | Signals | Graceful `SIGTERM` shutdown |
+| `nix` | Process control | `kill(pid, 0)` liveness check |
+| `dirs` | Paths | Config directory resolution |
+| `webbrowser` | OAuth | Open the browser at the authorize URL |
+
+Deliberately **excluded**: `tokio`/`async`/`axum`/`reqwest` (heavy tree for a
+tool that is mostly proxying), `keyring` (native dependency; the official CLI
+uses a plain file and so do we), and `clap`'s derive-heavy features (a small
+hand-rolled arg parser is enough for nine subcommands).
+
+---
+
 ## 1. Executive summary
 
 | Question | Answer |

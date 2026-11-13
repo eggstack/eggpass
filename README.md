@@ -9,8 +9,15 @@ can talk to Grok models such as `grok-4.7` and `grok-4.6` without an x.ai API ke
 
 > **Status: research phase.** No implementation code yet. See
 > [`docs/research.md`](docs/research.md) for the technical findings this build
-> is based on, and [`docs/cli-spec.md`](docs/cli-spec.md) for the command
-> surface.
+> is based on — including the
+> [locked decisions](docs/research.md#locked-decisions-2026-11-13) (Rust
+> runtime, `api.x.ai` upstream, browser-loopback OAuth) — and
+> [`docs/cli-spec.md`](docs/cli-spec.md) for the command surface.
+
+## Requirements
+
+- Rust 1.85+ (stable; MSRV-pinned)
+- A Grok subscription account with browser access to `accounts.x.ai`
 
 ## Goal
 
