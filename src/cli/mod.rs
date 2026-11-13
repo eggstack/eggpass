@@ -155,7 +155,11 @@ pub fn run(cli: Cli) -> i32 {
 /// Send the command to its handler.
 fn dispatch(context: &Context) -> Result<(), CommandError> {
     match &context.cli.command {
-        Command::Login { device, provider } => commands::login::login(context, *device, *provider),
+        Command::Login {
+            device,
+            oauth,
+            provider,
+        } => commands::login::login(context, *device, *oauth, *provider),
         Command::Logout { provider } => commands::login::logout(context, *provider),
         Command::Status => commands::status::status(context),
         Command::Run { foreground } => commands::run::run(context, *foreground),

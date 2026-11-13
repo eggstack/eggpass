@@ -18,6 +18,7 @@ use crate::timeutil;
 pub fn login(
     context: &Context,
     device: bool,
+    oauth: bool,
     provider: Option<ProviderId>,
 ) -> Result<(), CommandError> {
     let provider = match provider {
@@ -39,13 +40,26 @@ pub fn login(
         });
     }
 
+    // The device-code flow is the default wherever the provider has one.
+    // It is what the official Grok CLI prefers and what OpenCode registers
+    // for xAI, and it works from any device — no browser on this machine,
+    // and no loopback port. The browser flow stays available, and is used
+    // automatically if the device endpoint is not published.
+    let flow = if oauth {
+        Flow::Browser
+    } else if device || provider_supports_device(context, provider) {
+        Flow::Device
+    } else {
+        Flow::Browser
+    };
+
     let runtime = ProviderRuntime::new(provider, &context.config, &context.paths);
 
     // The host id identifies this installation. It is created on the first
     // sign-in and reused afterwards, so the same registration is kept.
     ensure_host_id(context, provider)?;
 
-    let outcome = login_with_fallback(&runtime, device)?;
+    let outcome = login_with_fallback(&runtime, flow)?;
 
     let path = context.paths.credential_file(provider.as_str());
     store::save(&path, &outcome.auth)
@@ -70,6 +84,15 @@ pub fn login(
     Ok(())
 }
 
+/// Which OAuth flow to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// The device-code grant: the user visits a URL and enters a code.
+    Device,
+    /// The browser loopback flow: the browser is redirected back to us.
+    Browser,
+}
+
 /// Run the login flow, retrying once with the fallback `referrer` and scopes.
 ///
 /// xAI tracks the `referrer` parameter and may one day refuse an unknown
@@ -77,11 +100,16 @@ pub fn login(
 /// safest fallback.
 fn login_with_fallback(
     runtime: &ProviderRuntime,
-    device: bool,
+    flow: Flow,
 ) -> Result<LoginOutcome, CommandError> {
-    let first = attempt(runtime, device);
-    match first {
+    match attempt(runtime, flow) {
         Ok(outcome) => Ok(outcome),
+        // The device endpoint is not published to every client. The official
+        // Grok CLI falls back to the browser in exactly the same way.
+        Err(FlowError::DeviceUnavailable) if flow == Flow::Device => {
+            eprintln!("The device-code flow is unavailable; falling back to the browser login.");
+            attempt(runtime, Flow::Browser).map_err(|err| CommandError::new(err.to_string()))
+        }
         Err(err) if is_retryable(&err) && runtime.spec.id == ProviderId::Xai => {
             eprintln!("The login was refused; retrying with the official client settings.");
             let mut spec = runtime.spec.clone();
@@ -92,27 +120,26 @@ fn login_with_fallback(
                 .map(|scope| scope.to_string())
                 .collect();
             let client = crate::auth::OAuthClient::for_provider(&spec, runtime.client.client_id());
-            attempt_with(&spec, &client, device).map_err(|err| CommandError::new(err.to_string()))
+            attempt_with(&spec, &client, flow).map_err(|err| CommandError::new(err.to_string()))
         }
         Err(err) => Err(CommandError::new(err.to_string())),
     }
 }
 
 /// Run one attempt of the chosen flow.
-fn attempt(runtime: &ProviderRuntime, device: bool) -> Result<LoginOutcome, FlowError> {
-    attempt_with(&runtime.spec, &runtime.client, device)
+fn attempt(runtime: &ProviderRuntime, flow: Flow) -> Result<LoginOutcome, FlowError> {
+    attempt_with(&runtime.spec, &runtime.client, flow)
 }
 
 /// Run one attempt with an explicit spec and client.
 fn attempt_with(
     spec: &crate::provider::ProviderSpec,
     client: &crate::auth::OAuthClient,
-    device: bool,
+    flow: Flow,
 ) -> Result<LoginOutcome, FlowError> {
-    if device {
-        flow::login_device(spec, client)
-    } else {
-        flow::login_loopback(spec, client, None)
+    match flow {
+        Flow::Device => flow::login_device(spec, client),
+        Flow::Browser => flow::login_loopback(spec, client, None),
     }
 }
 

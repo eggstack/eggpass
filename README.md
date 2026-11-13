@@ -40,11 +40,10 @@ eggpass status     # shows the accounts and the server
 
 Point your client at `http://127.0.0.1:8484/v1`.
 
-On a headless machine, or over SSH, use the device-code flow instead:
-
-```sh
-eggpass login --provider xai --device
-```
+The xAI login uses the **device-code flow**: it prints a short code and a URL,
+and you approve it from any device — a phone, another machine, or this one.
+No browser needs to run here, which is also what makes it work over SSH.
+`eggpass login --oauth` uses the browser redirect instead.
 
 Already running the official Grok CLI? Its credentials are picked up
 automatically — `eggpass status` will show you as logged in.
@@ -59,7 +58,8 @@ it introduces itself as Grok Build.
 
 What we *do* control is the `referrer` parameter, which xAI documents as the
 "OAuth usage attribution" value. We send `eggpass`, so the usage is attributed
-to eggpass even though the page says Grok Build. xAI's own CLI sends `user`.
+to eggpass even though the page says Grok Build. xAI's own CLI sends `user`,
+and OpenCode sends `opencode`.
 
 If the page shows a **code to copy** instead of redirecting to your browser's
 callback, paste that code into the terminal and press Enter — the login is

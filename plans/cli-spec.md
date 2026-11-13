@@ -45,10 +45,33 @@ Authenticate with a provider over OAuth.
 ```
 eggpass login              # interactive provider picker, then the login flow
 eggpass login --provider xai   # pick the provider directly, no picker
-eggpass login --device     # x.ai only: device-code flow, for headless / SSH
+eggpass login --device     # x.ai only: device-code flow, the default
+eggpass login --oauth      # x.ai only: browser loopback flow
 ```
 
 **Behaviour**
+
+0. **Which flow.** The **device-code flow is the default** wherever the
+   provider has one, and the browser loopback flow is the fallback.
+
+   This is not a preference. xAI's browser flow for the Grok Build client id
+   lands on a page that says *"Copy the code below into Grok Build to finish
+   signing in"*, which is confusing — and xAI does not publish the
+   device-code endpoint to every client. So:
+
+   - the device flow is tried first, because it works from any device, needs
+     no browser on this machine and no loopback port, and never shows that
+     page;
+   - if the device endpoint answers **404**, the browser flow is used
+     automatically, with a note saying so.
+
+   The official Grok CLI does exactly this — *"auth: device flow unavailable
+   (404), falling back to loopback login"* — and OpenCode registers the
+   device method for xAI and nothing else.
+
+   `--device` asks for the device flow explicitly, `--oauth` for the browser
+   flow, and the two together are a usage error. ChatGPT has no device flow,
+   so it always signs in with the browser.
 
 1. **Choose a provider.** With no provider named — by neither `--provider` nor
    `EGGPASS_PROVIDER` — present an interactive picker over every provider the
@@ -134,7 +157,8 @@ The OAuth callback port is **independent of the API port**. Login works while
 the daemon is running and does not require the daemon to be stopped.
 
 **Exit codes:** `0` success or cancelled · `1` denied/expired/failed ·
-`2` `--device` requested for a provider that has no device flow.
+`2` `--device` requested for a provider that has no device flow, or
+`--device` and `--oauth` given together.
 
 ---
 

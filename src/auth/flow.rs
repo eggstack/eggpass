@@ -41,6 +41,11 @@ pub enum FlowError {
     UntrustedUrl(String),
     /// The provider does not support the requested flow.
     Unsupported(&'static str),
+    /// The provider does not publish a device-code endpoint.
+    ///
+    /// This is not a failure: the caller falls back to the browser flow, the
+    /// same way the official Grok CLI does.
+    DeviceUnavailable,
     /// Something went wrong reading from or writing to the socket.
     Io(String),
 }
@@ -70,6 +75,9 @@ impl std::fmt::Display for FlowError {
             }
             FlowError::Unsupported(what) => {
                 write!(f, "{what} is not supported for this provider")
+            }
+            FlowError::DeviceUnavailable => {
+                write!(f, "the provider does not publish a device-code endpoint")
             }
             FlowError::Io(message) => write!(f, "{message}"),
         }
@@ -209,7 +217,13 @@ pub fn login_device(spec: &ProviderSpec, client: &OAuthClient) -> Result<LoginOu
         return Err(FlowError::Unsupported("the device-code flow"));
     }
 
-    let device = client.request_device_code()?;
+    let device = match client.request_device_code() {
+        Ok(device) => device,
+        // xAI does not publish the device-code endpoint to every client. A
+        // 404 there means "use the browser instead", not "the login failed".
+        Err(AuthError::Http { status: 404, .. }) => return Err(FlowError::DeviceUnavailable),
+        Err(err) => return Err(err.into()),
+    };
 
     if !is_trusted_verification_url(&device.verification_uri, spec.trusted_device_hosts) {
         return Err(FlowError::UntrustedUrl(device.verification_uri));

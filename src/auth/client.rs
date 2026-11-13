@@ -404,7 +404,8 @@ impl OAuthClient {
                 match error.as_str() {
                     "authorization_pending" => Ok(DevicePoll::Pending),
                     "slow_down" => Ok(DevicePoll::SlowDown),
-                    "access_denied" => Ok(DevicePoll::Denied(error)),
+                    // xAI has used both spellings for the same refusal.
+                    "access_denied" | "authorization_denied" => Ok(DevicePoll::Denied(error)),
                     "expired_token" => Ok(DevicePoll::Expired),
                     _ => Err(AuthError::OAuth {
                         error,

@@ -289,6 +289,33 @@ provider returned without checking the host.
 (`login --device`), and also the primary path on a headless box. It is strictly
 more robust than loopback and requires no port.
 
+> **Update (2026-11-13) — device code is now the *default*, not the
+> fallback.** Two references settled this.
+>
+> The **official Grok CLI** prefers it: *"auth: device flow unavailable (404),
+> falling back to loopback login"* — device first, browser as the fallback.
+>
+> **OpenCode**'s xAI provider registers the device method and nothing else.
+> Its startup path migrates every xAI credential whose method is `browser`
+> over to `device`, which is a migration away from the browser flow rather
+> than towards it:
+>
+> ```ts
+> if (credential.value.type !== "oauth" || credential.value.methodID !== browserMethodID) return Effect.void
+> return credentials.update(credential.id, {
+>   value: Credential.OAuth.make({ ...credential.value, methodID: deviceMethodID }),
+> })
+> ```
+>
+> OpenCode also sends `referrer: "opencode"` — the same honest approach as
+> our `referrer: "eggpass"`, and the same public client id.
+>
+> The browser flow is kept, and is used automatically when the device
+> endpoint answers `404`.
+>
+> Verified live: a device-code login completed end to end, producing a full
+> credential with an access token, a refresh token and an id token.
+
 ### 2.6 Refresh
 
 ```

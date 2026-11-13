@@ -16,6 +16,8 @@ pub enum Command {
     Login {
         /// Use the device-code flow rather than the browser.
         device: bool,
+        /// Use the browser flow rather than the device-code flow.
+        oauth: bool,
         /// The provider to sign in with, when it was named.
         provider: Option<ProviderId>,
     },
@@ -187,10 +189,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
     let command = match name.as_str() {
         "login" => {
             let mut device = false;
+            let mut oauth = false;
             let mut local_provider = provider;
             for arg in &rest {
                 match arg.as_str() {
                     "--device" => device = true,
+                    "--oauth" => oauth = true,
                     "--provider" => {
                         return Err(UsageError {
                             message: "`--provider` is a global option; put it before the command"
@@ -207,8 +211,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
                     }
                 }
             }
+            if device && oauth {
+                return Err(UsageError {
+                    message: "`--device` and `--oauth` ask for opposite things; pick one"
+                        .to_string(),
+                });
+            }
             Command::Login {
                 device,
+                oauth,
                 provider: local_provider,
             }
         }
@@ -410,10 +421,12 @@ pub fn global_help() -> String {
 /// Help text for a single command.
 pub fn command_help(name: &str) -> String {
     match name {
-        "login" => "eggpass login [--device]\n\n\
+        "login" => "eggpass login [--device | --oauth]\n\n\
             Authenticate with a provider over OAuth. Without --provider a picker\n\
             lists the providers to choose from.\n\n\
-            --device   Use the device-code flow (x.ai only, for headless machines)\n"
+            --device   Use the device-code flow (x.ai only, for headless machines)\n\
+            --oauth    Use the browser flow (x.ai only, when the device flow is\n\
+                       unavailable or you want the browser redirect)\n"
             .to_string(),
         "logout" => "eggpass logout\n\n\
             Revoke and remove the stored credentials. Without --provider a picker\n\
@@ -461,6 +474,7 @@ mod tests {
             ParseOutcome::Run(Cli {
                 command: Command::Login {
                     device: false,
+                    oauth: false,
                     provider: None
                 },
                 ..
@@ -471,6 +485,7 @@ mod tests {
             ParseOutcome::Run(Cli {
                 command: Command::Login {
                     device: true,
+                    oauth: false,
                     provider: None
                 },
                 ..
@@ -566,6 +581,7 @@ mod tests {
             cli.command,
             Command::Login {
                 device: false,
+                oauth: false,
                 provider: Some(ProviderId::OpenAi)
             }
         );
@@ -580,6 +596,7 @@ mod tests {
             cli.command,
             Command::Login {
                 device: false,
+                oauth: false,
                 provider: Some(ProviderId::Xai)
             }
         );
