@@ -11,13 +11,6 @@ machine — OpenCode, Cline, Continue, the OpenAI SDK, a shell script — can ta
 to Grok and ChatGPT models. No provider API key, no cloud, nothing leaves the
 machine.
 
-```
-┌──────────────┐   OpenAI API    ┌────────────┐   OAuth bearer   ┌──────────────┐
-│ your client  │ ──────────────► │ eggpass    │ ───────────────► │  api.x.ai    │
-│ (OpenCode…)  │  127.0.0.1:8484 │  (daemon)  │                  │  api.openai  │
-└──────────────┘                  └────────────┘                  └──────────────┘
-```
-
 ## Requirements
 
 - Rust **1.89** or newer, to build it
