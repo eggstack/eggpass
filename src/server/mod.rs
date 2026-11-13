@@ -262,10 +262,8 @@ fn presented_keys(request: &Request) -> Vec<String> {
                     }
                 }
             }
-            "x-api-key" => {
-                if !value.is_empty() {
-                    candidates.push(value.to_string());
-                }
+            "x-api-key" if !value.is_empty() => {
+                candidates.push(value.to_string());
             }
             _ => {}
         }

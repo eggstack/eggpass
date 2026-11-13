@@ -757,7 +757,7 @@ impl Config {
                     mapped.push((prefix, id));
                 }
                 // The longest prefix wins, so the order has to be settled.
-                mapped.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+                mapped.sort_by_key(|left| std::cmp::Reverse(left.0.len()));
                 config.routing.prefixes = mapped;
             }
         }
