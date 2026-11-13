@@ -1,33 +1,61 @@
 //! A hand-rolled argument parser.
 //!
-//! Nine subcommands do not justify a parser dependency, so this module does
+//! Ten subcommands do not justify a parser dependency, so this module does
 //! the small amount of work itself: global flags may appear before or after the
 //! subcommand, `--help` works per command, and anything unrecognised is a
 //! usage error.
 
 use std::path::PathBuf;
 
+use crate::provider::ProviderId;
+
 /// The subcommand the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Authenticate with x.ai over OAuth.
-    Login { device: bool, force: bool },
-    /// Remove stored credentials.
-    Logout,
+    /// Authenticate with a provider over OAuth.
+    Login {
+        /// Use the device-code flow rather than the browser.
+        device: bool,
+        /// The provider to sign in with, when it was named.
+        provider: Option<ProviderId>,
+    },
+    /// Revoke and remove stored credentials.
+    Logout {
+        /// The provider to sign out of, when it was named.
+        provider: Option<ProviderId>,
+    },
     /// Report account and daemon state.
     Status,
     /// Start the server as a background daemon.
-    Run { foreground: bool },
+    Run {
+        /// Stay in the foreground instead of detaching.
+        foreground: bool,
+    },
     /// Stop the running daemon.
     Stop,
     /// Stop, then start.
     Restart,
     /// Show or change the listen port.
-    Port { port: Option<u16> },
+    Port {
+        /// The new port, when one was given.
+        port: Option<u16>,
+    },
+    /// Show or change the bind address.
+    Host {
+        /// The new host, when one was given.
+        host: Option<String>,
+    },
     /// Open the configuration file in an editor.
     Edit,
     /// Start the daemon only if it is not already running.
     Croncheck,
+    /// Update to the latest released version.
+    Update {
+        /// An exact version to install instead of the latest one.
+        version: Option<String>,
+        /// Report what would happen without changing anything.
+        check: bool,
+    },
 }
 
 /// A parsed command line.
@@ -77,6 +105,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
     let args: Vec<String> = args.into_iter().collect();
 
     let mut config_path: Option<PathBuf> = None;
+    let mut provider: Option<ProviderId> = None;
     let mut verbose = false;
     let mut subcommand: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
@@ -106,6 +135,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
             }
             other if other.starts_with("--config=") => {
                 config_path = Some(PathBuf::from(&other["--config=".len()..]));
+                index += 1;
+            }
+            "--provider" => {
+                let value = args.get(index + 1).ok_or_else(|| UsageError {
+                    message: "--provider requires a provider id".to_string(),
+                })?;
+                provider = Some(parse_provider(value)?);
+                index += 2;
+            }
+            other if other.starts_with("--provider=") => {
+                provider = Some(parse_provider(&other["--provider=".len()..])?);
                 index += 1;
             }
             other if other.starts_with('-') && other != "-" => {
@@ -147,23 +187,51 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
     let command = match name.as_str() {
         "login" => {
             let mut device = false;
-            let mut force = false;
+            let mut local_provider = provider;
             for arg in &rest {
                 match arg.as_str() {
                     "--device" => device = true,
-                    "--force" => force = true,
+                    "--provider" => {
+                        return Err(UsageError {
+                            message: "`--provider` is a global option; put it before the command"
+                                .to_string(),
+                        });
+                    }
+                    other if other.starts_with("--provider=") => {
+                        local_provider = Some(parse_provider(&other["--provider=".len()..])?);
+                    }
                     other => {
                         return Err(UsageError {
-                            message: format!("unknown option `{other}` for `grokproxy login`"),
+                            message: format!("unknown option `{other}` for `eggpass login`"),
                         });
                     }
                 }
             }
-            Command::Login { device, force }
+            Command::Login {
+                device,
+                provider: local_provider,
+            }
         }
         "logout" => {
-            expect_no_args(&name, &rest)?;
-            Command::Logout
+            for arg in &rest {
+                match arg.as_str() {
+                    "--provider" => {
+                        return Err(UsageError {
+                            message: "`--provider` is a global option; put it before the command"
+                                .to_string(),
+                        });
+                    }
+                    other if other.starts_with("--provider=") => {
+                        provider = Some(parse_provider(&other["--provider=".len()..])?);
+                    }
+                    other => {
+                        return Err(UsageError {
+                            message: format!("unknown option `{other}` for `eggpass logout`"),
+                        });
+                    }
+                }
+            }
+            Command::Logout { provider }
         }
         "status" => {
             expect_no_args(&name, &rest)?;
@@ -176,7 +244,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
                     "--foreground" => foreground = true,
                     other => {
                         return Err(UsageError {
-                            message: format!("unknown option `{other}` for `grokproxy run`"),
+                            message: format!("unknown option `{other}` for `eggpass run`"),
                         });
                     }
                 }
@@ -197,14 +265,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
                 match arg.as_str() {
                     other if other.starts_with('-') => {
                         return Err(UsageError {
-                            message: format!("unknown option `{other}` for `grokproxy port`"),
+                            message: format!("unknown option `{other}` for `eggpass port`"),
                         });
                     }
                     other => {
                         if port.is_some() {
                             return Err(UsageError {
-                                message: "`grokproxy port` takes at most one port number"
-                                    .to_string(),
+                                message: "`eggpass port` takes at most one port number".to_string(),
                             });
                         }
                         port = Some(parse_port(other)?);
@@ -213,6 +280,27 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
             }
             Command::Port { port }
         }
+        "host" => {
+            let mut host = None;
+            for arg in &rest {
+                match arg.as_str() {
+                    other if other.starts_with('-') => {
+                        return Err(UsageError {
+                            message: format!("unknown option `{other}` for `eggpass host`"),
+                        });
+                    }
+                    other => {
+                        if host.is_some() {
+                            return Err(UsageError {
+                                message: "`eggpass host` takes at most one address".to_string(),
+                            });
+                        }
+                        host = Some(other.to_string());
+                    }
+                }
+            }
+            Command::Host { host }
+        }
         "edit" => {
             expect_no_args(&name, &rest)?;
             Command::Edit
@@ -220,6 +308,29 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
         "croncheck" => {
             expect_no_args(&name, &rest)?;
             Command::Croncheck
+        }
+        "update" => {
+            let mut version = None;
+            let mut check = false;
+            for arg in &rest {
+                match arg.as_str() {
+                    "--check" | "--dry-run" => check = true,
+                    other if other.starts_with('-') => {
+                        return Err(UsageError {
+                            message: format!("unknown option `{other}` for `eggpass update`"),
+                        });
+                    }
+                    other => {
+                        if version.is_some() {
+                            return Err(UsageError {
+                                message: "`eggpass update` takes at most one version".to_string(),
+                            });
+                        }
+                        version = Some(other.to_string());
+                    }
+                }
+            }
+            Command::Update { version, check }
         }
         other => {
             return Err(UsageError {
@@ -239,10 +350,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
 fn expect_no_args(name: &str, rest: &[String]) -> Result<(), UsageError> {
     if let Some(extra) = rest.first() {
         return Err(UsageError {
-            message: format!("`grokproxy {name}` takes no arguments (got `{extra}`)"),
+            message: format!("`eggpass {name}` takes no arguments (got `{extra}`)"),
         });
     }
     Ok(())
+}
+
+/// Parse a provider id given on the command line.
+fn parse_provider(value: &str) -> Result<ProviderId, UsageError> {
+    ProviderId::parse(value).ok_or_else(|| UsageError {
+        message: format!("unknown provider `{value}` (expected \"xai\" or \"openai\")"),
+    })
 }
 
 /// Parse a port number given on the command line.
@@ -261,27 +379,30 @@ fn parse_port(value: &str) -> Result<u16, UsageError> {
 /// The top-level help text.
 pub fn global_help() -> String {
     format!(
-        "grokproxy {version} — a local, OpenAI-compatible proxy for Grok\n\
+        "eggpass {version} — a local, OpenAI-compatible proxy for Grok and ChatGPT\n\
          \n\
          USAGE:\n    \
-             grokproxy [OPTIONS] <COMMAND>\n\
+             eggpass [OPTIONS] <COMMAND>\n\
          \n\
          COMMANDS:\n    \
-             login       Authenticate with x.ai over OAuth\n    \
-             logout      Remove stored OAuth credentials\n    \
+             login       Authenticate with a provider over OAuth\n    \
+             logout      Revoke and remove stored credentials\n    \
              status      Show account and daemon state\n    \
              run         Start the server as a background daemon\n    \
              stop        Stop the running daemon\n    \
              restart     Stop the daemon, then start it again\n    \
              port        Show or change the listen port\n    \
+             host        Show or change the bind address\n    \
              edit        Open the config file in your editor\n    \
-             croncheck   Start the daemon only if it is not already running\n\
+             croncheck   Start the daemon only if it is not already running\n    \
+             update      Update to the latest released version\n\
          \n\
          OPTIONS:\n    \
-             --config <path>   Use a different config file\n    \
-             --verbose         Log debug messages\n    \
-             -h, --help        Show this help\n    \
-             -V, --version     Show the version\n",
+             --config <path>     Use a different config file\n    \
+             --provider <id>     Name the provider directly (xai or openai)\n    \
+             --verbose           Log debug messages\n    \
+             -h, --help          Show this help\n    \
+             -V, --version       Show the version\n",
         version = version()
     )
 }
@@ -289,25 +410,36 @@ pub fn global_help() -> String {
 /// Help text for a single command.
 pub fn command_help(name: &str) -> String {
     match name {
-        "login" => "grokproxy login [--device] [--force]\n\n\
-            Authenticate with x.ai over OAuth.\n\n\
-            --device   Use the device-code flow (for headless machines and SSH)\n\
-            --force    Log in again even if credentials already exist\n"
+        "login" => "eggpass login [--device]\n\n\
+            Authenticate with a provider over OAuth. Without --provider a picker\n\
+            lists the providers to choose from.\n\n\
+            --device   Use the device-code flow (x.ai only, for headless machines)\n"
             .to_string(),
-        "logout" => "grokproxy logout\n\nRemove the stored OAuth credentials.\n".to_string(),
-        "status" => "grokproxy status\n\nShow account state and daemon state.\n".to_string(),
-        "run" => "grokproxy run [--foreground]\n\nStart the server as a background daemon.\n\n\
+        "logout" => "eggpass logout\n\n\
+            Revoke and remove the stored credentials. Without --provider a picker\n\
+            lists the providers you are signed in to.\n"
+            .to_string(),
+        "status" => "eggpass status\n\nShow account state and daemon state.\n".to_string(),
+        "run" => "eggpass run [--foreground]\n\nStart the server as a background daemon.\n\n\
             --foreground   Stay in the foreground instead of detaching\n"
             .to_string(),
-        "stop" => "grokproxy stop\n\nStop the running daemon.\n".to_string(),
-        "restart" => "grokproxy restart\n\nStop the daemon, then start it again.\n".to_string(),
-        "port" => "grokproxy port [PORT]\n\nShow the listen port, or change it. A changed port\n\
-            takes effect on the next `grokproxy restart`.\n"
+        "stop" => "eggpass stop\n\nStop the running daemon.\n".to_string(),
+        "restart" => "eggpass restart\n\nStop the daemon, then start it again.\n".to_string(),
+        "port" => "eggpass port [PORT]\n\nShow the listen port, or change it. A changed port is\n\
+            applied and the server is restarted for you.\n"
             .to_string(),
-        "edit" => "grokproxy edit\n\nOpen the config file in $EDITOR.\n".to_string(),
+        "host" => "eggpass host [ADDRESS]\n\nShow the bind address, or change it. A changed address is\n\
+            applied and the server is restarted for you. Loopback is the default.\n"
+            .to_string(),
+        "edit" => "eggpass edit\n\nOpen the config file in $EDITOR.\n".to_string(),
         "croncheck" => {
-            "grokproxy croncheck\n\nStart the daemon only if it is not already running.\n\
+            "eggpass croncheck\n\nStart the daemon only if it is not already running.\n\
             Safe to use from a crontab; prints nothing.\n"
+                .to_string()
+        }
+        "update" => {
+            "eggpass update [VERSION]\n\nUpdate to the latest released version, or to one exact\n            version. A running server keeps the old binary until it is restarted.\n\n\
+             \x20           --check   Report what would happen, change nothing\n"
                 .to_string()
         }
         other => format!("unknown command `{other}`\n"),
@@ -329,17 +461,17 @@ mod tests {
             ParseOutcome::Run(Cli {
                 command: Command::Login {
                     device: false,
-                    force: false
+                    provider: None
                 },
                 ..
             })
         ));
         assert!(matches!(
-            parse_args(&["login", "--device", "--force"]).unwrap(),
+            parse_args(&["login", "--device"]).unwrap(),
             ParseOutcome::Run(Cli {
                 command: Command::Login {
                     device: true,
-                    force: true
+                    provider: None
                 },
                 ..
             })
@@ -347,7 +479,7 @@ mod tests {
         assert!(matches!(
             parse_args(&["logout"]).unwrap(),
             ParseOutcome::Run(Cli {
-                command: Command::Logout,
+                command: Command::Logout { provider: None },
                 ..
             })
         ));
@@ -394,6 +526,22 @@ mod tests {
             })
         ));
         assert!(matches!(
+            parse_args(&["host"]).unwrap(),
+            ParseOutcome::Run(Cli {
+                command: Command::Host { host: None },
+                ..
+            })
+        ));
+        let ParseOutcome::Run(cli) = parse_args(&["host", "0.0.0.0"]).unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Host {
+                host: Some("0.0.0.0".to_string())
+            }
+        );
+        assert!(matches!(
             parse_args(&["edit"]).unwrap(),
             ParseOutcome::Run(Cli {
                 command: Command::Edit,
@@ -407,6 +555,39 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_provider_can_be_named_globally() {
+        let ParseOutcome::Run(cli) = parse_args(&["--provider", "openai", "login"]).unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Login {
+                device: false,
+                provider: Some(ProviderId::OpenAi)
+            }
+        );
+    }
+
+    #[test]
+    fn the_provider_can_be_named_with_an_equals_sign() {
+        let ParseOutcome::Run(cli) = parse_args(&["login", "--provider=xai"]).unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Login {
+                device: false,
+                provider: Some(ProviderId::Xai)
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_is_a_usage_error() {
+        assert!(parse_args(&["--provider", "nope", "login"]).is_err());
     }
 
     #[test]

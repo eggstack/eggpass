@@ -9,14 +9,19 @@ use std::io::Read;
 use super::Response;
 
 /// Forward a streaming response without buffering it.
-pub fn stream(body: Box<dyn Read + Send + 'static>, content_type: &str) -> Response {
-    Response::stream(
-        200,
-        vec![
-            ("Content-Type".to_string(), content_type.to_string()),
-            ("Cache-Control".to_string(), "no-cache".to_string()),
-            ("X-Accel-Buffering".to_string(), "no".to_string()),
-        ],
-        body,
-    )
+pub fn stream(
+    mut headers: Vec<(String, String)>,
+    body: Box<dyn Read + Send + 'static>,
+) -> Response {
+    // The content type has to be the event stream, whatever the upstream
+    // called it.
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
+    headers.push((
+        "Content-Type".to_string(),
+        "text/event-stream; charset=utf-8".to_string(),
+    ));
+    headers.push(("Cache-Control".to_string(), "no-cache".to_string()));
+    headers.push(("X-Accel-Buffering".to_string(), "no".to_string()));
+
+    Response::stream(200, headers, body)
 }

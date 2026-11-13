@@ -12,8 +12,10 @@ behaviour it implements is specified in [`cli-spec.md`](cli-spec.md).
 
 ## Ground rules
 
-- **Rust stable only.** `rust-version = "1.85"`, `edition = "2024"`. No
+- **Rust stable only.** `rust-version = "1.89"`, `edition = "2024"`. No
   `rust-toolchain.toml` pin. No nightly features.
+  *(Raised from 1.85 when the updater adopted `eggup`'s crate family, which
+  requires 1.89.)*
 - **No async runtime.** Blocking, thread-per-connection. This keeps the
   dependency tree small and SSE proxying straightforward.
 - **Secrets never logged.** Token values are redacted everywhere, including
@@ -26,34 +28,50 @@ behaviour it implements is specified in [`cli-spec.md`](cli-spec.md).
 
 ## Module layout
 
+The layout as it stands after the eggpass work. The original eight-phase
+layout is marked; everything else was added by the multi-provider phase.
+
 ```
 src/
 ├── main.rs              # arg parsing + dispatch
 ├── cli/
 │   ├── mod.rs           # subcommand dispatch, shared output helpers
 │   ├── args.rs          # hand-rolled parser (no clap)
+│   ├── prompt.rs        # the interactive provider picker (crossterm)
 │   └── commands/
 │       ├── mod.rs
 │       ├── login.rs     # login / logout
 │       ├── status.rs    # status
 │       ├── run.rs       # run / stop / restart / croncheck
+│       ├── address.rs   # the shared port/host apply-and-restart machinery
 │       ├── port.rs      # port
+│       ├── host.rs      # host
+│       ├── update.rs    # update
 │       └── edit.rs      # edit
 ├── config.rs            # Config struct, TOML load/save, defaults
-├── paths.rs             # config dir, auth file, pid file, log file
+├── paths.rs             # config dir, credential files, pid file, log file
+├── migrate.rs           # the ~/.config/grokproxy → ~/.config/eggpass migration
+├── update.rs            # the updater's policy; the mechanics are eggup's
+├── provider/
+│   ├── mod.rs           # ProviderId, ProviderSpec, RequestPolicy, routing
+│   ├── xai.rs           # x.ai's constants and spec
+│   └── openai.rs        # ChatGPT's SIWC constants and spec
 ├── auth/
 │   ├── mod.rs
 │   ├── pkce.rs          # verifier + S256 challenge
-│   ├── client.rs        # authorize URL, token exchange, refresh, device code
+│   ├── client.rs        # authorize URL, token exchange, refresh, revoke
 │   ├── flow.rs          # loopback browser flow, device-code flow
-│   ├── store.rs         # auth.json read/write (atomic, 0600)
+│   ├── store.rs         # per-provider credential files (atomic, 0600)
 │   └── refresh.rs       # proactive refresh with skew + rotation handling
-├── upstream.rs          # api.x.ai and cli-chat-proxy clients, header rules
+├── upstream.rs          # the outbound HTTP client and header rules
 ├── server/
 │   ├── mod.rs           # listener, thread-per-connection, shutdown
+│   ├── http.rs          # the HTTP/1.1 server
 │   ├── router.rs        # path normalisation and matching
 │   ├── chat.rs          # /v1/chat/completions, /v1/responses
-│   ├── models.rs        # /v1/models, /v1/models/{id}
+│   ├── translate.rs     # Chat Completions ↔ Responses, for ChatGPT
+│   ├── aggregator.rs    # the Responses SSE stream → one answer
+│   ├── models.rs        # /v1/models, /v1/models/{id} — live
 │   ├── health.rs        # /health
 │   └── sse.rs           # streaming passthrough
 ├── daemon.rs            # daemonize, PID file, liveness, stop
@@ -69,7 +87,6 @@ src/
 | `serde` + `serde_json` | JSON | `derive` feature |
 | `toml` | Config file | Serialize + deserialize |
 | `ureq` | Outbound HTTP | rustls, streaming response reader for SSE |
-| `tiny_http` | Inbound HTTP | thread-per-connection, streamed response bodies |
 | `sha2` | PKCE challenge | `Sha256` |
 | `base64` | base64url | `URL_SAFE_NO_PAD` engine |
 | `rand` | Randomness | `state`, `nonce`, PKCE verifier |
@@ -78,11 +95,17 @@ src/
 | `nix` | Process control | `kill(pid, 0)` liveness, signal sending |
 | `dirs` | Paths | config directory resolution |
 | `webbrowser` | OAuth | open the authorize URL |
+| `crossterm` | The picker | raw mode, arrow/j/k keys; the family precedent |
+| `eggup-core` | Updater | the transaction, the ownership verifier, the validators |
+| `eggup-acquisition` | Updater | fetching the manifest and the artifact |
+| `eggup-eggpack` | Updater | projecting a release manifest for a target |
+| `eggup-eggfetch` | Updater | the production transport |
 
-Dev-dependencies: `tempfile` (credential-store tests), `httptest` or
-`wiremock` (upstream stubbing). Prefer `httptest` — fewer dependencies.
+Dev-dependencies: `tempfile` (credential-store tests). The stub upstream is
+written directly against a socket in `src/server/tests.rs`.
 
-Deliberately excluded: `tokio`/`async`/`axum`/`reqwest`, `keyring`, `clap`.
+Deliberately excluded: `tokio`/`async`/`axum`/`reqwest`, `keyring`, `clap`,
+`tiny_http`, `httptest`, `wiremock`.
 
 ---
 
@@ -372,10 +395,10 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
 
 > **Update (2026-11-13).** `port` was built as described below — config-only,
 > no implicit restart — and `host` did not exist. Both are **superseded** by
-> the design in [Part 3.8.1 of `plan-eggpass.md`](plan-eggpass.md#381-the-address-commands),
-> which is Phase 1 of that plan. The text below is kept as the record of what
-> was originally specified and what shipped; the superseded behaviour is the
-> "never restart implicitly" rule, which the new `port`/`host` replace.
+> the design in [Part 3.8.1 of `plan-eggpass.md`](plan-eggpass.md#381-the-address-commands).
+> The text below is kept as the record of what was originally specified and
+> what shipped first; the superseded behaviour is the "never restart implicitly"
+> rule, which the new `port`/`host` replace.
 
 **Work**
 
@@ -399,6 +422,12 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
   old port until `restart`.
 - `port 70000` is rejected with a clear message and exit `1`.
 - `edit` opens the right editor and reports a syntax error without losing it.
+
+> **As shipped.** `port` and `host` now validate, compare against the pid
+> file, probe the address, then stop → write → start, with a rollback. The
+> "never restart implicitly" rule above is **no longer the behaviour**: it is
+> superseded. The live verification is in
+> [`shipped-2026-11-13.md`](shipped-2026-11-13.md).
 
 ---
 
@@ -470,7 +499,7 @@ to go smoothly, so they come after the risky unknowns are retired.
 ## Definition of done
 
 - All nine commands behave exactly as `cli-spec.md` describes — and the tenth,
-  `host`, once Phase 1 of [`plan-eggpass.md`](plan-eggpass.md) lands.
+  `host`, plus the eleventh, `update`.
 - `eggpass login && eggpass run` yields a working OpenAI-compatible
   endpoint serving `grok-4.7` / `grok-4.6`.
 - `eggpass croncheck` is safe as a 5-minute crontab entry.
@@ -484,6 +513,10 @@ to go smoothly, so they come after the risky unknowns are retired.
 
 All eight phases are implemented, committed and verified. The notes below
 record the places where the build did not match this plan, and why.
+
+The multi-provider phase — the rename, the provider layer, the ChatGPT SIWC
+path, the picker, the address commands and the updater — is recorded
+separately in [`shipped-2026-11-13.md`](shipped-2026-11-13.md).
 
 ### Open risk #1 is resolved
 
@@ -517,9 +550,13 @@ Development: `tempfile`.
 
 That is the plan's table minus `tiny_http`, with nothing added.
 
+*As of the multi-provider phase the runtime list also carries `crossterm` (the
+picker) and the four `eggup` crates (the updater's mechanics). The full list
+is in [`shipped-2026-11-13.md`](shipped-2026-11-13.md).*
+
 ### Verification
 
-- `cargo test` — 87 tests, no network.
+- `cargo test` — 139 tests, no network.
 - `cargo clippy --all-targets -- -D warnings` — clean.
 - `cargo fmt --all -- --check` — clean.
 - `scripts/verify-live.sh` — passes end to end against the real x.ai:

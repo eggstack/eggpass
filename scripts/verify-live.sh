@@ -11,24 +11,24 @@
 #   scripts/verify-live.sh --skip-login # reuse the credentials already stored
 #
 # Everything runs against a throwaway configuration directory, so your real
-# ~/.config/grokproxy is left alone.
+# ~/.config/eggpass is left alone.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/target/release/grokproxy"
-PORT="${GROKPROXY_VERIFY_PORT:-8485}"
+BIN="$ROOT/target/release/eggpass"
+PORT="${EGGPASS_VERIFY_PORT:-8485}"
 SKIP_LOGIN=0
 KEEP_HOME=0
 
-if [ -n "${GROKPROXY_HOME:-}" ]; then
+if [ -n "${EGGPASS_HOME:-}" ]; then
     # Reuse the caller's configuration directory instead of a throwaway one.
-    WORK="$GROKPROXY_HOME"
+    WORK="$EGGPASS_HOME"
     KEEP_HOME=1
 else
-    WORK="$(mktemp -d "${TMPDIR:-/tmp}/grokproxy-verify.XXXXXX")"
+    WORK="$(mktemp -d "${TMPDIR:-/tmp}/eggpass-verify.XXXXXX")"
 fi
-export GROKPROXY_HOME="$WORK"
+export EGGPASS_HOME="$WORK"
 
 for argument in "$@"; do
     case "$argument" in

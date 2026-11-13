@@ -118,7 +118,7 @@ impl TokenSet {
     }
 }
 
-/// Account details, as far as we need them for `grokproxy status`.
+/// Account details, as far as we need them for `eggpass status`.
 #[derive(Debug, Clone, Default)]
 pub struct UserInfo {
     /// The provider's identifier for the account.
@@ -159,31 +159,63 @@ pub enum DevicePoll {
     Complete(TokenSet),
 }
 
-/// A client for the x.ai OAuth endpoints.
+/// A client for one provider's OAuth endpoints.
+///
+/// The endpoints, scopes and extra parameters all come from a
+/// [`ProviderSpec`](crate::provider::ProviderSpec), so this client works for
+/// x.ai and for Sign in with ChatGPT without a branch on the provider.
 #[derive(Debug, Clone)]
 pub struct OAuthClient {
     client_id: String,
     issuer: String,
     scopes: Vec<String>,
-    referrer: String,
+    referrer: Option<String>,
+    authorize_path: String,
+    token_path: String,
+    device_path: Option<String>,
+    userinfo_path: Option<String>,
+    extra_authorize: Vec<(String, String)>,
+    registration_params: Vec<(String, String)>,
+    extra_token: Vec<(String, String)>,
     agent: ureq::Agent,
 }
 
 impl OAuthClient {
-    /// Build a client for the given issuer, client id and scopes.
-    pub fn new(client_id: &str, issuer: &str, scopes: &[&str], referrer: &str) -> OAuthClient {
+    /// Build a client for a provider.
+    ///
+    /// `client_id` is the id to present: the provider's fixed public id, or
+    /// the id it issued on an earlier registration.
+    pub fn for_provider(spec: &crate::provider::ProviderSpec, client_id: &str) -> OAuthClient {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(180)))
-            .user_agent(format!("grokproxy/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("eggpass/{}", env!("CARGO_PKG_VERSION")))
             .build();
+
+        let referrer = spec
+            .extra_authorize_params
+            .iter()
+            .find(|(name, _)| name == "referrer")
+            .map(|(_, value)| value.clone());
 
         OAuthClient {
             client_id: client_id.to_string(),
-            issuer: issuer.trim_end_matches('/').to_string(),
-            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
-            referrer: referrer.to_string(),
+            issuer: spec.issuer.trim_end_matches('/').to_string(),
+            scopes: spec.scopes.clone(),
+            referrer,
+            authorize_path: spec.authorize_path.clone(),
+            token_path: spec.token_path.clone(),
+            device_path: spec.device_path.clone(),
+            userinfo_path: spec.userinfo_path.clone(),
+            extra_authorize: spec
+                .extra_authorize_params
+                .iter()
+                .filter(|(name, _)| name != "referrer")
+                .cloned()
+                .collect(),
+            registration_params: spec.registration_params.clone(),
+            extra_token: spec.extra_token_params.clone(),
             agent: ureq::Agent::new_with_config(config),
         }
     }
@@ -205,34 +237,39 @@ impl OAuthClient {
 
     /// The authorization endpoint.
     pub fn authorize_endpoint(&self) -> String {
-        format!("{}/oauth2/authorize", self.issuer)
+        format!("{}{}", self.issuer, self.authorize_path)
     }
 
     /// The token endpoint.
     pub fn token_endpoint(&self) -> String {
-        format!("{}/oauth2/token", self.issuer)
+        format!("{}{}", self.issuer, self.token_path)
     }
 
     /// The device authorization endpoint.
-    pub fn device_endpoint(&self) -> String {
-        format!("{}/oauth2/device/code", self.issuer)
+    pub fn device_endpoint(&self) -> Option<String> {
+        self.device_path
+            .as_ref()
+            .map(|path| format!("{}{}", self.issuer, path))
     }
 
     /// The userinfo endpoint.
-    pub fn userinfo_endpoint(&self) -> String {
-        format!("{}/oauth2/userinfo", self.issuer)
+    pub fn userinfo_endpoint(&self) -> Option<String> {
+        self.userinfo_path
+            .as_ref()
+            .map(|path| format!("{}{}", self.issuer, path))
     }
-
-    /// Build the URL the user's browser is sent to.
-    pub fn authorize_url(
+    /// Build the URL the user's browser is sent to, with extra parameters.
+    pub fn authorize_url_with(
         &self,
         redirect_uri: &str,
         code_challenge: &str,
         state: &str,
         nonce: &str,
+        registration: bool,
+        extra: &[(String, String)],
     ) -> String {
         let scope = self.scope_string();
-        let params: Vec<(&str, &str)> = vec![
+        let mut params: Vec<(&str, &str)> = vec![
             ("response_type", "code"),
             ("client_id", &self.client_id),
             ("redirect_uri", redirect_uri),
@@ -241,41 +278,57 @@ impl OAuthClient {
             ("code_challenge_method", "S256"),
             ("state", state),
             ("nonce", nonce),
-            ("referrer", &self.referrer),
         ];
+        if let Some(referrer) = &self.referrer {
+            params.push(("referrer", referrer));
+        }
+        if registration {
+            for (name, value) in &self.registration_params {
+                params.push((name.as_str(), value.as_str()));
+            }
+        }
+        for (name, value) in &self.extra_authorize {
+            params.push((name.as_str(), value.as_str()));
+        }
+        for (name, value) in extra {
+            params.push((name.as_str(), value.as_str()));
+        }
         format!("{}?{}", self.authorize_endpoint(), encode_query(&params))
     }
-
-    /// Exchange an authorization code for tokens.
-    ///
-    /// `code_challenge_method` is deliberately *not* sent: it is not part of
-    /// RFC 6749 and the verifier alone is what the server needs.
-    pub fn exchange_code(
+    pub fn exchange_code_as(
         &self,
         code: &str,
         redirect_uri: &str,
         code_verifier: &str,
+        client_id: &str,
     ) -> Result<TokenSet, AuthError> {
-        let params: Vec<(&str, &str)> = vec![
+        let mut params: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", redirect_uri),
-            ("client_id", &self.client_id),
+            ("client_id", client_id),
             ("code_verifier", code_verifier),
         ];
+        for (name, value) in &self.extra_token {
+            params.push((name.as_str(), value.as_str()));
+        }
         let value = self.post_form(&self.token_endpoint(), &params)?;
         TokenSet::from_json(&value, timeutil::now_unix())
     }
 
     /// Ask for a device code.
     pub fn request_device_code(&self) -> Result<DeviceCode, AuthError> {
+        let Some(endpoint) = self.device_endpoint() else {
+            return Err(AuthError::InvalidResponse(
+                "this provider has no device-code flow".into(),
+            ));
+        };
         let scope = self.scope_string();
-        let params: Vec<(&str, &str)> = vec![
-            ("client_id", &self.client_id),
-            ("scope", &scope),
-            ("referrer", &self.referrer),
-        ];
-        let value = self.post_form(&self.device_endpoint(), &params)?;
+        let mut params: Vec<(&str, &str)> = vec![("client_id", &self.client_id), ("scope", &scope)];
+        if let Some(referrer) = &self.referrer {
+            params.push(("referrer", referrer));
+        }
+        let value = self.post_form(&endpoint, &params)?;
 
         let device_code = value
             .get("device_code")
@@ -368,23 +421,59 @@ impl OAuthClient {
             }
         }
     }
-
-    /// Exchange a refresh token for a new set of tokens.
-    pub fn refresh(&self, refresh_token: &str) -> Result<TokenSet, AuthError> {
-        let params: Vec<(&str, &str)> = vec![
+    pub fn refresh_as(&self, refresh_token: &str, client_id: &str) -> Result<TokenSet, AuthError> {
+        let mut params: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", &self.client_id),
+            ("client_id", client_id),
         ];
+        for (name, value) in &self.extra_token {
+            params.push((name.as_str(), value.as_str()));
+        }
         let value = self.post_form(&self.token_endpoint(), &params)?;
         TokenSet::from_json(&value, timeutil::now_unix())
     }
 
-    /// Fetch the account details behind an access token.
-    pub fn userinfo(&self, access_token: &str) -> Result<UserInfo, AuthError> {
+    /// Revoke a token at the provider.
+    ///
+    /// Revocation is best-effort: the caller deletes the local credential
+    /// either way, and a token that could not be revoked simply lapses.
+    pub fn revoke(&self, endpoint: &str, token: &str, client_id: &str) -> Result<(), AuthError> {
+        let params: Vec<(&str, &str)> = vec![
+            ("token", token),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", client_id),
+        ];
+        let body = encode_query(&params);
         let response = self
             .agent
-            .get(&self.userinfo_endpoint())
+            .post(endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send(body)
+            .map_err(|err| AuthError::Network(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        let mut response_body = response.into_body();
+        let bytes = response_body
+            .read_to_vec()
+            .map_err(|err| AuthError::Network(err.to_string()))?;
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        Err(AuthError::Http { status, body: text })
+    }
+
+    /// Fetch the account details behind an access token.
+    pub fn userinfo(&self, access_token: &str) -> Result<UserInfo, AuthError> {
+        let Some(endpoint) = self.userinfo_endpoint() else {
+            return Err(AuthError::InvalidResponse(
+                "this provider has no userinfo endpoint".into(),
+            ));
+        };
+        let response = self
+            .agent
+            .get(&endpoint)
             .header("Authorization", format!("Bearer {access_token}"))
             .call();
 
@@ -490,10 +579,10 @@ impl RawResponse {
 /// Read the first present string field from a JSON object.
 fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
-        if let Some(text) = value.get(*key).and_then(Value::as_str) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.get(*key).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
         }
     }
     None
@@ -549,6 +638,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// An x.ai client pointing at a stub issuer, for the tests that need one.
+    fn xai_client(client_id: &str) -> OAuthClient {
+        let mut config = crate::config::Config::default();
+        config.oauth.xai.issuer = "https://auth.x.ai".to_string();
+        config.oauth.xai.scopes = vec!["openid".to_string(), "api:access".to_string()];
+        let spec = crate::provider::spec_for(crate::provider::ProviderId::Xai, &config);
+        OAuthClient::for_provider(&spec, client_id)
+    }
+
+    /// A client pointing at a local stub server.
+    fn stub_client(issuer: &str) -> OAuthClient {
+        let mut config = crate::config::Config::default();
+        config.oauth.xai.issuer = issuer.to_string();
+        config.oauth.xai.scopes = vec!["openid".to_string()];
+        let spec = crate::provider::spec_for(crate::provider::ProviderId::Xai, &config);
+        OAuthClient::for_provider(&spec, "client")
+    }
+
     #[test]
     fn token_sets_are_read_from_the_response() {
         let value = json!({
@@ -582,17 +689,14 @@ mod tests {
 
     #[test]
     fn the_authorize_url_has_the_expected_shape() {
-        let client = OAuthClient::new(
-            "client-id",
-            "https://auth.x.ai",
-            &["openid", "api:access"],
-            "grokproxy",
-        );
-        let url = client.authorize_url(
+        let client = xai_client("client-id");
+        let url = client.authorize_url_with(
             "http://127.0.0.1:1234/callback",
             "challenge",
             "state",
             "nonce",
+            false,
+            &[],
         );
         assert!(
             url.starts_with("https://auth.x.ai/oauth2/authorize?"),
@@ -601,11 +705,60 @@ mod tests {
         assert!(url.contains("response_type=code"), "{url}");
         assert!(url.contains("code_challenge_method=S256"), "{url}");
         assert!(url.contains("scope=openid%20api%3Aaccess"), "{url}");
-        assert!(url.contains("referrer=grokproxy"), "{url}");
+        assert!(url.contains("referrer=eggpass"), "{url}");
         assert!(
             url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1234%2Fcallback"),
             "{url}"
         );
+    }
+
+    #[test]
+    fn the_sign_in_with_chatgpt_url_carries_the_registration_parameters() {
+        let config = crate::config::Config::default();
+        let spec = crate::provider::spec_for(crate::provider::ProviderId::OpenAi, &config);
+        let client = OAuthClient::for_provider(&spec, crate::provider::openai::ENTRY_CLIENT_ID);
+
+        // A first registration carries the agent name hint.
+        let url = client.authorize_url_with(
+            "http://127.0.0.1:54321/auth/callback",
+            "challenge",
+            "state",
+            "nonce",
+            true,
+            &[],
+        );
+        assert!(
+            url.starts_with("https://auth.openai.com/api/accounts/authorize?"),
+            "{url}"
+        );
+        assert!(url.contains("client_id=dynamic_agent_client"), "{url}");
+        assert!(
+            url.contains("resource=https%3A%2F%2Fapi.openai.com%2Fv1"),
+            "{url}"
+        );
+        assert!(url.contains("agent_name_hint=eggpass"), "{url}");
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Fauth%2Fcallback"),
+            "{url}"
+        );
+    }
+
+    #[test]
+    fn the_registration_parameters_are_left_out_of_a_reauthorization() {
+        let config = crate::config::Config::default();
+        let spec = crate::provider::spec_for(crate::provider::ProviderId::OpenAi, &config);
+        let client = OAuthClient::for_provider(&spec, "oaiapp_issued");
+
+        let url = client.authorize_url_with(
+            "http://127.0.0.1:54321/auth/callback",
+            "challenge",
+            "state",
+            "nonce",
+            false,
+            &[],
+        );
+        assert!(url.contains("client_id=oaiapp_issued"), "{url}");
+        assert!(!url.contains("agent_name_hint"), "{url}");
     }
 
     #[test]
@@ -640,12 +793,7 @@ mod tests {
             }
         });
 
-        let client = OAuthClient::new(
-            "client",
-            &format!("http://127.0.0.1:{port}"),
-            &["openid"],
-            "grokproxy",
-        );
+        let client = stub_client(&format!("http://127.0.0.1:{port}"));
         let poll = client
             .poll_device_code("device-code")
             .expect("the poll answers");

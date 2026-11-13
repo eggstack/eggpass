@@ -1,6 +1,6 @@
 //! Small time helpers.
 //!
-//! `grokproxy` deliberately avoids a date/time crate: the only things it needs
+//! `eggpass` deliberately avoids a date/time crate: the only things it needs
 //! are "now" in unix seconds, converting an RFC 3339 timestamp (the format the
 //! official Grok CLI writes) into unix seconds, and printing a log timestamp.
 
@@ -81,7 +81,7 @@ pub fn format_rfc3339(unix: i64) -> String {
     )
 }
 
-/// Render a duration the way `grokproxy status` shows it.
+/// Render a duration the way `eggpass status` shows it.
 pub fn humanize_duration(seconds: i64) -> String {
     let seconds = seconds.max(0);
     let hours = seconds / 3_600;

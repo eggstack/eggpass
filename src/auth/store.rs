@@ -1,6 +1,6 @@
 //! The credential store.
 //!
-//! Credentials live in `~/.config/grokproxy/auth.json`, inside a directory with
+//! Credentials live in `~/.config/eggpass/auth.json`, inside a directory with
 //! mode `0700`, in a file with mode `0600`, written atomically so that a
 //! crash mid-write can never leave a half-written token behind.
 //!
@@ -55,7 +55,7 @@ pub struct StoredAuth {
     /// The token type, normally `Bearer`.
     #[serde(default = "default_token_type")]
     pub token_type: String,
-    /// The scopes the token was granted.
+    /// The scopes the token was granted, space separated.
     #[serde(default)]
     pub scope: Option<String>,
     /// The client id the token belongs to.
@@ -76,6 +76,15 @@ pub struct StoredAuth {
     /// The account's email address.
     #[serde(default)]
     pub email: Option<String>,
+    /// The stable identifier for this installation.
+    ///
+    /// Only Sign in with ChatGPT uses it, and it has to survive a re-login
+    /// so that the same registration is reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_agent_host_id: Option<String>,
+    /// Whether the token may spend the user's ChatGPT plan.
+    #[serde(default)]
+    pub plan_enabled: bool,
 }
 
 fn default_token_type() -> String {
@@ -96,7 +105,20 @@ impl StoredAuth {
         now + skew < self.effective_expires_at()
     }
 
-    /// A short description of the account for `grokproxy status`.
+    /// The scopes the token was granted.
+    pub fn scopes(&self) -> Vec<String> {
+        self.scope
+            .as_deref()
+            .map(|scope| scope.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether a scope was granted.
+    pub fn has_scope(&self, wanted: &str) -> bool {
+        self.scopes().iter().any(|scope| scope == wanted)
+    }
+
+    /// A short description of the account for `eggpass status`.
     pub fn account_label(&self) -> String {
         self.email
             .clone()
@@ -266,6 +288,8 @@ pub fn import_grok_cli(path: &Path) -> Result<Option<StoredAuth>, StoreError> {
             .and_then(Value::as_str)
             .filter(|email| !email.is_empty())
             .map(str::to_string),
+        ext_agent_host_id: None,
+        plan_enabled: false,
     }))
 }
 
@@ -366,6 +390,8 @@ mod tests {
             obtained_at: 0,
             user_id: Some("user".to_string()),
             email: Some("a@b.c".to_string()),
+            ext_agent_host_id: None,
+            plan_enabled: false,
         }
     }
 

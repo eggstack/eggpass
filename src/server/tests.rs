@@ -7,8 +7,10 @@
 //! The stub is written directly against a socket rather than with an HTTP
 //! library, so the tests do not depend on our own server being correct.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,9 +19,10 @@ use serde_json::json;
 use crate::auth::client::OAuthClient;
 use crate::auth::refresh::TokenManager;
 use crate::auth::store::StoredAuth;
-use crate::config::Upstream;
+use crate::config::Routing;
 use crate::paths::Paths;
-use crate::server::{Server, ServerContext};
+use crate::provider::{CatalogueKind, NativePaths, ProviderId, ProviderSpec, RequestPolicy};
+use crate::server::{ProviderHandle, Server, ServerContext};
 use crate::timeutil;
 use crate::upstream::UpstreamClient;
 
@@ -173,7 +176,7 @@ fn serve_stub(
             body,
         } => {
             let head = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nX-Ratelimit-Remaining: 42\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(head.as_bytes())?;
@@ -185,7 +188,7 @@ fn serve_stub(
             chunks,
         } => {
             let head = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nX-Ratelimit-Remaining: 42\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(head.as_bytes())?;
             stream.flush()?;
@@ -216,6 +219,36 @@ impl Harness {
     }
 }
 
+/// The x.ai provider, pointed at the stub upstream.
+///
+/// The spec is written out here rather than derived from the configuration, so
+/// the test exercises the proxy rather than the configuration loader.
+fn stub_spec(stub: &Stub) -> ProviderSpec {
+    ProviderSpec {
+        id: ProviderId::Xai,
+        display_name: "x.ai",
+        issuer: stub.base_url(),
+        authorize_path: "/oauth2/authorize".to_string(),
+        token_path: "/oauth2/token".to_string(),
+        device_path: Some("/oauth2/device/code".to_string()),
+        userinfo_path: Some("/oauth2/userinfo".to_string()),
+        revocation_path: Some("/oauth2/revoke".to_string()),
+        callback_path: "/callback",
+        entry_client_id: "client".to_string(),
+        scopes: vec!["openid".to_string(), "api:access".to_string()],
+        extra_authorize_params: Vec::new(),
+        registration_params: Vec::new(),
+        extra_token_params: Vec::new(),
+        base_url: stub.base_url(),
+        extra_headers: Vec::new(),
+        policy: RequestPolicy::default(),
+        supports_device_flow: true,
+        trusted_device_hosts: &["auth.x.ai"],
+        catalogue: CatalogueKind::DataArray,
+        native_paths: NativePaths::Both,
+    }
+}
+
 /// Start a proxy in front of a stub upstream.
 ///
 /// The stub upstream is also the OAuth issuer, so a refresh can be exercised
@@ -224,6 +257,8 @@ fn harness(stub: &Stub, api_key: &str, access_token: &str) -> Harness {
     let directory = tempfile::tempdir().expect("temp dir");
     let paths = Paths::in_directory(directory.path());
     paths.ensure_dir().expect("config dir");
+
+    let spec = stub_spec(stub);
 
     let now = timeutil::now_unix();
     let auth = StoredAuth {
@@ -238,42 +273,37 @@ fn harness(stub: &Stub, api_key: &str, access_token: &str) -> Harness {
         obtained_at: now,
         user_id: Some("user-1".to_string()),
         email: Some("user@example.com".to_string()),
+        ext_agent_host_id: None,
+        plan_enabled: false,
     };
-    crate::auth::store::save(&paths.auth_file(), &auth).expect("credentials are written");
+    crate::auth::store::save(&paths.credential_file("xai"), &auth)
+        .expect("credentials are written");
 
-    let upstream = UpstreamClient::with_base_url(Upstream::Api, &stub.base_url());
+    let upstream = UpstreamClient::new(&spec);
+    let client = OAuthClient::for_provider(&spec, "client");
+    let tokens = TokenManager::new(paths.credential_file("xai"), client);
 
-    // The OAuth client is built from the configuration file, so the tests
-    // cover the configuration path as well as the code path.
-    let config_path = paths.config_file().to_path_buf();
-    std::fs::write(
-        &config_path,
-        format!(
-            "port = 8484\n[oauth]\nclient_id = \"client\"\nissuer = \"{}\"\nscopes = \"openid api:access\"\nreferrer = \"grokproxy\"\n",
-            stub.base_url()
-        ),
-    )
-    .expect("the config file is written");
-    let config = crate::config::Config::load(&config_path).expect("the config file parses");
-    assert_eq!(config.oauth.issuer, stub.base_url());
-
-    let tokens = TokenManager::new(
-        paths.clone(),
-        OAuthClient::new(
-            &config.oauth.client_id,
-            &config.oauth.issuer,
-            &config.scope_references(),
-            &config.oauth.referrer,
-        ),
+    let mut providers = HashMap::new();
+    providers.insert(
+        ProviderId::Xai,
+        ProviderHandle {
+            spec: spec.clone(),
+            upstream,
+            tokens,
+        },
     );
 
     let context = Arc::new(ServerContext {
         api_key: api_key.to_string(),
-        upstream,
-        tokens,
+        providers,
+        default_provider: ProviderId::Xai,
+        routing: Routing::default(),
+        upstream_in_flight: Arc::new(AtomicUsize::new(0)),
+        max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
     });
 
-    let server = Server::bind(0).expect("proxy binds");
+    let server = Server::bind_with_limits("127.0.0.1", 0, crate::config::ServerLimits::default())
+        .expect("proxy binds");
     let port = server.address().port();
     let running = Arc::clone(&server);
     std::thread::spawn(move || running.serve(context));
@@ -380,12 +410,15 @@ fn a_streaming_response_arrives_incrementally() {
         .send(json!({"model": "grok-4.7", "messages": [], "stream": true}).to_string())
         .expect("the proxy answers");
     assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "the content type was {content_type:?}"
     );
 
     let mut reader = response.into_body().into_reader();
@@ -551,7 +584,7 @@ fn the_key_query_parameter_is_not_forwarded() {
 }
 
 #[test]
-fn the_model_list_is_merged_with_the_known_models() {
+fn the_model_list_comes_from_the_upstream() {
     let stub = Stub::start(|request| {
         if request.path == "/v1/models" {
             Reply::json(
@@ -577,23 +610,38 @@ fn the_model_list_is_merged_with_the_known_models() {
         .map(|model| model["id"].as_str().expect("model id"))
         .collect();
 
-    assert!(ids.contains(&"grok-4.7"), "{ids:?}");
-    assert!(ids.contains(&"grok-4.6"), "{ids:?}");
+    // The catalogue is exactly what the provider advertises. There is no
+    // compiled-in list of model names to pad it with.
+    assert_eq!(ids, vec!["grok-4.7"]);
 }
 
 #[test]
-fn a_single_model_is_answered_even_when_the_upstream_does_not_know_it() {
-    let stub = Stub::start(|_| Reply::json(404, r#"{"error":{"message":"not found"}}"#));
+fn a_model_the_upstream_does_not_advertise_is_a_404() {
+    let stub = Stub::start(|request| {
+        if request.path == "/v1/models" {
+            Reply::json(
+                200,
+                r#"{"object":"list","data":[{"id":"grok-4.7","object":"model"}]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
     let harness = harness(&stub, "", "grok-token");
 
     let response = agent()
-        .get(harness.url("/v1/models/grok-4.7"))
+        .get(harness.url("/v1/models/grok-9.9"))
         .call()
         .expect("the proxy answers");
-    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.status().as_u16(), 404);
     let body = read_json_body(response);
-    assert_eq!(body["id"], "grok-4.7");
-    assert_eq!(body["object"], "model");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("grok-9.9")
+    );
 }
 
 #[test]
@@ -637,4 +685,57 @@ fn keep_alive_connections_serve_more_than_one_request() {
     }
 
     assert_eq!(stub.requests().len(), 3);
+}
+
+#[test]
+fn the_upstream_headers_reach_a_streaming_client() {
+    // A streaming client used to see nothing but the event stream: the
+    // upstream's rate-limit headers were thrown away, so the budget was
+    // invisible to exactly the clients that were streaming.
+    let stub = Stub::start(|_| Reply::Stream {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![(Duration::from_millis(0), "data: [DONE]\n\n".to_string())],
+    });
+    let harness = harness(&stub, "", "grok-token");
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .send(json!({"model": "grok-4.7", "messages": [], "stream": true}).to_string())
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok()),
+        Some("42"),
+        "the upstream's rate-limit header did not reach the client"
+    );
+}
+
+#[test]
+fn a_client_cannot_inject_the_provider_owned_headers() {
+    // The Grok Build headers describe the client the proxy speaks for. A
+    // client that set them must not be able to make the proxy claim to be
+    // some other build.
+    let stub = Stub::start(|_| Reply::json(200, r#"{"ok":true}"#));
+    let harness = harness(&stub, "", "grok-token");
+
+    agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .header("X-XAI-Token-Auth", "spoofed")
+        .header("x-grok-client-version", "9.9.9")
+        .header("x-grok-client-identifier", "not-eggpass")
+        .send(chat_body().to_string())
+        .expect("the proxy answers");
+
+    let requests = stub.requests();
+    let upstream = requests.first().expect("the upstream saw the request");
+    assert_eq!(upstream.header("X-XAI-Token-Auth"), None);
+    assert_eq!(upstream.header("x-grok-client-version"), None);
+    assert_eq!(upstream.header("x-grok-client-identifier"), None);
 }

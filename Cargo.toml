@@ -1,9 +1,9 @@
 [package]
-name = "grokproxy"
+name = "eggpass"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "A lightweight, local, OpenAI-compatible proxy for Grok models using x.ai OAuth"
+rust-version = "1.89"
+description = "A lightweight, local, OpenAI-compatible proxy for Grok and ChatGPT using OAuth"
 license = "MIT"
 readme = "README.md"
 keywords = ["grok", "xai", "openai", "proxy", "oauth"]
@@ -11,8 +11,26 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 base64 = "0.23.1"
+crossterm = "0.29"
 daemonize = "0.5.0"
 dirs = "7.0.0"
+# Self-update mechanics. Acquisition, transport, release-manifest projection,
+# digest binding, staging, locking, and rollback are owned by the published
+# Eggup crates rather than reimplemented here.
+#
+# `eggup-eggfetch` is the production transport: `eggup-curl` is smaller, but
+# `CurlConfig` has no User-Agent seam and the adapter clears the child
+# environment, so every request goes out as `curl/x.y` and the release host
+# answers 403. A transport that cannot reach the version authority is not
+# qualified, however small it is.
+#
+# `eggup-eggpack` reads an Eggpack `ReleaseManifest` v1. Its `project_json`
+# takes the manifest as bytes, so `eggpack-manifest` is not a direct
+# dependency and no version pin has to be mirrored here.
+eggup-acquisition = "0.2.0"
+eggup-core = "0.2.0"
+eggup-eggpack = "0.2.0"
+eggup-eggfetch = "0.2.0"
 nix = { version = "0.31.3", features = ["signal", "process"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }

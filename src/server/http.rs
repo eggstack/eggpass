@@ -1,6 +1,6 @@
 //! A minimal HTTP/1.1 server.
 //!
-//! `grokproxy` used `tiny_http`, but its response writer wraps the socket in a
+//! `eggpass` used `tiny_http`, but its response writer wraps the socket in a
 //! one-kilobyte `BufWriter` that is only flushed when the response ends. That
 //! is fine for ordinary responses and fatal for server-sent events: a
 //! streaming client would receive the tokens in one-kilobyte bursts, and the
@@ -12,14 +12,26 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// The largest request head we accept.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 
 /// The largest request body we accept.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// How long in-flight requests are given to finish during shutdown.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a kept-alive connection may sit idle before it is closed.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a single write may stall before the connection is dropped.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How many connections may be handled at once.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 /// A parsed request.
 #[derive(Debug, Clone)]
@@ -116,13 +128,43 @@ impl Response {
 /// The HTTP server.
 pub struct HttpServer {
     listener: TcpListener,
+    /// The number of connections currently being handled.
+    ///
+    /// The count is decremented only after the response body has been written,
+    /// so a streaming answer still counts as in flight while it is going out.
+    active: Arc<AtomicUsize>,
+    /// The largest number of simultaneous connections.
+    max_connections: usize,
+    /// How long a kept-alive connection may sit idle.
+    idle_timeout: Duration,
+    /// How long a single write may stall.
+    write_timeout: Duration,
 }
 
 impl HttpServer {
     /// Bind to an address.
     pub fn bind(address: &str) -> std::io::Result<HttpServer> {
         let listener = TcpListener::bind(address)?;
-        Ok(HttpServer { listener })
+        Ok(HttpServer {
+            listener,
+            active: Arc::new(AtomicUsize::new(0)),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+        })
+    }
+
+    /// Set the limits the server works within.
+    pub fn with_limits(
+        mut self,
+        max_connections: usize,
+        idle_timeout: Duration,
+        write_timeout: Duration,
+    ) -> HttpServer {
+        self.max_connections = max_connections.max(1);
+        self.idle_timeout = idle_timeout;
+        self.write_timeout = write_timeout;
+        self
     }
 
     /// The address the server listens on.
@@ -132,7 +174,9 @@ impl HttpServer {
 
     /// Accept connections until the shutdown flag is set.
     ///
-    /// Each connection is handled on its own thread.
+    /// Each connection is handled on its own thread. When the server is asked
+    /// to stop, the in-flight connections are given the grace window to
+    /// finish before this returns.
     pub fn serve(
         self: Arc<Self>,
         shutdown: Arc<AtomicBool>,
@@ -160,29 +204,77 @@ impl HttpServer {
             let Ok(stream) = stream else {
                 continue;
             };
+
+            // The cap keeps the thread count bounded. A connection over the
+            // limit is refused rather than queued.
+            if self.active.load(Ordering::SeqCst) >= self.max_connections {
+                let _ = refuse(stream);
+                continue;
+            }
+
+            self.active.fetch_add(1, Ordering::SeqCst);
             let handler = Arc::clone(&handler);
+            let active = Arc::clone(&self.active);
+            let idle_timeout = self.idle_timeout;
+            let write_timeout = self.write_timeout;
             std::thread::spawn(move || {
-                let _ = handle_connection(stream, handler);
+                let _ = handle_connection(stream, handler, idle_timeout, write_timeout);
+                // The count drops only now: the response body has been
+                // written, so a stream that was cut short by a shutdown was
+                // still counted as in flight.
+                active.fetch_sub(1, Ordering::SeqCst);
             });
         }
+
+        // Let the in-flight connections finish, but not forever.
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while self.active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
+}
+
+/// Refuse a connection that is over the limit.
+fn refuse(mut stream: TcpStream) -> std::io::Result<()> {
+    let body = r#"{"error":{"message":"too many connections","type":"server_error","code":null}}"#;
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\n\
+         Server: eggpass\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    let _ = stream.flush();
+    Ok(())
 }
 
 /// Handle one connection, serving requests until it is closed.
 fn handle_connection(
     stream: TcpStream,
     handler: Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>,
+    idle_timeout: Duration,
+    write_timeout: Duration,
 ) -> std::io::Result<()> {
     // Small responses should go out immediately.
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(write_timeout));
 
     let mut reader = SocketReader::new(stream.try_clone()?);
     let mut writer = stream;
 
     loop {
+        // A kept-alive connection may sit idle for a while; when it does, it
+        // is closed rather than holding a thread forever.
+        let _ = writer.set_read_timeout(Some(idle_timeout));
+
         let request = match read_request(&mut reader, &mut writer) {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
+            Err(err) if is_idle_timeout(&err) => return Ok(()),
             Err(_) => return Ok(()),
         };
 
@@ -194,6 +286,14 @@ fn handle_connection(
             return Ok(());
         }
     }
+}
+
+/// Whether an error is the idle timeout firing.
+fn is_idle_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::InvalidInput
+    )
 }
 
 /// A buffered reader over a socket.
@@ -465,7 +565,7 @@ fn write_response(
         response.status,
         reason_phrase(response.status)
     );
-    head.push_str("Server: grokproxy\r\n");
+    head.push_str("Server: eggpass\r\n");
     head.push_str(&format!("Date: {}\r\n", http_date()));
     head.push_str(if keep_alive {
         "Connection: keep-alive\r\n"

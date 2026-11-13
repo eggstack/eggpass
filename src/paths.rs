@@ -1,11 +1,11 @@
-//! Filesystem locations used by `grokproxy`.
+//! Filesystem locations used by `eggpass`.
 //!
 //! Resolution order for the configuration directory:
 //!
-//! 1. `$GROKPROXY_HOME` when set — relocates *every* file (config, credentials,
+//! 1. `$EGGPASS_HOME` when set — relocates *every* file (config, credentials,
 //!    pid, log). Useful for tests and for running a second instance.
-//! 2. `$XDG_CONFIG_HOME/grokproxy` when set.
-//! 3. `~/.config/grokproxy`.
+//! 2. `$XDG_CONFIG_HOME/eggpass` when set.
+//! 3. `~/.config/eggpass`.
 //!
 //! The `--config <path>` flag overrides only the configuration *file*; the
 //! credential, pid and log files stay in the resolved directory.
@@ -14,12 +14,18 @@ use std::path::{Path, PathBuf};
 
 /// Name of the user-editable configuration file.
 pub const CONFIG_FILE_NAME: &str = "config.toml";
-/// Name of the OAuth credential store.
-pub const AUTH_FILE_NAME: &str = "auth.json";
 /// Name of the daemon pid file.
-pub const PID_FILE_NAME: &str = "grokproxy.pid";
+pub const PID_FILE_NAME: &str = "eggpass.pid";
 /// Name of the daemon log file.
-pub const LOG_FILE_NAME: &str = "grokproxy.log";
+pub const LOG_FILE_NAME: &str = "eggpass.log";
+/// Name of the directory holding the per-provider credential files.
+pub const CREDENTIALS_DIR_NAME: &str = "credentials";
+/// The legacy single-provider credential file, kept for the migration.
+pub const LEGACY_AUTH_FILE_NAME: &str = "auth.json";
+/// The name this project had before the rename.
+pub const LEGACY_DIR_NAME: &str = "grokproxy";
+/// The marker left behind in the legacy directory after a migration.
+pub const MIGRATION_MARKER_NAME: &str = "migrated-to-eggpass";
 
 /// Directory holding the official Grok Build CLI's credential file.
 pub const GROK_CLI_DIR: &str = ".grok";
@@ -43,7 +49,7 @@ impl std::fmt::Display for PathError {
         match self {
             PathError::NoHomeDirectory => write!(
                 f,
-                "cannot determine the home directory; set $GROKPROXY_HOME or $XDG_CONFIG_HOME"
+                "cannot determine the home directory; set $EGGPASS_HOME or $XDG_CONFIG_HOME"
             ),
             PathError::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
@@ -52,7 +58,7 @@ impl std::fmt::Display for PathError {
 
 impl std::error::Error for PathError {}
 
-/// The set of files `grokproxy` reads and writes.
+/// The set of files `eggpass` reads and writes.
 #[derive(Debug, Clone)]
 pub struct Paths {
     dir: PathBuf,
@@ -80,14 +86,24 @@ impl Paths {
         Paths { dir, config_file }
     }
 
+    /// The configuration directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The configuration file (`config.toml`).
     pub fn config_file(&self) -> &Path {
         &self.config_file
     }
 
-    /// The OAuth credential store (`auth.json`).
-    pub fn auth_file(&self) -> PathBuf {
-        self.dir.join(AUTH_FILE_NAME)
+    /// The directory holding the per-provider credential files.
+    pub fn credentials_dir(&self) -> PathBuf {
+        self.dir.join(CREDENTIALS_DIR_NAME)
+    }
+
+    /// The credential file for one provider (`credentials/<provider>.json`).
+    pub fn credential_file(&self, provider: &str) -> PathBuf {
+        self.credentials_dir().join(format!("{provider}.json"))
     }
 
     /// The daemon pid file.
@@ -103,6 +119,16 @@ impl Paths {
     /// The official Grok Build CLI's credential file, used as an import source.
     pub fn grok_cli_auth_file(&self) -> Option<PathBuf> {
         dirs::home_dir().map(|home| home.join(GROK_CLI_DIR).join(GROK_CLI_AUTH_FILE_NAME))
+    }
+
+    /// The directory this project used before the rename.
+    ///
+    /// Only consulted when it sits next to the resolved directory, so a
+    /// relocated installation (`$EGGPASS_HOME`) never drags in an unrelated
+    /// legacy directory.
+    pub fn legacy_dir(&self) -> Option<PathBuf> {
+        let legacy = self.dir.parent()?.join(LEGACY_DIR_NAME);
+        if legacy.is_dir() { Some(legacy) } else { None }
     }
 
     /// Create the configuration directory if needed and force its mode to `0700`.
@@ -137,14 +163,14 @@ pub fn restrict_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
 
 /// Determine the configuration directory from the environment.
 fn resolve_dir() -> Result<PathBuf, PathError> {
-    if let Some(value) = non_empty_env("GROKPROXY_HOME") {
+    if let Some(value) = non_empty_env("EGGPASS_HOME") {
         return Ok(PathBuf::from(value));
     }
     if let Some(value) = non_empty_env("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(value).join("grokproxy"));
+        return Ok(PathBuf::from(value).join("eggpass"));
     }
     let home = dirs::home_dir().ok_or(PathError::NoHomeDirectory)?;
-    Ok(home.join(".config").join("grokproxy"))
+    Ok(home.join(".config").join("eggpass"))
 }
 
 /// Read an environment variable, treating an empty value as unset.
@@ -160,29 +186,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grokproxy_home_wins_over_xdg() {
+    fn eggpass_home_wins_over_xdg() {
         // SAFETY: single-threaded test with no other threads touching the env.
         unsafe {
-            std::env::set_var("GROKPROXY_HOME", "/tmp/grokproxy-test-home");
-            std::env::set_var("XDG_CONFIG_HOME", "/tmp/grokproxy-test-xdg");
+            std::env::set_var("EGGPASS_HOME", "/tmp/eggpass-test-home");
+            std::env::set_var("XDG_CONFIG_HOME", "/tmp/eggpass-test-xdg");
         }
         let paths = Paths::resolve(None).unwrap();
         assert_eq!(
-            paths.auth_file(),
-            Path::new("/tmp/grokproxy-test-home/auth.json")
+            paths.credential_file("xai"),
+            Path::new("/tmp/eggpass-test-home/credentials/xai.json")
         );
         assert_eq!(
             paths.config_file(),
-            Path::new("/tmp/grokproxy-test-home/config.toml")
+            Path::new("/tmp/eggpass-test-home/config.toml")
         );
 
         unsafe {
-            std::env::remove_var("GROKPROXY_HOME");
+            std::env::remove_var("EGGPASS_HOME");
         }
         let paths = Paths::resolve(None).unwrap();
         assert_eq!(
-            paths.auth_file(),
-            Path::new("/tmp/grokproxy-test-xdg/grokproxy/auth.json")
+            paths.credential_file("xai"),
+            Path::new("/tmp/eggpass-test-xdg/eggpass/credentials/xai.json")
         );
 
         unsafe {
@@ -193,20 +219,34 @@ mod tests {
     #[test]
     fn config_override_only_moves_the_config_file() {
         unsafe {
-            std::env::set_var("GROKPROXY_HOME", "/tmp/grokproxy-test-home");
+            std::env::set_var("EGGPASS_HOME", "/tmp/eggpass-test-home");
         }
         let paths = Paths::resolve(Some(Path::new("/tmp/elsewhere/custom.toml"))).unwrap();
         assert_eq!(paths.config_file(), Path::new("/tmp/elsewhere/custom.toml"));
         assert_eq!(
-            paths.auth_file(),
-            Path::new("/tmp/grokproxy-test-home/auth.json")
+            paths.credential_file("xai"),
+            Path::new("/tmp/eggpass-test-home/credentials/xai.json")
         );
         assert_eq!(
             paths.pid_file(),
-            Path::new("/tmp/grokproxy-test-home/grokproxy.pid")
+            Path::new("/tmp/eggpass-test-home/eggpass.pid")
         );
         unsafe {
-            std::env::remove_var("GROKPROXY_HOME");
+            std::env::remove_var("EGGPASS_HOME");
         }
+    }
+
+    #[test]
+    fn the_legacy_directory_is_only_found_beside_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_DIR_NAME);
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let paths = Paths::in_directory(dir.path().join("eggpass"));
+        assert_eq!(paths.legacy_dir(), Some(legacy));
+
+        // A relocated installation has no sibling to migrate from.
+        let elsewhere = Paths::in_directory("/tmp/eggpass-somewhere-else");
+        assert_eq!(elsewhere.legacy_dir(), None);
     }
 }

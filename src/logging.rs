@@ -62,10 +62,10 @@ pub fn init(path: Option<&Path>, level: LogLevel, verbose: bool, stderr: bool) {
     };
 
     let file = path.and_then(|path| {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
         }
         OpenOptions::new().create(true).append(true).open(path).ok()
     });
@@ -94,11 +94,11 @@ pub fn log(level: Level, message: &str) {
         message
     );
 
-    if let Ok(mut file) = logger.file.lock() {
-        if let Some(file) = file.as_mut() {
-            let _ = file.write_all(line.as_bytes());
-            let _ = file.flush();
-        }
+    if let Ok(mut file) = logger.file.lock()
+        && let Some(file) = file.as_mut()
+    {
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
     }
 
     if logger.stderr {

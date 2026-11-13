@@ -1,18 +1,25 @@
-//! `grokproxy run`, `stop`, `restart` and `croncheck`.
+//! `eggpass run`, `stop`, `restart` and `croncheck`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::auth::OAuthClient;
 use crate::cli::{CommandError, Context};
 use crate::daemon::{self, DaemonState, SpawnOutcome};
-use crate::server::{Server, ServerContext};
-use crate::upstream::UpstreamClient;
+use crate::provider::{ProviderId, ProviderRuntime};
+use crate::server::{ProviderHandle, Server, ServerContext};
 
 /// Start the server as a background daemon.
 pub fn run(context: &Context, foreground: bool) -> Result<(), CommandError> {
-    match daemon::state(&context.paths.pid_file(), context.config.port) {
-        DaemonState::Running { pid, port } => {
-            println!("Already running (pid {pid}) at http://127.0.0.1:{port}/v1");
+    match daemon::state(
+        &context.paths.pid_file(),
+        &context.config.host,
+        context.config.port,
+    ) {
+        DaemonState::Running { pid, host, port } => {
+            println!(
+                "Already running (pid {pid}) at http://{}:{port}/v1",
+                daemon::probe_host(&host)
+            );
             return Ok(());
         }
         DaemonState::Stale { pid } => {
@@ -34,7 +41,7 @@ pub fn run(context: &Context, foreground: bool) -> Result<(), CommandError> {
 /// Stop the running daemon.
 pub fn stop(context: &Context) -> Result<(), CommandError> {
     let pid_file = context.paths.pid_file();
-    match daemon::state(&pid_file, context.config.port) {
+    match daemon::state(&pid_file, &context.config.host, context.config.port) {
         DaemonState::Stopped => {
             println!("Not running.");
         }
@@ -68,7 +75,7 @@ pub fn restart(context: &Context) -> Result<(), CommandError> {
 /// that happens goes into the log file.
 pub fn croncheck(context: &Context) -> Result<(), CommandError> {
     let pid_file = context.paths.pid_file();
-    let state = daemon::state(&pid_file, context.config.port);
+    let state = daemon::state(&pid_file, &context.config.host, context.config.port);
     if state.is_running() {
         crate::logging::debug("croncheck: the daemon is already running");
         return Ok(());
@@ -101,14 +108,19 @@ fn start_daemon(context: &Context, quiet: bool) -> Result<(), CommandError> {
             });
         }
         SpawnOutcome::Parent => {
-            if daemon::wait_for_health(context.config.port, daemon::START_TIMEOUT) {
+            if daemon::wait_for_health(
+                &context.config.host,
+                context.config.port,
+                daemon::START_TIMEOUT,
+            ) {
                 let info = daemon::read_info(&context.paths.pid_file());
                 if !quiet {
                     if let Some(info) = info {
-                        println!("grokproxy is running (pid {}).", info.pid);
+                        println!("eggpass is running (pid {}).", info.pid);
                     }
                     println!(
-                        "Point your client at http://127.0.0.1:{}/v1",
+                        "Point your client at http://{}:{}/v1",
+                        daemon::probe_host(&context.config.host),
                         context.config.port
                     );
                 }
@@ -118,7 +130,7 @@ fn start_daemon(context: &Context, quiet: bool) -> Result<(), CommandError> {
                 crate::logging::error("the daemon did not answer /health in time");
                 if !quiet {
                     eprintln!(
-                        "grokproxy did not start within {} seconds.",
+                        "eggpass did not start within {} seconds.",
                         daemon::START_TIMEOUT.as_secs()
                     );
                     if !tail.is_empty() {
@@ -133,37 +145,60 @@ fn start_daemon(context: &Context, quiet: bool) -> Result<(), CommandError> {
 
 /// Run the server in this process.
 fn serve(context: &Context) -> Result<(), CommandError> {
-    let server =
-        Server::bind(context.config.port).map_err(|err| CommandError::new(err.to_string()))?;
+    let server = Server::bind_with_limits(
+        &context.config.host,
+        context.config.port,
+        context.config.server,
+    )
+    .map_err(|err| CommandError::new(err.to_string()))?;
 
-    let upstream = UpstreamClient::new(context.config.upstream);
-    let tokens = crate::auth::TokenManager::new(
-        context.paths.clone(),
-        OAuthClient::new(
-            &context.config.oauth.client_id,
-            &context.config.oauth.issuer,
-            &context.config.scope_references(),
-            &context.config.oauth.referrer,
-        ),
-    );
+    // Every enabled provider gets a handle. A provider we are not signed in
+    // to is still registered: it simply answers 401 when it is used.
+    let mut providers: HashMap<ProviderId, ProviderHandle> = HashMap::new();
+    for id in ProviderId::all() {
+        if !context.config.providers.get(id).enabled {
+            continue;
+        }
+        let runtime = ProviderRuntime::new(id, &context.config, &context.paths);
+        let upstream =
+            crate::upstream::UpstreamClient::with_timeouts(&runtime.spec, context.config.timeouts);
+        providers.insert(
+            id,
+            ProviderHandle {
+                spec: runtime.spec,
+                upstream,
+                tokens: runtime.tokens,
+            },
+        );
+    }
+
+    let default_provider = context
+        .config
+        .routing
+        .default_provider
+        .unwrap_or(ProviderId::Xai);
 
     let server_context = Arc::new(ServerContext {
         api_key: context.config.api_key.clone(),
-        upstream,
-        tokens,
+        providers,
+        default_provider,
+        routing: context.config.routing.clone(),
+        upstream_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
     });
 
     daemon::write_info(
         &context.paths.pid_file(),
         std::process::id() as i32,
+        &context.config.host,
         context.config.port,
     )
     .map_err(|err| CommandError::new(err.to_string()))?;
 
     crate::logging::info(&format!(
-        "listening on http://{} (upstream {})",
+        "listening on http://{} ({} provider(s) configured)",
         server.address(),
-        context.config.upstream.base_url()
+        server_context.providers.len()
     ));
 
     server.clone().serve(server_context);

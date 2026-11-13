@@ -1,6 +1,12 @@
 # Plan: `eggpass` — a multi-provider AI proxy
 
-Date: 2026-11-13. Planning only — no code changed.
+Date: 2026-11-13.
+
+> **Status: implemented.** This document was written as a plan; the plan has
+> been built. Part 10 records what shipped, where it diverged from what is
+> written here, and the two things that still need a human. The outcome is
+> also recorded in [`shipped-2026-11-13.md`](shipped-2026-11-13.md), and the
+> command-by-command contract is in [`cli-spec.md`](cli-spec.md).
 
 `eggpass` is a local, OpenAI-compatible proxy that authenticates against
 several AI providers with their own subscription OAuth credentials and serves
@@ -20,6 +26,7 @@ ecosystem.
 | [7](#part-7--the-interactive-provider-picker) | **The interactive provider picker** |
 | [8](#part-8--packaging-and-updates-eggpack--eggup) | **Packaging and updates: eggpack / eggup** |
 | [9](#part-9--relationship-to-eggpool) | **Relationship to eggpool** |
+| [10](#part-10--what-shipped) | **What shipped** |
 
 ### Decisions settled
 
@@ -981,6 +988,10 @@ and `eggpass host` must use the same technique (Part 3.8.1).
 
 Each phase is independently shippable and independently testable.
 
+> **Status: all shipped.** Phases 0–6 and 7's header forwarding are built and
+> verified; Phase 7's optional `GET /v1/usage` was deliberately not built.
+> See [Part 10](#part-10--what-shipped).
+
 ### Phase 0 — Harden the current server (no behaviour change for users)
 
 - **H1** Track in-flight connections; join connection threads during the grace
@@ -1528,12 +1539,19 @@ protected, and it is worth a line in the release notes when it happens.
 
 ### 8.6 The `eggpass update` command
 
+> **Update (2026-11-13).** The reference implementation for this command is
+> **`cargo-cleanme`**, not eggpool. eggpool's `update` command is non-standard
+> for the family because eggpool was originally a Python project distributed
+> through pip — its `update` exists to cover the move to Rust, not as the
+> house pattern. cargo-cleanme is the standard-shaped consumer, and it is what
+> this command follows.
+
 New command, matching the family:
 
 ```
 eggpass update              # latest catalogued release, same owner
 eggpass update 0.2.0       # exact historical-version switch (also the rollback)
-eggpass install-provenance  # show the update authority
+eggpass update --check      # report what would happen; change nothing
 ```
 
 Behaviour:
@@ -1547,6 +1565,14 @@ Behaviour:
   restart`, which the user already knows about. An implicit restart during an
   update would cut live streams — see the SIGTERM truncation issue in Part 1.
 - Rollback is the same command with the older version.
+
+> **As shipped.** The `install-provenance` subcommand was **not** built: the
+> provenance that matters is the one that decides whether a mutation is
+> allowed, and `eggpass update --check` prints it as the `owner:` line.
+> `cargo install`-managed binaries are refused with the `cargo install`
+> command to run instead, and an unprovable installation is refused rather
+> than guessed. The full behaviour is in
+> [`cli-spec.md`](cli-spec.md#eggpass-update).
 
 ### 8.7 What this means for the CI we already have
 
@@ -1684,3 +1710,66 @@ building eggpass's OAuth layer on its own terms.
 | `eggreplay` | A semantic interaction recorder/replayer and regression engine. Also potentially valuable for replaying recorded upstream responses in tests. |
 | `eggplan` | A repo planning work-order engine. Possibly relevant to how the eggstack family structures planning work — worth a look when formalising our own plan documents. |
 | `gregg`, `snip-it` | The family's TUI references. `snip-it` uses `ratatui` + `crossterm`, which is the precedent for our provider picker (Part 7.3). |
+
+---
+
+## Part 10 — What shipped
+
+The plan above has been built. This part records how the build went, so the
+plan and the outcome can be read against each other.
+
+The full record — every phase, every deviation, the live verification
+evidence and the two outstanding human steps — is in
+[`shipped-2026-11-13.md`](shipped-2026-11-13.md). This part is the summary
+and the delta.
+
+### Every phase landed
+
+| Phase | Status | Notes |
+| --- | --- | --- |
+| 0 — Harden the server (H1–H5) | Shipped | H1–H5 all implemented; the limits became real through the new `[server]` and `[timeouts]` config tables. |
+| 1 — `port` and `host` | Shipped | Both apply and restart. The shared machinery is `src/cli/commands/address.rs`. |
+| 2 — Model catalogue | Shipped | The static list is **gone**. `GET /v1/models` is a live round trip; unknown ids are `404`. |
+| 3 — The provider layer | Shipped | `src/provider/{mod,xai,openai}.rs`; per-provider credential files; per-provider refresh mutexes. |
+| 4 — ChatGPT SIWC | Shipped | Dynamic registration, the issued client id persisted, `ext_agent_host_id` persisted, revocation on logout. |
+| 5 — ChatGPT inference | Shipped | The Responses API on the public endpoint, the stream aggregator, the merged catalogue. |
+| 6 — Chat Completions translation | Shipped | `src/server/translate.rs`. |
+| 7 — Usage and limits | **Partly shipped** | Upstream headers reach streaming clients. `GET /v1/usage` was **not** implemented — optional in the plan, and the upstream contract could not be verified. |
+| 6.2 — The rename | Shipped | The crate, the binary, `EGGPASS_HOME`, the pid file, the log file, and the config directory. |
+| 7 — The picker | Shipped | `crossterm`, with the numbered-list fallback. |
+| 8 — Packaging and updates | Shipped | The updater's **policy** is ours; the mechanics are `eggup`'s. |
+
+### The delta from the plan
+
+| Plan said | Shipped | Why |
+| --- | --- | --- |
+| MSRV 1.85 | **1.89** | `eggup`'s crate family requires it. |
+| A bespoke updater | `eggup`'s published crates | There is no `eggup` crate — the family is `eggup-core`, `eggup-acquisition`, `eggup-eggfetch`, `eggup-curl`, `eggup-archive`, `eggup-eggpack`. Their mechanics are better than ours would have been. |
+| `eggpool`'s `update` as the model | **cargo-cleanme** | eggpool's `update` covers a Python-to-Rust move, not the family pattern. cargo-cleanme is the standard-shaped consumer. |
+| `eggup-curl` was an option | `eggup-eggfetch` | `CurlConfig` has no User-Agent seam and the adapter clears the child environment, so the release host answers 403. |
+| `ExistingAsOwnedVerifier` proves ownership | `LiveDigestVerifier` | The former asserts from configuration; the latter proves it by hashing the destination under `eggup`'s lock and requiring the pre-transaction digest. |
+| `eggpass install-provenance` | **Not built** | The provenance that matters is the one that gates the mutation, and `--check` prints it as `owner:`. |
+| `GET /v1/usage` | **Not built** | The upstream contract is unverified, and a guessed contract is worse than none. |
+
+### One bug worth recording
+
+The provider base URL included `/v1` while the request path also carried the
+`/v1` prefix, so every request went to `/v1/v1/...` and 404'd. The base URL
+is now the **origin**; the path carries the prefix. The unit tests did not
+catch it because the stub upstream answered any path — only the first live
+request did.
+
+### What is left
+
+Two things, both blocked on something outside the code:
+
+1. **A completed ChatGPT sign-in.** The SIWC implementation is complete, but
+   exercising it needs a human to sign in with their ChatGPT account in a
+   browser and consent to plan usage.
+2. **A published release.** `eggpass update` is implemented and its policy is
+   tested, but there is no published `eggpass` release for it to install. The
+   repository (`eggstack/eggpass`) is a configured default, not a confirmed
+   fact — this repo has no git remote.
+
+Both are written up with the exact commands in
+[`shipped-2026-11-13.md`](shipped-2026-11-13.md#what-still-needs-a-human).

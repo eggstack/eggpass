@@ -1,6 +1,7 @@
-//! `grokproxy` — a lightweight, local, OpenAI-compatible proxy for Grok.
+//! `eggpass` — a lightweight, local, OpenAI-compatible proxy for Grok and
+//! ChatGPT.
 //!
-//! The binary is a single command-line tool: authenticate with x.ai over
+//! The binary is a single command-line tool: authenticate with a provider over
 //! OAuth, then serve an OpenAI-compatible API on loopback that any client can
 //! talk to.
 
@@ -9,9 +10,12 @@ mod cli;
 mod config;
 mod daemon;
 mod logging;
+mod migrate;
 mod paths;
+mod provider;
 mod server;
 mod timeutil;
+mod update;
 mod upstream;
 
 use cli::args::ParseOutcome;
@@ -26,14 +30,14 @@ fn main() {
             print!("{text}");
         }
         Ok(ParseOutcome::Version(version)) => {
-            println!("grokproxy {version}");
+            println!("eggpass {version}");
         }
         Ok(ParseOutcome::Run(parsed)) => {
             std::process::exit(cli::run(parsed));
         }
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("Run `grokproxy --help` for usage.");
+            eprintln!("Run `eggpass --help` for usage.");
             std::process::exit(1);
         }
     }
@@ -43,7 +47,7 @@ fn main() {
 ///
 /// Rust ignores `SIGPIPE`, so writing to a closed pipe raises a panic instead
 /// of ending the process. Most command line tools end quietly instead, which
-/// is what `grokproxy status | head -1` should do.
+/// is what `eggpass status | head -1` should do.
 #[cfg(unix)]
 fn restore_default_sigpipe() {
     // SAFETY: setting a signal disposition to its default is safe at any time.

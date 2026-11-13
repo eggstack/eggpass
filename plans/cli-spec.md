@@ -435,6 +435,91 @@ eggpass croncheck
 
 ---
 
+## `eggpass update`
+
+Update to the latest published release, or to one exact release.
+
+```
+eggpass update              # update to the latest release
+eggpass update 0.2.0       # update to exactly this version
+eggpass update --check      # report what would happen; change nothing
+```
+
+**Behaviour**
+
+The update itself is done by `eggup`, the eggstack family's verified updater.
+`eggpass` supplies the *policy* — which release to install, what the target
+triple is, and what the installed binary must prove about itself — and `eggup`
+supplies the *mechanics*: fetch, verify, validate, replace. The same mechanism
+every other eggstack tool uses.
+
+1. **Resolve the current executable** and classify how it is installed:
+   - **self-managed** — a binary the user installed, which `eggup` may replace.
+     The transaction proves ownership by hashing the destination and requiring
+     it to match the digest observed before the transaction began; the hash is
+     re-read under `eggup`'s lock.
+   - **cargo-managed** — installed by `cargo install`. The command **refuses**
+     and prints the `cargo install` command to run instead. Replacing a
+     Cargo-managed binary behind Cargo's back would desynchronise the two.
+   - **unprovable** — neither. The command refuses rather than guess.
+2. **Refuse forbidden provenance before asking the release host anything.**
+   When local facts alone make the mutation impossible, no network call can
+   change the answer.
+3. **Fetch the release manifest** from
+   `https://github.com/<repository>/releases/latest/download/<manifest_name>`,
+   or `.../releases/download/v<version>/<manifest_name>` for an exact version.
+   The manifest names the published artifacts and their sizes and SHA-256
+   digests.
+4. **Project the manifest** for this host's canonical Rust target triple
+   (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+   `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`).
+   Aliases such as `linux-x64` are **not** accepted — the triple in the
+   manifest has to be the exact one.
+5. **Never downgrade.** A build newer than the published release is a local or
+   unreleased build, and the catalogue is not entitled to replace it. If the
+   installed version already equals the published one, the command says so and
+   changes nothing.
+6. **Download and verify.** The artifact's size and SHA-256 must match the
+   manifest. The digest is an **integrity** check, not an authenticity check:
+   it proves the download was not corrupted, not that it came from us. `eggpack`
+   publishes no signature and claims none.
+7. **Validate the candidate.** The downloaded binary is run with `--version`
+   and its stdout compared, exactly, against `eggpass <version>\n`. A binary
+   that does not print exactly that is not installed.
+8. **Commit.** Only after validation does the transaction replace the
+   installed binary. If the transaction fails, the receipt's disposition
+   decides what happens: rolled back, or recovery required — in which case the
+   previous binary is still on disk and its path is printed.
+9. **Never restart the daemon.** A running server keeps the old binary until
+   it is restarted, and a restart cuts live streams. The command says so and
+   points at `eggpass restart`.
+
+**Output**
+
+```
+$ eggpass update --check
+eggpass 0.1.0 is installed; 0.2.0 is published.
+  target: aarch64-apple-darwin
+  asset:  eggpass-aarch64-apple-darwin
+  owner:  self-managed
+```
+
+```
+$ eggpass update
+Updated eggpass 0.1.0 to 0.2.0.
+  target: aarch64-apple-darwin
+  asset:  eggpass-aarch64-apple-darwin
+The running server still has the old binary until it is restarted.
+Run `eggpass restart` when you are ready.
+```
+
+**Exit codes:** `0` updated, or `--check` completed · `1` the release is
+absent, the version is already current, a downgrade was requested, the
+provenance forbids the mutation, the digest did not match, the candidate did
+not validate, or the transaction failed.
+
+---
+
 ## Files
 
 | Path | Purpose | Mode |
@@ -455,6 +540,19 @@ optional when reading, so a pid file written by an older build still parses.
 user who already ran `grok login` can start using the proxy without logging in
 again.
 
+### Migration from the old name
+
+The config directory used to be `~/.config/grokproxy`. On startup `eggpass`
+**copies** the old directory's `config.toml`, `credentials/`, `eggpass.pid` and
+`eggpass.log` into `~/.config/eggpass`, and leaves a `migrated-to-eggpass`
+marker in the old directory.
+
+The migration **copies rather than moves**, and never deletes anything the
+user owns. The old directory is left in place — it is the user's data, and
+deleting it is their call, not the tool's. The migration never overwrites an
+existing `~/.config/eggpass`, and it is idempotent: running it twice changes
+nothing the second time.
+
 ## Config file
 
 ```toml
@@ -462,23 +560,84 @@ again.
 
 host = "127.0.0.1"  # the address to bind; "localhost"/"local"/"loopback" mean 127.0.0.1
 port = 8484
-upstream = "api"      # "api" = api.x.ai  |  "build" = cli-chat-proxy.grok.com
 api_key = ""          # empty = accept any key (safe only while the host is loopback)
 log_level = "info"    # error | warn | info | debug
+allow_privileged_port = false
+
+[timeouts]
+connect_seconds = 30    # how long establishing a connection may take
+global_seconds = 1800   # the ceiling on a whole request
+body_seconds = 1800     # the ceiling on reading the response body
+
+[server]
+max_connections = 256       # simultaneous connections; beyond it the server answers 503
+idle_timeout_seconds = 120  # how long a kept-alive connection may sit idle
+write_timeout_seconds = 600 # how long a single write may stall
+
+[update]
+repository = "eggstack/eggpass"
+manifest_name = "eggpass-release-manifest.json"
+
+[providers.xai]
+enabled = true
+upstream = "api"      # "api" = api.x.ai  |  "build" = cli-chat-proxy.grok.com
+
+[providers.openai]
+enabled = true
+
+[routing]
+default_provider = "xai"
+
+[routing.prefixes]
+"grok-" = "xai"
+"gpt-"  = "openai"
+"codex" = "openai"
+
+[oauth.xai]
+client_id = "b1a00492-073a-47ea-816f-4c329264a828"
+issuer = "https://auth.x.ai"
+scopes = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
+referrer = "eggpass"
+
+[oauth.openai]
+issuer = "https://auth.openai.com"
+scopes = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+agent_name_hint = "eggpass"
+resource = "https://api.openai.com/v1"
 ```
 
 `host` and `port` are the two addresses the server listens on, and they are
 changed with the `host` and `port` commands rather than by hand-editing this
-file — both commands validate, apply and restart in one step.
+file — both commands validate, apply and restart in one step. Editing them by
+hand works too; the change takes effect at the next `eggpass restart`.
+
+The top-level `upstream` key is the legacy spelling of
+`providers.xai.upstream` and is still read, but the per-provider table wins.
+
+The flat `[oauth]` table is the legacy spelling of `[oauth.xai]` and is still
+read; the per-provider tables win.
+
+`scopes` may be written either as a space-separated string or as a list of
+strings.
+
+**Unknown keys are preserved** when `eggpass port` and `eggpass host` rewrite
+the file. Both perform a surgical text edit on the one key they change rather
+than a parse-and-reserialise round trip, so comments and keys the tool does
+not understand survive.
 
 ## Upstream behaviour
 
-- Base URL: `https://api.x.ai/v1` when `upstream = "api"`.
-- Base URL: `https://cli-chat-proxy.grok.com/v1` when `upstream = "build"`,
-  in which case the request additionally carries
-  `X-XAI-Token-Auth: xai-grok-cli` and `x-grok-client-version: <version>`.
+- Base URL: `https://api.x.ai` when `providers.xai.upstream = "api"`.
+- Base URL: `https://cli-chat-proxy.grok.com` when
+  `providers.xai.upstream = "build"`, in which case the request additionally
+  carries `X-XAI-Token-Auth: xai-grok-cli` and
+  `x-grok-client-version: <version>`.
+- The base URL is the **origin**, never the origin plus `/v1`: the request path
+  carries the `/v1` prefix itself, so a base URL ending in `/v1` would send
+  every request to `/v1/v1/...`.
 - Incoming `Authorization` / `X-Api-Key` headers from the client are **stripped**
-  and replaced with the Grok OAuth token, so client credentials never reach x.ai.
+  and replaced with the provider's OAuth token, so client credentials never
+  reach the provider.
 
 ## Exposed endpoints
 
@@ -486,6 +645,10 @@ file — both commands validate, apply and restart in one step.
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI-compatible chat completions (streaming + non-streaming) |
 | `POST /v1/responses` | OpenAI-compatible Responses API |
-| `GET /v1/models` | Model list |
+| `GET /v1/models` | The live model catalogue, merged across signed-in providers |
 | `GET /v1/models/{id}` | Single model |
 | `GET /health` | Liveness probe (no auth required) |
+
+`GET /v1/models` is a **live round trip**. There is no static catalogue: the
+union of the signed-in providers' catalogues is what is advertised, and a
+model id no provider advertises is a `404`.

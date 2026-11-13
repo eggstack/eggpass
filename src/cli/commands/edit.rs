@@ -1,4 +1,4 @@
-//! `grokproxy edit`.
+//! `eggpass edit`.
 
 use std::process::Command;
 

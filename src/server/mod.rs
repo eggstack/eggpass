@@ -1,16 +1,18 @@
 //! The local HTTP server.
 //!
-//! The server binds to `127.0.0.1` and nothing else. It speaks the
-//! OpenAI-compatible subset that clients actually use, forwards everything to
-//! the configured upstream with the Grok OAuth token, and never lets a
-//! client's own credentials reach x.ai.
+//! The server binds to loopback and nothing else, by default. It speaks the
+//! OpenAI-compatible subset that clients actually use, forwards every request
+//! to the provider that serves the requested model, and never lets a client's
+//! own credentials reach the provider.
 
+pub mod aggregator;
 pub mod chat;
 pub mod health;
 pub mod http;
 pub mod models;
 pub mod router;
 pub mod sse;
+pub mod translate;
 
 #[cfg(test)]
 mod tests;
@@ -18,39 +20,95 @@ mod tests;
 pub use chat::forwarded_headers;
 pub use http::{HttpServer, Request, Response};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::auth::refresh::TokenManager;
+use crate::config::Routing;
+use crate::provider::{ProviderId, ProviderSpec};
 use crate::upstream::UpstreamClient;
 
-/// How long in-flight requests are given to finish during shutdown.
-pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-
-/// Everything a request handler needs.
-#[derive(Debug)]
-pub struct ServerContext {
-    /// The key clients must present. Empty means "accept anything".
-    pub api_key: String,
-    /// The upstream requests are forwarded to.
+/// The largest number of simultaneous upstream requests.
+pub const DEFAULT_MAX_UPSTREAM_REQUESTS: usize = 64;
+/// One provider, ready to serve requests.
+pub struct ProviderHandle {
+    /// What the provider is and how it behaves.
+    pub spec: ProviderSpec,
+    /// The client the requests go out through.
     pub upstream: UpstreamClient,
     /// Hands out access tokens, refreshing them when needed.
     pub tokens: TokenManager,
 }
 
+/// Everything a request handler needs.
+pub struct ServerContext {
+    /// The key clients must present. Empty means "accept anything".
+    pub api_key: String,
+    /// The providers that are available.
+    pub providers: HashMap<ProviderId, ProviderHandle>,
+    /// The provider used when no prefix matches the model.
+    pub default_provider: ProviderId,
+    /// The routing table.
+    pub routing: Routing,
+    /// The number of upstream requests in flight.
+    ///
+    /// This is shared, because a streaming request holds its slot until the
+    /// stream has finished, which is after the handler has returned.
+    pub upstream_in_flight: Arc<AtomicUsize>,
+    /// The largest number of simultaneous upstream requests.
+    pub max_upstream_requests: usize,
+}
+
+impl ServerContext {
+    /// The provider that serves a model.
+    pub fn provider_for(&self, model: &str) -> ProviderId {
+        self.routing.provider_for(model, self.default_provider)
+    }
+
+    /// Take an upstream slot, or refuse when there are too many requests.
+    pub fn take_upstream_slot(&self) -> bool {
+        let mut current = self.upstream_in_flight.load(Ordering::SeqCst);
+        loop {
+            if current >= self.max_upstream_requests {
+                return false;
+            }
+            match self.upstream_in_flight.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Give an upstream slot back.
+    pub fn release_upstream_slot(&self) {
+        self.upstream_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Errors raised while starting the server.
 #[derive(Debug)]
 pub enum ServerError {
-    /// The port could not be bound.
-    Bind { port: u16, source: std::io::Error },
+    /// The address could not be bound.
+    Bind {
+        /// The address that was tried.
+        address: String,
+        /// The underlying error.
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServerError::Bind { port, source } => {
-                write!(f, "could not bind 127.0.0.1:{port}: {source}")
+            ServerError::Bind { address, source } => {
+                write!(f, "could not bind {address}: {source}")
             }
         }
     }
@@ -62,22 +120,30 @@ impl std::error::Error for ServerError {}
 pub struct Server {
     http: Arc<HttpServer>,
     shutdown: Arc<AtomicBool>,
-    in_flight: Arc<AtomicUsize>,
 }
 
 impl Server {
-    /// Bind the server to the loopback interface.
-    pub fn bind(port: u16) -> Result<Arc<Server>, ServerError> {
-        let http =
-            HttpServer::bind(&format!("127.0.0.1:{port}")).map_err(|source| ServerError::Bind {
-                port,
-                source: std::io::Error::other(source.to_string()),
-            })?;
+    /// Bind the server to an address, with explicit limits.
+    pub fn bind_with_limits(
+        host: &str,
+        port: u16,
+        limits: crate::config::ServerLimits,
+    ) -> Result<Arc<Server>, ServerError> {
+        let address = format!("{host}:{port}");
+        let http = HttpServer::bind(&address)
+            .map_err(|source| ServerError::Bind {
+                address: address.clone(),
+                source,
+            })?
+            .with_limits(
+                limits.max_connections,
+                Duration::from_secs(limits.idle_timeout_seconds),
+                Duration::from_secs(limits.write_timeout_seconds),
+            );
 
         Ok(Arc::new(Server {
             http: Arc::new(http),
             shutdown: Arc::new(AtomicBool::new(false)),
-            in_flight: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -97,23 +163,14 @@ impl Server {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
 
         let handler = {
-            let server = Arc::clone(&self);
             let context = Arc::clone(&context);
-            Arc::new(move |request: Request| {
-                server.in_flight.fetch_add(1, Ordering::SeqCst);
-                let response = handle_request(request, &context);
-                server.in_flight.fetch_sub(1, Ordering::SeqCst);
-                response
-            }) as Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>
+            Arc::new(move |request: Request| handle_request(request, &context))
+                as Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>
         };
 
+        // The server waits for the in-flight connections itself, so a stream
+        // that is halfway out when the signal arrives still finishes.
         Arc::clone(&self.http).serve(self.shutdown.clone(), handler);
-
-        // Let in-flight requests finish, but not forever.
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while self.in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 }
 
@@ -149,7 +206,7 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
 ///
 /// The key may arrive as `Authorization: Bearer`, as `X-Api-Key`, or as a
 /// `key` query parameter. When no key is configured, everything is allowed —
-/// the server only ever binds to loopback.
+/// the server only ever binds to loopback unless the user says otherwise.
 pub fn is_authorized(context: &ServerContext, request: &Request) -> bool {
     if context.api_key.is_empty() {
         return true;
@@ -223,16 +280,11 @@ mod authorisation_tests {
     fn context_with_key(key: &str) -> ServerContext {
         ServerContext {
             api_key: key.to_string(),
-            upstream: UpstreamClient::new(crate::config::Upstream::Api),
-            tokens: TokenManager::new(
-                crate::paths::Paths::resolve(None).unwrap(),
-                crate::auth::OAuthClient::new(
-                    crate::auth::DEFAULT_CLIENT_ID,
-                    crate::auth::DEFAULT_ISSUER,
-                    crate::auth::DEFAULT_SCOPES,
-                    crate::auth::DEFAULT_REFERRER,
-                ),
-            ),
+            providers: HashMap::new(),
+            default_provider: ProviderId::Xai,
+            routing: Routing::default(),
+            upstream_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_upstream_requests: DEFAULT_MAX_UPSTREAM_REQUESTS,
         }
     }
 
@@ -277,5 +329,23 @@ mod authorisation_tests {
             &request_with(vec![("Authorization", "Bearer wrong")], "")
         ));
         assert!(!is_authorized(&context, &request_with(vec![], "")));
+    }
+
+    #[test]
+    fn the_upstream_slots_are_bounded() {
+        let context = ServerContext {
+            api_key: String::new(),
+            providers: HashMap::new(),
+            default_provider: ProviderId::Xai,
+            routing: Routing::default(),
+            upstream_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_upstream_requests: 2,
+        };
+
+        assert!(context.take_upstream_slot());
+        assert!(context.take_upstream_slot());
+        assert!(!context.take_upstream_slot());
+        context.release_upstream_slot();
+        assert!(context.take_upstream_slot());
     }
 }

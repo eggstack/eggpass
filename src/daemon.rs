@@ -3,10 +3,14 @@
 //! The daemon is self-contained: a pid file, a health probe and a signal. No
 //! launchd, no systemd, no root, and the same behaviour on macOS and Linux.
 //!
-//! The pid file holds two lines — the process id, and the port the daemon is
-//! actually serving. The second line is what lets `grokproxy status` and
-//! `grokproxy port` report the port that is live *right now*, which may differ
-//! from the configured port after a `grokproxy port` change.
+//! The pid file holds three lines — the process id, the address the daemon
+//! bound, and the port it is actually serving. Those last two are what let
+//! `eggpass status`, `eggpass port` and `eggpass host` report the address
+//! that is live *right now*, which may differ from the configured one after a
+//! hand edit of the config file.
+//!
+//! A pid file written by an older build has only two lines — the process id
+//! and the port — and still parses.
 
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -29,6 +33,8 @@ pub enum DaemonState {
     Running {
         /// The process id.
         pid: i32,
+        /// The address it bound.
+        host: String,
         /// The port it is serving.
         port: u16,
     },
@@ -75,36 +81,61 @@ impl std::fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {}
 
 /// The contents of the pid file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonInfo {
     /// The process id.
     pub pid: i32,
+    /// The address the daemon bound, when it is recorded.
+    pub host: Option<String>,
     /// The port the daemon is serving, when it is recorded.
     pub port: Option<u16>,
 }
 
 /// Read the pid file.
+///
+/// A two-line file is the older layout — the process id and the port — and is
+/// still understood.
 pub fn read_info(pid_file: &Path) -> Option<DaemonInfo> {
     let text = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = text.lines();
     let pid: i32 = lines.next()?.trim().parse().ok()?;
-    let port = lines
-        .next()
-        .and_then(|line| line.trim().parse::<u16>().ok());
-    Some(DaemonInfo { pid, port })
+
+    let second = lines.next().map(str::trim);
+    let third = lines.next().map(str::trim);
+
+    match second {
+        // The older layout: the second line is the port.
+        Some(second) if second.parse::<u16>().is_ok() => Some(DaemonInfo {
+            pid,
+            host: None,
+            port: second.parse::<u16>().ok(),
+        }),
+        // The current layout: the second line is the host, the third the port.
+        Some(second) => Some(DaemonInfo {
+            pid,
+            host: Some(second.to_string()),
+            port: third.and_then(|line| line.parse::<u16>().ok()),
+        }),
+        None => Some(DaemonInfo {
+            pid,
+            host: None,
+            port: None,
+        }),
+    }
 }
 
 /// Write the pid file.
-pub fn write_info(pid_file: &Path, pid: i32, port: u16) -> Result<(), DaemonError> {
-    if let Some(parent) = pid_file.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
+pub fn write_info(pid_file: &Path, pid: i32, host: &str, port: u16) -> Result<(), DaemonError> {
+    if let Some(parent) = pid_file.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
-    std::fs::write(pid_file, format!("{pid}\n{port}\n")).map_err(|source| DaemonError::Io {
+    std::fs::write(pid_file, format!("{pid}\n{host}\n{port}\n")).map_err(|source| DaemonError::Io {
         path: pid_file.to_path_buf(),
         source,
     })
@@ -128,15 +159,27 @@ pub fn is_alive(pid: i32) -> bool {
     }
 }
 
-/// Whether the daemon answers `/health` on the given port.
-pub fn health_ok(port: u16) -> bool {
+/// The address a health probe should use for a bound address.
+///
+/// A wildcard bind covers the loopback interface, so the probe can use it. A
+/// specific address has to be probed where it actually listens.
+pub fn probe_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
+    }
+}
+
+/// Whether the daemon answers `/health` on the given address.
+pub fn health_ok(host: &str, port: u16) -> bool {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(2)))
         .timeout_global(Some(Duration::from_secs(3)))
         .build();
     let agent = ureq::Agent::new_with_config(config);
-    match agent.get(&format!("http://127.0.0.1:{port}/health")).call() {
+    let url = format!("http://{}:{port}/health", probe_host(host));
+    match agent.get(&url).call() {
         Ok(response) => (200..300).contains(&response.status().as_u16()),
         Err(_) => false,
     }
@@ -147,7 +190,7 @@ pub fn health_ok(port: u16) -> bool {
 /// A daemon counts as running only when the recorded process is alive **and**
 /// the health endpoint answers. Either signal alone is unreliable: a pid can
 /// be reused, and an unrelated process can hold the port.
-pub fn state(pid_file: &Path, configured_port: u16) -> DaemonState {
+pub fn state(pid_file: &Path, configured_host: &str, configured_port: u16) -> DaemonState {
     let Some(info) = read_info(pid_file) else {
         return DaemonState::Stopped;
     };
@@ -155,15 +198,20 @@ pub fn state(pid_file: &Path, configured_port: u16) -> DaemonState {
         return DaemonState::Stale { pid: info.pid };
     }
 
-    // Prefer the port the daemon reported; fall back to the configured one.
+    // Prefer what the daemon reported; fall back to the configured values.
+    let host = info.host.unwrap_or_else(|| configured_host.to_string());
     let mut port = info.port.unwrap_or(configured_port);
-    if !health_ok(port) && port != configured_port && health_ok(configured_port) {
+    if !health_ok(&host, port)
+        && port != configured_port
+        && health_ok(configured_host, configured_port)
+    {
         port = configured_port;
     }
 
-    if health_ok(port) {
+    if health_ok(&host, port) {
         DaemonState::Running {
             pid: info.pid,
+            host,
             port,
         }
     } else {
@@ -172,10 +220,10 @@ pub fn state(pid_file: &Path, configured_port: u16) -> DaemonState {
 }
 
 /// Wait until the daemon answers `/health`, or the timeout expires.
-pub fn wait_for_health(port: u16, timeout: Duration) -> bool {
+pub fn wait_for_health(host: &str, port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if health_ok(port) {
+        if health_ok(host, port) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -198,13 +246,14 @@ pub enum SpawnOutcome {
 /// The caller decides what to do next: the child starts the server, the parent
 /// waits for the health endpoint.
 pub fn spawn(log_file: &Path) -> Result<SpawnOutcome, DaemonError> {
-    if let Some(parent) = log_file.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
+    if let Some(parent) = log_file.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
 
     let log = OpenOptions::new()
@@ -294,17 +343,18 @@ mod tests {
     #[test]
     fn the_pid_file_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("grokproxy.pid");
-        write_info(&path, 4321, 8484).unwrap();
+        let path = dir.path().join("eggpass.pid");
+        write_info(&path, 4321, "127.0.0.1", 8484).unwrap();
         let info = read_info(&path).unwrap();
         assert_eq!(info.pid, 4321);
         assert_eq!(info.port, Some(8484));
+        assert_eq!(info.host.as_deref(), Some("127.0.0.1"));
     }
 
     #[test]
     fn a_pid_only_file_is_understood() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("grokproxy.pid");
+        let path = dir.path().join("eggpass.pid");
         std::fs::write(&path, "4321\n").unwrap();
         let info = read_info(&path).unwrap();
         assert_eq!(info.pid, 4321);
@@ -315,7 +365,7 @@ mod tests {
     fn a_missing_pid_file_means_stopped() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            state(&dir.path().join("grokproxy.pid"), 8484),
+            state(&dir.path().join("eggpass.pid"), "127.0.0.1", 8484),
             DaemonState::Stopped
         );
     }
@@ -323,10 +373,13 @@ mod tests {
     #[test]
     fn a_dead_pid_is_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("grokproxy.pid");
+        let path = dir.path().join("eggpass.pid");
         // A pid that is almost certainly not running.
-        write_info(&path, 999_999_999, 8484).unwrap();
-        assert_eq!(state(&path, 8484), DaemonState::Stale { pid: 999_999_999 });
+        write_info(&path, 999_999_999, "127.0.0.1", 8484).unwrap();
+        assert_eq!(
+            state(&path, "127.0.0.1", 8484),
+            DaemonState::Stale { pid: 999_999_999 }
+        );
     }
 
     #[test]

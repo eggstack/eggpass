@@ -1,38 +1,18 @@
 //! The upstream client.
 //!
-//! Two upstreams sit behind one interface:
+//! One client per provider. The provider's spec says where the requests go
+//! and which headers it needs; everything else is the same for every provider.
 //!
-//! | `upstream` | Base URL | Extra headers |
-//! | --- | --- | --- |
-//! | `"api"` (default) | `https://api.x.ai/v1` | none |
-//! | `"build"` | `https://cli-chat-proxy.grok.com/v1` | Grok CLI fingerprint |
-//!
-//! The `build` proxy refuses requests that do not advertise a Grok CLI client
-//! version of at least `1.0.13`, so we always send the current one.
+//! The model catalogue is **not** cached and there is no compiled-in list of
+//! model names. Every `GET /v1/models` is a live round trip to the provider,
+//! so the catalogue is never stale and a model that exists upstream is never
+//! missing here.
 
 use std::io::Read;
 use std::time::Duration;
 
 use crate::auth::refresh::TokenError;
-use crate::config::Upstream;
-
-/// The Grok Build release whose version we advertise.
-pub const GROK_BUILD_CLIENT_VERSION: &str = "1.0.77";
-
-/// The minimum Grok Build client version the build proxy accepts.
-pub const GROK_BUILD_MINIMUM_VERSION: &str = "1.0.13";
-
-/// Models we advertise even when the upstream list has not caught up.
-pub const KNOWN_MODELS: &[&str] = &[
-    "grok-4.7",
-    "grok-4.6",
-    "grok-4.5",
-    "grok-4.3",
-    "grok-4.20-0309-reasoning",
-    "grok-4.20-0309-non-reasoning",
-    "grok-4.20-multi-agent-0309",
-    "grok-build-0.1",
-];
+use crate::provider::ProviderSpec;
 
 /// The HTTP methods we forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,39 +110,36 @@ fn add_headers<B>(
     request
 }
 
-/// A client for one of the two upstreams.
+/// A client for one provider.
 #[derive(Debug, Clone)]
 pub struct UpstreamClient {
-    kind: Upstream,
     base_url: String,
+    extra: Vec<(&'static str, String)>,
     agent: ureq::Agent,
 }
 
 impl UpstreamClient {
-    /// Build a client for the given upstream.
-    pub fn new(kind: Upstream) -> UpstreamClient {
-        UpstreamClient::with_base_url(kind, kind.origin())
+    /// Build a client for a provider.
+    pub fn new(spec: &ProviderSpec) -> UpstreamClient {
+        UpstreamClient::with_timeouts(spec, crate::config::Timeouts::default())
     }
 
-    /// Build a client that talks to a specific origin.
-    ///
-    /// The request path always carries the `/v1` prefix.
-    pub fn with_base_url(kind: Upstream, base_url: &str) -> UpstreamClient {
+    /// Build a client for a provider, with explicit timeouts.
+    pub fn with_timeouts(spec: &ProviderSpec, timeouts: crate::config::Timeouts) -> UpstreamClient {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_global(Some(Duration::from_secs(1_800)))
-            .timeout_recv_body(Some(Duration::from_secs(300)))
-            .user_agent(format!("grokproxy/{}", env!("CARGO_PKG_VERSION")))
+            .timeout_connect(Some(Duration::from_secs(timeouts.connect_seconds)))
+            .timeout_global(Some(Duration::from_secs(timeouts.global_seconds)))
+            .timeout_recv_body(Some(Duration::from_secs(timeouts.body_seconds)))
+            .user_agent(format!("eggpass/{}", env!("CARGO_PKG_VERSION")))
             .build();
 
         UpstreamClient {
-            kind,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: spec.base_url.trim_end_matches('/').to_string(),
+            extra: spec.extra_headers.clone(),
             agent: ureq::Agent::new_with_config(config),
         }
     }
-
     /// Send a request to the upstream.
     pub fn send(
         &self,
@@ -174,13 +151,13 @@ impl UpstreamClient {
     ) -> Result<UpstreamResponse, UpstreamError> {
         let url = format!("{}{}", self.base_url, path);
 
-        let extra = self.extra_headers();
+        let extra = &self.extra;
 
         let response = match method {
-            Method::Get => add_headers(self.agent.get(&url), headers, token, &extra).call(),
+            Method::Get => add_headers(self.agent.get(&url), headers, token, extra).call(),
             Method::Post => {
                 let body = body.unwrap_or(b"");
-                add_headers(self.agent.post(&url), headers, token, &extra).send(body)
+                add_headers(self.agent.post(&url), headers, token, extra).send(body)
             }
         }
         .map_err(|err| match err {
@@ -209,27 +186,6 @@ impl UpstreamClient {
             headers,
             body: Box::new(body),
         })
-    }
-
-    /// Headers that are only sent to the Grok Build proxy.
-    fn extra_headers(&self) -> Vec<(&'static str, String)> {
-        match self.kind {
-            Upstream::Api => Vec::new(),
-            Upstream::Build => {
-                debug_assert!(
-                    version_is_at_least(GROK_BUILD_CLIENT_VERSION, GROK_BUILD_MINIMUM_VERSION),
-                    "the advertised Grok Build version is below the floor the proxy enforces"
-                );
-                vec![
-                    ("X-XAI-Token-Auth", "xai-grok-cli".to_string()),
-                    (
-                        "x-grok-client-version",
-                        GROK_BUILD_CLIENT_VERSION.to_string(),
-                    ),
-                    ("x-grok-client-identifier", "grokproxy".to_string()),
-                ]
-            }
-        }
     }
 }
 
@@ -260,6 +216,10 @@ pub fn send_with_auth(
 /// Headers that must never be forwarded to the upstream.
 ///
 /// The client's own credentials live here — they must not reach x.ai.
+///
+/// The provider-owned headers are here too. They describe the Grok Build client
+/// that the proxy speaks for, so a client that sets them must not be able to
+/// make the proxy claim to be something it is not.
 pub const STRIPPED_HEADERS: &[&str] = &[
     "authorization",
     "x-api-key",
@@ -272,6 +232,9 @@ pub const STRIPPED_HEADERS: &[&str] = &[
     "forwarded",
     "x-real-ip",
     "cdn-loop",
+    "x-xai-token-auth",
+    "x-grok-client-version",
+    "x-grok-client-identifier",
 ];
 
 /// Header prefixes that must never be forwarded to the upstream.
@@ -348,7 +311,7 @@ pub fn build_path(path: &str, query: &str) -> String {
 }
 
 /// Whether a dotted version number is at least as new as another.
-fn version_is_at_least(version: &str, floor: &str) -> bool {
+pub fn version_is_at_least(version: &str, floor: &str) -> bool {
     fn parts(value: &str) -> Vec<u32> {
         value
             .split('.')
@@ -356,56 +319,6 @@ fn version_is_at_least(version: &str, floor: &str) -> bool {
             .collect()
     }
     parts(version) >= parts(floor)
-}
-
-/// Percent-encode a value for use in a path segment.
-pub fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
-/// Merge the models we know about into the upstream's list.
-///
-/// Upstream entries are never dropped; we only add the ones that are missing.
-pub fn merge_models(body: &[u8]) -> Vec<u8> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return body.to_vec();
-    };
-    let Some(data) = value.get("data").and_then(serde_json::Value::as_array) else {
-        return body.to_vec();
-    };
-
-    let present: Vec<String> = data
-        .iter()
-        .filter_map(|model| model.get("id").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .collect();
-
-    let mut merged = data.clone();
-    for model in KNOWN_MODELS {
-        if present.iter().any(|id| id == model) {
-            continue;
-        }
-        merged.push(serde_json::json!({
-            "id": model,
-            "object": "model",
-            "owned_by": "xai",
-        }));
-    }
-
-    let mut output = value.clone();
-    if let Some(object) = output.as_object_mut() {
-        object.insert("data".to_string(), serde_json::Value::Array(merged));
-    }
-    serde_json::to_vec(&output).unwrap_or_else(|_| body.to_vec())
 }
 
 #[cfg(test)]
@@ -416,11 +329,14 @@ mod tests {
     fn the_advertised_client_version_is_above_the_floor() {
         // The Grok Build proxy answers 426 below 1.0.13.
         assert!(
-            version_is_at_least(GROK_BUILD_CLIENT_VERSION, GROK_BUILD_MINIMUM_VERSION),
-            "the advertised version {GROK_BUILD_CLIENT_VERSION} is below the floor {GROK_BUILD_MINIMUM_VERSION}"
+            version_is_at_least(
+                crate::provider::xai::GROK_BUILD_CLIENT_VERSION,
+                crate::provider::xai::GROK_BUILD_MINIMUM_VERSION
+            ),
+            "the advertised version is below the floor the proxy enforces"
         );
-        assert!(!version_is_at_least("1.0.12", GROK_BUILD_MINIMUM_VERSION));
-        assert!(version_is_at_least("1.0.13", GROK_BUILD_MINIMUM_VERSION));
+        assert!(!version_is_at_least("1.0.12", "1.0.13"));
+        assert!(version_is_at_least("1.0.13", "1.0.13"));
     }
 
     #[test]
@@ -473,27 +389,5 @@ mod tests {
     fn the_key_parameter_is_removed_on_its_own() {
         let (_, query) = normalize_target("/v1/models?key=secret");
         assert_eq!(query, "");
-    }
-
-    #[test]
-    fn models_are_merged_without_dropping_upstream_entries() {
-        let body = br#"{"object":"list","data":[{"id":"grok-4.7","object":"model"}]}"#;
-        let merged = merge_models(body);
-        let value: serde_json::Value = serde_json::from_slice(&merged).unwrap();
-        let ids: Vec<&str> = value["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|model| model["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids[0], "grok-4.7");
-        assert!(ids.contains(&"grok-4.6"), "{ids:?}");
-        assert_eq!(ids.len(), KNOWN_MODELS.len());
-    }
-
-    #[test]
-    fn merging_leaves_an_unparsable_body_alone() {
-        let body = b"not json";
-        assert_eq!(merge_models(body), body);
     }
 }

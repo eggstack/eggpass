@@ -8,11 +8,11 @@
 //!   mutex plus the re-read inside it means a burst of parallel 401s results
 //!   in a single refresh.
 
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use super::client::{AuthError, OAuthClient, TokenSet};
 use super::store::{self, StoreError, StoredAuth};
-use crate::paths::Paths;
 use crate::timeutil;
 
 /// How long before expiry we refresh the access token.
@@ -34,16 +34,16 @@ pub enum TokenError {
 impl std::fmt::Display for TokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TokenError::NotLoggedIn => write!(f, "not logged in — run `grokproxy login`"),
+            TokenError::NotLoggedIn => write!(f, "not logged in — run `eggpass login`"),
             TokenError::Store(err) => write!(f, "{err}"),
             TokenError::Auth(err) => write!(
                 f,
-                "the stored credentials could not be refreshed ({err}) — run `grokproxy login`"
+                "the stored credentials could not be refreshed ({err}) — run `eggpass login`"
             ),
             TokenError::NoRefreshToken => {
                 write!(
                     f,
-                    "the stored credentials have expired and carry no refresh token — run `grokproxy login`"
+                    "the stored credentials have expired and carry no refresh token — run `eggpass login`"
                 )
             }
         }
@@ -65,10 +65,15 @@ impl From<AuthError> for TokenError {
 }
 
 /// Hands out usable access tokens.
+///
+/// One manager per provider: the credential file, the OAuth client and the
+/// refresh mutex are all per provider, so a refresh on one provider never
+/// blocks another.
 #[derive(Debug)]
 pub struct TokenManager {
-    paths: Paths,
+    path: PathBuf,
     client: OAuthClient,
+    import_source: Option<PathBuf>,
     lock: Mutex<()>,
     skew: i64,
 }
@@ -84,22 +89,30 @@ impl crate::upstream::TokenProvider for TokenManager {
 }
 
 impl TokenManager {
-    /// Build a manager that stores credentials under `paths`.
-    pub fn new(paths: Paths, client: OAuthClient) -> TokenManager {
+    /// Build a manager that stores one provider's credentials in `path`.
+    pub fn new(path: PathBuf, client: OAuthClient) -> TokenManager {
         TokenManager {
-            paths,
+            path,
             client,
+            import_source: None,
             lock: Mutex::new(()),
             skew: REFRESH_SKEW_SECS,
         }
     }
 
+    /// Build a manager that falls back to another file when ours is missing.
+    ///
+    /// This is how the official Grok CLI's credential file is imported.
+    pub fn with_import_source(mut self, source: Option<PathBuf>) -> TokenManager {
+        self.import_source = source;
+        self
+    }
+
     /// The credentials currently on disk, without refreshing anything.
     pub fn current(&self) -> Result<Option<StoredAuth>, TokenError> {
-        let grok_cli = self.paths.grok_cli_auth_file();
         Ok(store::load_or_import(
-            &self.paths.auth_file(),
-            grok_cli.as_deref(),
+            &self.path,
+            self.import_source.as_deref(),
         )?)
     }
 
@@ -153,10 +166,17 @@ impl TokenManager {
             return Err(TokenError::NoRefreshToken);
         };
 
-        let tokens = self.client.refresh(&refresh_token)?;
+        // Sign in with ChatGPT issues a client id during registration, and the
+        // refresh has to present that id rather than the entrypoint.
+        let client_id = if current.client_id.is_empty() {
+            self.client.client_id().to_string()
+        } else {
+            current.client_id.clone()
+        };
+        let tokens = self.client.refresh_as(&refresh_token, &client_id)?;
         let refreshed = merge_refreshed(current, &tokens);
 
-        store::save(&self.paths.auth_file(), &refreshed)?;
+        store::save(&self.path, &refreshed)?;
         Ok(refreshed)
     }
 
@@ -200,6 +220,8 @@ pub fn merge_refreshed(current: &StoredAuth, tokens: &TokenSet) -> StoredAuth {
         obtained_at: timeutil::now_unix(),
         user_id: current.user_id.clone(),
         email: current.email.clone(),
+        ext_agent_host_id: current.ext_agent_host_id.clone(),
+        plan_enabled: current.plan_enabled,
     }
 }
 
@@ -230,6 +252,8 @@ mod tests {
             obtained_at: 0,
             user_id: Some("user".to_string()),
             email: Some("a@b.c".to_string()),
+            ext_agent_host_id: None,
+            plan_enabled: false,
         }
     }
 
