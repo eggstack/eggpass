@@ -145,6 +145,9 @@ pub fn spec(config: &crate::config::Config) -> ProviderSpec {
             require_input_array: true,
         },
         supports_device_flow: false,
+        // Sign in with ChatGPT issues a client id of its own and returns it in
+        // the callback, so a pasted code would carry no client id to exchange.
+        issues_client_id: true,
         trusted_device_hosts: &[],
         catalogue: CatalogueKind::SlugArray,
         native_paths: NativePaths::ResponsesOnly,

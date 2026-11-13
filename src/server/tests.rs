@@ -243,6 +243,7 @@ fn stub_spec(stub: &Stub) -> ProviderSpec {
         extra_headers: Vec::new(),
         policy: RequestPolicy::default(),
         supports_device_flow: true,
+        issues_client_id: false,
         trusted_device_hosts: &["auth.x.ai"],
         catalogue: CatalogueKind::DataArray,
         native_paths: NativePaths::Both,

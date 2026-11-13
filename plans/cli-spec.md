@@ -107,6 +107,18 @@ eggpass login --device     # x.ai only: device-code flow, for headless / SSH
      client id is `dynamic_agent_client` and OpenAI issues the real client id
      during the callback; that issued id is stored. On a **re-login** the
      saved issued client id is reused, so no second registration is created.
+   - **The code may also be pasted back.** xAI sometimes shows a code to copy
+     on the consent page instead of redirecting to the loopback — its page
+     says *"Copy the code below into Grok Build to finish signing in"*. The
+     official Grok CLI waits for the code from **"loopback + stdin"**, and so
+     does this: while the loopback listener is open, a code pasted into the
+     terminal is picked up and exchanged. A pasted line that does not look
+     like an authorization code is ignored and the wait continues.
+     Only a **terminal** stdin is watched — reading a pipe would swallow the
+     caller's input and would block a scripted login forever.
+     This is available for x.ai, whose client id is fixed. It is **not**
+     available for ChatGPT, which issues a client id of its own and returns it
+     in the callback: a pasted code carries no issued id to exchange.
 3. Exchange the code for tokens and write them to the provider's credential
    file under `~/.config/eggpass/credentials/` (mode `0600`).
 4. Print success, the account identifier, and when the access token expires.

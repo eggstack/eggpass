@@ -91,6 +91,10 @@ pub fn spec(config: &crate::config::Config) -> ProviderSpec {
         extra_headers,
         policy: RequestPolicy::default(),
         supports_device_flow: true,
+        // x.ai has one fixed public client id, so there is no issued id to
+        // wait for. That also means a code pasted into the terminal can be
+        // exchanged.
+        issues_client_id: false,
         trusted_device_hosts: &["accounts.x.ai", "auth.x.ai", "x.ai"],
         catalogue: CatalogueKind::DataArray,
         native_paths: NativePaths::Both,

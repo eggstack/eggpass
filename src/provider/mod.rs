@@ -134,6 +134,13 @@ pub struct ProviderSpec {
     pub policy: RequestPolicy,
     /// Whether the provider can complete a device-code grant.
     pub supports_device_flow: bool,
+    /// Whether the provider issues its own client id and returns it in the
+    /// callback.
+    ///
+    /// When it does, the authorization code can only come from the callback:
+    /// a code pasted into the terminal carries no issued client id, so the
+    /// token exchange would present the wrong one.
+    pub issues_client_id: bool,
     /// The hosts we are willing to send a user to for device-code
     /// verification.
     pub trusted_device_hosts: &'static [&'static str],

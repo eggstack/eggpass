@@ -49,6 +49,22 @@ eggpass login --provider xai --device
 Already running the official Grok CLI? Its credentials are picked up
 automatically — `eggpass status` will show you as logged in.
 
+### The xAI sign-in page says "Grok Build"
+
+It does, and it will. xAI has no general-purpose public OAuth client for
+third-party apps, so `eggpass` signs in with the official Grok Build CLI's
+public client id — the same public credential every Grok Build install
+carries. xAI's consent page takes the product name from that client id, so
+it introduces itself as Grok Build.
+
+What we *do* control is the `referrer` parameter, which xAI documents as the
+"OAuth usage attribution" value. We send `eggpass`, so the usage is attributed
+to eggpass even though the page says Grok Build. xAI's own CLI sends `user`.
+
+If the page shows a **code to copy** instead of redirecting to your browser's
+callback, paste that code into the terminal and press Enter — the login is
+waiting for it, exactly as the official CLI does.
+
 ## Commands
 
 | Command | What it does |

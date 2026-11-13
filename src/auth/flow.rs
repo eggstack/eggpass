@@ -12,6 +12,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::client::{AuthError, DevicePoll, OAuthClient, TokenSet, UserInfo};
@@ -132,6 +133,9 @@ pub fn login_loopback(
     let registering = spec.id == crate::provider::ProviderId::OpenAi
         && existing.is_none_or(|auth| auth.client_id.is_empty());
 
+    // A pasted code can only be exchanged when the client id is fixed.
+    let allow_pasted_code = !spec.issues_client_id;
+
     let mut extra: Vec<(String, String)> = Vec::new();
     if !registering
         && let Some(auth) = existing
@@ -153,9 +157,27 @@ pub fn login_loopback(
 
     println!("Opening your browser to complete the login.");
     println!("If it does not open, visit this URL yourself:\n\n  {url}\n");
+    if allow_pasted_code {
+        println!(
+            "If the page shows a code to copy instead of redirecting, paste it here and press Enter."
+        );
+    }
     let _ = webbrowser::open(&url);
 
-    let callback = wait_for_callback(listener, &state, spec.callback_path)?;
+    // A provider that shows a code to copy, rather than redirecting to the
+    // loopback, can still be finished by pasting the code back here. The
+    // official Grok CLI waits for the code from "loopback + stdin"; this is
+    // the same idea.
+    //
+    // It is only possible when the provider does not issue a client id of its
+    // own, because a pasted code carries no issued id to exchange.
+    let pasted = if allow_pasted_code {
+        watch_stdin_for_code()
+    } else {
+        None
+    };
+
+    let callback = wait_for_callback(listener, &state, spec.callback_path, pasted)?;
 
     // The token exchange has to present the id the provider issued, not the
     // entrypoint we started from.
@@ -321,11 +343,13 @@ fn finish(
     LoginOutcome { auth }
 }
 
-/// Accept connections until the callback arrives or the deadline passes.
+/// Accept connections until the callback arrives, a code is pasted, or the
+/// deadline passes.
 fn wait_for_callback(
     listener: TcpListener,
     state: &str,
     callback_path: &str,
+    pasted: Option<mpsc::Receiver<String>>,
 ) -> Result<Callback, FlowError> {
     listener.set_nonblocking(true).map_err(|err| {
         FlowError::Io(format!("could not configure the callback listener: {err}"))
@@ -336,6 +360,23 @@ fn wait_for_callback(
     loop {
         if Instant::now() >= deadline {
             return Err(FlowError::Timeout);
+        }
+
+        // A pasted code takes the same path as a callback, minus the issued
+        // client id and scope, which only the callback carries.
+        if let Some(pasted) = &pasted
+            && let Ok(line) = pasted.try_recv()
+        {
+            let candidate = line.trim();
+            if looks_like_authorization_code(candidate) {
+                println!("Using the code you pasted.");
+                return Ok(Callback {
+                    code: candidate.to_string(),
+                    issued_client_id: None,
+                    scope: None,
+                });
+            }
+            println!("That does not look like an authorization code. Ignoring it.");
         }
 
         match listener.accept() {
@@ -411,6 +452,53 @@ fn wait_for_callback(
             }
         }
     }
+}
+
+/// Watch stdin for a pasted authorization code.
+///
+/// Returns `None` when stdin is not a terminal. Reading a pipe would swallow
+/// whatever the caller piped in and would block a scripted login forever, so
+/// the watcher only exists for a person at a keyboard.
+fn watch_stdin_for_code() -> Option<mpsc::Receiver<String>> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if sender.send(trimmed).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Some(receiver)
+}
+
+/// Whether a pasted line could be an authorization code.
+///
+/// Authorization codes are opaque, so this only rules out the things that
+/// clearly are not one: an empty line, whitespace, or a fragment of prose.
+fn looks_like_authorization_code(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() >= 8
+        && candidate.len() <= 512
+        && !candidate.chars().any(char::is_whitespace)
+        && candidate.chars().all(|c| c.is_ascii_graphic())
 }
 
 /// Read the request head from a connection.
@@ -639,5 +727,48 @@ mod tests {
         assert_eq!(percent_decode("a%2Fb"), "a/b");
         assert_eq!(percent_decode("a+b"), "a b");
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn an_authorization_code_is_recognised_by_its_shape() {
+        assert!(looks_like_authorization_code("SplxlOBeZQQYbYS6WxSbIA"));
+        assert!(looks_like_authorization_code("abc-123_DEF.456"));
+        // Too short, too long, or carrying whitespace are not codes.
+        assert!(!looks_like_authorization_code(""));
+        assert!(!looks_like_authorization_code("short"));
+        assert!(!looks_like_authorization_code("two words here"));
+        assert!(!looks_like_authorization_code(&"x".repeat(513)));
+    }
+
+    #[test]
+    fn a_pasted_code_finishes_the_login_without_a_callback() {
+        // x.ai sometimes shows a code to copy instead of redirecting to the
+        // loopback. The official CLI waits for the code from "loopback +
+        // stdin"; this is the same thing.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender.send("SplxlOBeZQQYbYS6WxSbIA".to_string()).unwrap();
+
+        let callback = wait_for_callback(listener, "state", "/callback", Some(receiver)).unwrap();
+        assert_eq!(callback.code, "SplxlOBeZQQYbYS6WxSbIA");
+        assert!(callback.issued_client_id.is_none());
+        assert!(callback.scope.is_none());
+    }
+
+    #[test]
+    fn a_pasted_line_that_is_not_a_code_is_ignored() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender.send("what was that again".to_string()).unwrap();
+
+        // The first line is not a code, so the wait continues. A real code
+        // after it still finishes the login.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = sender.send("SplxlOBeZQQYbYS6WxSbIA".to_string());
+        });
+
+        let callback = wait_for_callback(listener, "state", "/callback", Some(receiver)).unwrap();
+        assert_eq!(callback.code, "SplxlOBeZQQYbYS6WxSbIA");
     }
 }

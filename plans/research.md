@@ -115,6 +115,29 @@ It is obfuscated with `obfstr` in the Rust source but is a *public* credential
 — it is embedded in a binary that ships to every user. We reuse it, exactly as
 the reference project and other public proxies do.
 
+> **Consequence, observed live (2026-11-13): we are known to xAI as "Grok
+> Build".** xAI's consent page renders a `{clientName}` placeholder from its
+> client registry, and the registry maps this client id to **Grok Build**. The
+> page therefore says *"Copy the code below into Grok Build to finish signing
+> in"* — and shows *"Authorize Grok Build"*, *"You've already authorized Grok
+> Build"*, and *"We couldn't check your Grok Build seat"*.
+>
+> There is no way to change that from the client side: the wording comes from
+> the client id, and xAI publishes no general-purpose public client for
+> third-party applications the way OpenAI now does with *Sign in with ChatGPT
+> for Open Source*. Using a different id would mean registering one, which
+> xAI does not offer.
+>
+> The `referrer` parameter is a **separate** thing, and it is where we are
+> honest. xAI's own CLI documents it as *"Referrer for OAuth usage
+> attribution"*, with a default of `user`; we send `eggpass`. xAI's authorize
+> endpoint accepts it and carries it into the consent flow — verified live by
+> fetching the authorize URL with a browser user agent and confirming the
+> `return_to` query still contains `referrer=eggpass`.
+>
+> The `referrer` does **not** change the page's wording, because the wording
+> comes from the client id.
+
 ### 2.3 Scopes
 
 Two scope sets exist in the official CLI:
