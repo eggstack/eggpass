@@ -8,6 +8,7 @@ Nothing in this directory ships with the binary.
 | [`research.md`](research.md) | x.ai OAuth surface, the two-host upstream comparison, model catalog, a file-by-file review of the reference implementation, daemon design, config layout, and the open-risk register. Includes the **locked decisions**. | Current — 2026-11-13 |
 | [`cli-spec.md`](cli-spec.md) | The command-by-command contract for `login`, `logout`, `status`, `run`, `stop`, `restart`, `port`, `edit` and `croncheck`: behaviour, exit codes, side effects, file paths and config schema. | Current — 2026-11-13 |
 | [`implementation-plan.md`](implementation-plan.md) | Phased build order, module layout, dependency set, per-phase acceptance criteria, test strategy and the risk-to-phase mapping. Ends with **what shipped**, including the deviations from the plan and why. | Current — 2026-11-13 |
+| [`research-model-refresh-codex-eggserve-limits.md`](research-model-refresh-codex-eggserve-limits.md) | Follow-up research: how the model catalogue is refreshed today, what adding a ChatGPT/Codex OAuth path would take, whether `eggserve` should replace the handrolled HTTP server, and what plan/usage limits x.ai and OpenAI actually expose. | Current — 2026-11-13 |
 
 ## Reading order
 
@@ -17,6 +18,9 @@ Nothing in this directory ships with the binary.
 2. [`cli-spec.md`](cli-spec.md) — what the tool does.
 3. [`implementation-plan.md`](implementation-plan.md) — how it gets built, in
    what order, and how each step is verified.
+4. [`research-model-refresh-codex-eggserve-limits.md`](research-model-refresh-codex-eggserve-limits.md)
+   — the follow-up questions: catalogue refresh, a Codex auth path, HTTP
+   server choice, and plan limits.
 
 ## Key decisions
 
