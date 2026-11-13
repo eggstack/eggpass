@@ -18,11 +18,11 @@ pub fn host(context: &Context, requested: Option<String>) -> Result<(), CommandE
     let normalized = crate::config::normalize_host(&requested).map_err(CommandError::new)?;
 
     // Binding anywhere but loopback puts the proxy — and through it the
-    // user's subscriptions — on the network. An empty `api_key` means
-    // "accept any key", which would be an open proxy on someone's paid plan.
-    if !crate::config::is_loopback_host(&normalized) && context.config.api_key.is_empty() {
+    // user's subscriptions — on the network. Without a key of any kind that
+    // would be an open proxy on someone's paid plan.
+    if !crate::config::is_loopback_host(&normalized) && !has_key(context) {
         return Err(CommandError::new(format!(
-            "refusing to bind {normalized}: set an `api_key` in the config file first, so that the proxy is not open to the network"
+            "refusing to bind {normalized}: issue a key with `eggpass key add` first, so that the proxy is not open to the network"
         )));
     }
 
@@ -46,4 +46,19 @@ fn show(context: &Context) -> Result<(), CommandError> {
         println!("(the running server is still bound to {})", live.host);
     }
     Ok(())
+}
+
+/// Whether any key is configured, from either place.
+///
+/// The key in the configuration file counts, and so does any key `eggpass`
+/// issued.
+fn has_key(context: &Context) -> bool {
+    if !context.config.api_key.is_empty() {
+        return true;
+    }
+
+    match crate::keys::KeyStore::open(context.paths.key_store_file()) {
+        Ok(store) => !store.is_empty(),
+        Err(_) => false,
+    }
 }

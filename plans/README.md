@@ -6,7 +6,7 @@ Nothing in this directory ships with the binary.
 | Document | What it covers | Status |
 | --- | --- | --- |
 | [`research.md`](research.md) | x.ai OAuth surface, the two-host upstream comparison, model catalog, a file-by-file review of the reference implementation, daemon design, config layout, and the open-risk register. Includes the **locked decisions**. | Current — 2026-11-13 |
-| [`cli-spec.md`](cli-spec.md) | The command-by-command contract for `login`, `logout`, `status`, `run`, `stop`, `restart`, `port`, `host`, `edit`, `update` and `croncheck`: behaviour, exit codes, side effects, file paths and config schema. | Current — 2026-11-13 |
+| [`cli-spec.md`](cli-spec.md) | The command-by-command contract for `login`, `logout`, `status`, `run`, `stop`, `restart`, `port`, `host`, `key`, `edit`, `update` and `croncheck`: behaviour, exit codes, side effects, file paths and config schema. | Current — 2026-11-13 |
 | [`implementation-plan.md`](implementation-plan.md) | Phased build order, module layout, dependency set, per-phase acceptance criteria, test strategy and the risk-to-phase mapping. Ends with **what shipped**, including the deviations from the plan and why. | Current — 2026-11-13 |
 | [`research-model-refresh-codex-eggserve-limits.md`](research-model-refresh-codex-eggserve-limits.md) | Follow-up research: how the model catalogue is refreshed today, what adding a ChatGPT/Codex OAuth path would take, whether `eggserve` should replace the handrolled HTTP server, and what plan/usage limits x.ai and OpenAI actually expose. | Current — 2026-11-13 |
 | [`plan-eggpass.md`](plan-eggpass.md) | The plan for turning `eggpass` into a combined Grok + ChatGPT proxy: the streaming-concurrency findings, whether to drop the static model catalogue, the provider/routing/credential design, and the phase breakdown. Built on **Sign in with ChatGPT for Open Source**, not the Codex CLI's OAuth client. Also carries the rename map, the interactive provider picker, the `port`/`host` address commands, the eggpack/eggup packaging ecosystem, and the eggpool relationship. | Current — 2026-11-13 |
@@ -45,6 +45,7 @@ Nothing in this directory ships with the binary.
 | ChatGPT auth | Sign in with ChatGPT for Open Source — dynamic registration, no client secret, public `https://api.openai.com/v1` |
 | ChatGPT callback port | Random ephemeral loopback, path `/auth/callback`, host `127.0.0.1` — SIWC permits a variable port |
 | Provider selection | Interactive picker — `j`/`k` or `↑`/`↓` to move, `Enter` selects, `q`/`Esc` cancels; numbered-list fallback when stdin is not a TTY |
+| Client keys | Issued by `eggpass key add` — shown once, stored as a salted hash, numbered, revoked by number; a key takes effect on the next request |
 | Re-login | Replaces the stored credential atomically; there is no `--force` flag and no "already logged in" refusal |
 | Logout | Revokes at the provider, then deletes the local credential; best-effort revocation, never a hard failure |
 | Picker implementation | `nix`'s termios, following the family's own terminal selector — originally `crossterm`, reversed when the crossterm picker was found to render the menu as a staircase |

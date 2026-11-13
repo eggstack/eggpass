@@ -44,8 +44,18 @@ pub struct ProviderHandle {
 
 /// Everything a request handler needs.
 pub struct ServerContext {
-    /// The key clients must present. Empty means "accept anything".
+    /// The address the server is bound to.
+    ///
+    /// A server that is not on loopback refuses unauthenticated requests, so
+    /// a proxy on the network is never an open one.
+    pub host: String,
+    /// A key clients may present, taken from the configuration file.
+    ///
+    /// Empty means there is no such key. The keys `eggpass` issued are
+    /// accepted as well.
     pub api_key: String,
+    /// The keys `eggpass` issued to its clients.
+    pub keys: Arc<crate::keys::KeyStore>,
     /// The providers that are available.
     pub providers: HashMap<ProviderId, ProviderHandle>,
     /// The provider used when no prefix matches the model.
@@ -202,33 +212,59 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
     }
 }
 
-/// Whether the request carries the configured API key.
+/// Whether the request carries a key we accept.
 ///
-/// The key may arrive as `Authorization: Bearer`, as `X-Api-Key`, or as a
-/// `key` query parameter. When no key is configured, everything is allowed —
-/// the server only ever binds to loopback unless the user says otherwise.
+/// A key may arrive as `Authorization: Bearer`, as `X-Api-Key`, or as a `key`
+/// query parameter, and may be one of the keys `eggpass` issued or the one
+/// written in the configuration file.
+///
+/// When no key is configured at all, the request is allowed — but only while
+/// the server is on loopback. A server that is reachable from the network
+/// refuses everything, because an unauthenticated proxy on someone's paid
+/// plan is an open proxy.
 pub fn is_authorized(context: &ServerContext, request: &Request) -> bool {
-    if context.api_key.is_empty() {
-        return true;
+    let configured = !context.api_key.is_empty() || !context.keys.is_empty();
+
+    if !configured {
+        return crate::config::is_loopback_host(&context.host);
     }
+
+    for candidate in presented_keys(request) {
+        if !context.api_key.is_empty()
+            && crate::keys::constant_time_eq(candidate.as_bytes(), context.api_key.as_bytes())
+        {
+            return true;
+        }
+        if context.keys.verify(&candidate) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// The keys a request presents.
+///
+/// A request may present more than one — a header and a query parameter, say
+/// — and any one of them being right is enough.
+fn presented_keys(request: &Request) -> Vec<String> {
+    let mut candidates = Vec::new();
 
     for (name, value) in &request.headers {
         let lowered = name.to_ascii_lowercase();
         let value = value.trim();
         match lowered.as_str() {
             "authorization" => {
-                let token = value
-                    .strip_prefix("Bearer ")
-                    .or_else(|| value.strip_prefix("bearer "));
-                if let Some(token) = token
-                    && constant_time_eq(token.trim(), &context.api_key)
-                {
-                    return true;
+                if let Some(token) = strip_bearer(value) {
+                    let token = token.trim();
+                    if !token.is_empty() {
+                        candidates.push(token.to_string());
+                    }
                 }
             }
             "x-api-key" => {
-                if constant_time_eq(value, &context.api_key) {
-                    return true;
+                if !value.is_empty() {
+                    candidates.push(value.to_string());
                 }
             }
             _ => {}
@@ -239,26 +275,25 @@ pub fn is_authorized(context: &ServerContext, request: &Request) -> bool {
         let Some((name, value)) = pair.split_once('=') else {
             continue;
         };
-        if name.eq_ignore_ascii_case("key") && constant_time_eq(value, &context.api_key) {
-            return true;
+        if name.eq_ignore_ascii_case("key") {
+            let value = value.trim();
+            if !value.is_empty() {
+                candidates.push(value.to_string());
+            }
         }
     }
 
-    false
+    candidates
 }
 
-/// Compare two secrets without leaking their length through timing.
-fn constant_time_eq(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    if left.len() != right.len() {
-        return false;
+/// The token of a `Bearer` authorization header.
+fn strip_bearer(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        Some(token)
+    } else {
+        None
     }
-    let mut difference = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        difference |= a ^ b;
-    }
-    difference == 0
 }
 
 /// An error in the OpenAI error shape.
@@ -277,9 +312,19 @@ pub fn openai_error(status: u16, message: &str, kind: &str) -> Response {
 mod authorisation_tests {
     use super::*;
 
+    fn empty_store() -> Arc<crate::keys::KeyStore> {
+        let directory = tempfile::tempdir().expect("temp dir");
+        // The directory is kept alive by the store's own path, and the file is
+        // only read, so dropping the directory handle here is harmless.
+        let path = directory.keep().join("keys.json");
+        Arc::new(crate::keys::KeyStore::open(path).expect("key store"))
+    }
+
     fn context_with_key(key: &str) -> ServerContext {
         ServerContext {
+            host: "127.0.0.1".to_string(),
             api_key: key.to_string(),
+            keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,
             routing: Routing::default(),
@@ -302,7 +347,7 @@ mod authorisation_tests {
     }
 
     #[test]
-    fn an_empty_key_accepts_everything() {
+    fn an_empty_key_accepts_everything_on_loopback() {
         let context = context_with_key("");
         assert!(is_authorized(&context, &request_with(vec![], "")));
     }
@@ -332,9 +377,83 @@ mod authorisation_tests {
     }
 
     #[test]
+    fn an_issued_key_is_accepted() {
+        let context = context_with_key("");
+        let (_, plain) = context.keys.add(None).expect("key");
+
+        assert!(is_authorized(
+            &context,
+            &request_with(vec![("Authorization", &format!("Bearer {plain}"))], "")
+        ));
+        assert!(is_authorized(
+            &context,
+            &request_with(vec![("X-Api-Key", &plain)], "")
+        ));
+        assert!(!is_authorized(
+            &context,
+            &request_with(vec![("Authorization", "Bearer sk-eggpass-nope")], "")
+        ));
+    }
+
+    #[test]
+    fn a_revoked_key_stops_working() {
+        let context = context_with_key("");
+        let (_, first) = context.keys.add(None).expect("key");
+        let (_, second) = context.keys.add(None).expect("key");
+
+        context.keys.revoke(1).expect("revoke");
+
+        assert!(!is_authorized(
+            &context,
+            &request_with(vec![("Authorization", &format!("Bearer {first}"))], "")
+        ));
+        assert!(is_authorized(
+            &context,
+            &request_with(vec![("Authorization", &format!("Bearer {second}"))], "")
+        ));
+    }
+
+    #[test]
+    fn revoking_the_last_key_leaves_the_endpoint_open_on_loopback() {
+        let context = context_with_key("");
+        context.keys.add(None).expect("key");
+        context.keys.revoke(1).expect("revoke");
+
+        // No key configured at all is the default posture: the socket is on
+        // loopback, so nothing outside this machine can reach it.
+        assert!(is_authorized(&context, &request_with(vec![], "")));
+    }
+
+    #[test]
+    fn a_server_off_loopback_without_a_key_refuses_everything() {
+        let mut context = context_with_key("");
+        context.host = "0.0.0.0".to_string();
+
+        assert!(!is_authorized(&context, &request_with(vec![], "")));
+        assert!(!is_authorized(
+            &context,
+            &request_with(vec![("Authorization", "Bearer anything")], "")
+        ));
+    }
+
+    #[test]
+    fn a_server_off_loopback_with_a_key_serves() {
+        let mut context = context_with_key("secret");
+        context.host = "0.0.0.0".to_string();
+
+        assert!(is_authorized(
+            &context,
+            &request_with(vec![("Authorization", "Bearer secret")], "")
+        ));
+        assert!(!is_authorized(&context, &request_with(vec![], "")));
+    }
+
+    #[test]
     fn the_upstream_slots_are_bounded() {
         let context = ServerContext {
+            host: "127.0.0.1".to_string(),
             api_key: String::new(),
+            keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,
             routing: Routing::default(),

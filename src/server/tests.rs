@@ -217,6 +217,8 @@ fn serve_stub(
 /// The proxy, running in front of a stub upstream.
 struct Harness {
     port: u16,
+    /// The keys the proxy accepts, so a test can issue one.
+    keys: Arc<crate::keys::KeyStore>,
     _directory: tempfile::TempDir,
 }
 
@@ -339,6 +341,8 @@ fn harness_with_spec(
     let client = OAuthClient::for_provider(&spec, "client");
     let tokens = TokenManager::new(paths.credential_file(spec.id.as_str()), client);
 
+    let keys = Arc::new(crate::keys::KeyStore::open(paths.key_store_file()).expect("key store"));
+
     let mut providers = HashMap::new();
     providers.insert(
         spec.id,
@@ -350,7 +354,9 @@ fn harness_with_spec(
     );
 
     let context = Arc::new(ServerContext {
+        host: "127.0.0.1".to_string(),
         api_key: api_key.to_string(),
+        keys: Arc::clone(&keys),
         providers,
         default_provider: spec.id,
         routing: Routing::default(),
@@ -369,6 +375,7 @@ fn harness_with_spec(
 
     Harness {
         port,
+        keys,
         _directory: directory,
     }
 }
@@ -588,6 +595,65 @@ fn the_configured_key_is_required() {
         requests[0].header("Authorization"),
         Some("Bearer grok-token")
     );
+}
+
+#[test]
+fn an_issued_key_is_required_once_one_exists() {
+    let stub = Stub::start(|_| Reply::json(200, r#"{"ok":true}"#));
+    let harness = harness(&stub, "", "grok-token");
+    let (_, plain) = harness.keys.add(None).expect("a key is issued");
+
+    // Without a key.
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .send(chat_body().to_string())
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 401);
+
+    // With the key we issued.
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {plain}"))
+        .send(chat_body().to_string())
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 200);
+
+    // The upstream never saw the client's key.
+    let requests = stub.requests();
+    assert_eq!(requests[0].header("X-Api-Key"), None);
+    assert_eq!(
+        requests[0].header("Authorization"),
+        Some("Bearer grok-token")
+    );
+}
+
+#[test]
+fn a_revoked_key_is_refused_without_a_restart() {
+    let stub = Stub::start(|_| Reply::json(200, r#"{"ok":true}"#));
+    let harness = harness(&stub, "", "grok-token");
+    let (_, revoked) = harness.keys.add(None).expect("a key is issued");
+    let (_, kept) = harness.keys.add(None).expect("another key is issued");
+
+    let request = |key: &str| {
+        agent()
+            .post(harness.url("/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .header("Authorization", &format!("Bearer {key}"))
+            .send(chat_body().to_string())
+            .expect("the proxy answers")
+            .status()
+            .as_u16()
+    };
+
+    assert_eq!(request(&revoked), 200);
+    assert_eq!(request(&kept), 200);
+
+    harness.keys.revoke(1).expect("the key is revoked");
+
+    assert_eq!(request(&revoked), 401, "the revoked key is still accepted");
+    assert_eq!(request(&kept), 200, "the other key stopped working");
 }
 
 #[test]

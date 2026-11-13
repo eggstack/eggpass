@@ -9,6 +9,7 @@ mod auth;
 mod cli;
 mod config;
 mod daemon;
+mod keys;
 mod logging;
 mod migrate;
 mod paths;

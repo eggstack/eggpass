@@ -240,6 +240,7 @@ Server:   running
   url:       http://127.0.0.1:8484
   host:      127.0.0.1
   port:      8484
+  auth:      2 key(s)
   upstream:  api.x.ai
   models:    10 available
 ```
@@ -254,7 +255,9 @@ Server:   stopped
 
 Each provider appears in a fixed order so the output stays diffable. The
 `models` line is only meaningful for the provider serving inference; it is
-omitted when no provider is logged in.
+omitted when no provider is logged in. The `auth` line says how the endpoint
+is protected: `open — no key configured`, `N key(s)`, or `the key from the
+configuration file`.
 
 **Exit codes:** `0` always. Parseability matters more than status codes here —
 `status` is a human-facing command.
@@ -411,10 +414,14 @@ eggpass host 0.0.0.0      # bind every interface
 5. **A non-loopback host needs authentication.** Binding anywhere other than
    `127.0.0.1`/`::1` puts the proxy — and through it the user's x.ai and
    ChatGPT subscriptions — on the network. So:
-   - if `api_key` is empty, the change is refused, naming the setting that has
-     to be configured first;
-   - if `api_key` is set, the change is allowed and the command warns that the
+   - if there is no key at all — neither one issued by `eggpass key add` nor an
+     `api_key` in the config — the change is refused, naming the command that
+     has to be run first;
+   - if there is a key, the change is allowed and the command warns that the
      proxy is now reachable from the network.
+
+   A server that is already bound outside loopback and then loses its last key
+   refuses every request rather than serving as an open proxy.
 6. **Check the address is bindable before restarting.** If `host:port` cannot
    be bound, print `host <host> is not bindable` and change nothing.
 7. **Apply** — stop, write the config, start, wait for `/health`, print the new
@@ -430,7 +437,7 @@ running on http://0.0.0.0:8484 (pid 51234)
 ```
 
 **Exit codes:** `0` ok, including "already serving" · `1` invalid host, host
-not bindable, no `api_key` configured for a non-loopback host, or the restart
+not bindable, no key configured for a non-loopback host, or the restart
 failed.
 
 ---
@@ -569,11 +576,92 @@ not validate, or the transaction failed.
 
 ---
 
+## `eggpass key`
+
+Issue, list and revoke the keys that clients use to reach the endpoint.
+
+```
+eggpass key              # list the keys
+eggpass key list         # the same
+eggpass key add          # mint a key and show it once
+eggpass key add laptop   # mint a key and give it a label
+eggpass key revoke 2     # revoke the key numbered 2
+eggpass key revoke --all # revoke every key
+```
+
+**Behaviour**
+
+1. **`eggpass` issues the key.** The user never brings their own: `add` mints a
+   key from the system CSPRNG and shows it **exactly once**. There is no
+   `key set` — the point of the command is that the key is `eggpass`'s to
+   make.
+2. **Only the hash is stored.** The store holds a per-key random salt and the
+   SHA-256 of `salt || key`, plus the visible prefix, the optional label and
+   the creation time. The key itself is never written to disk, so the file
+   cannot be read to impersonate a client. The file is `0600` in a `0700`
+   directory, and is written atomically.
+3. **Keys are numbered, and the number is stable.** The first key is `#1`, the
+   next `#2`, and so on. A number is never reused and never renumbered when
+   another key is revoked, so `revoke 2` always means the same key. The number
+   is what `revoke` takes, and it is what `list` prints.
+4. **A key is not tied to one client.** One key may be used by several clients.
+   The optional label is for the user's own bookkeeping — `laptop`, `phone` —
+   and `list` shows it.
+5. **`list` shows only the visible part** — the first 20 characters, which is
+   the fixed `sk-eggpass-` marker plus a few random characters. That is enough
+   to tell two keys apart in a list and not enough to use one.
+6. **A key takes effect on the next request.** The server re-reads the store
+   whenever the file changes underneath it, so `add` and `revoke` need no
+   restart. The store has exactly one writer — this command — so the file is
+   never contended.
+7. **Authentication is required when there is a key.** While the store is empty
+   and the config's `api_key` is empty, the endpoint accepts anything, which is
+   the safe default for a loopback socket. The moment a key exists, a key is
+   required. Revoking the last one puts the endpoint back to open, and the
+   command says so.
+8. **The config's `api_key` still works.** It is the older, hand-written way
+   to set one key, and it is accepted alongside the issued ones. It is not
+   removed, because a configuration file that suddenly stops parsing is worse
+   than a second way in.
+
+**Output**
+
+```
+$ eggpass key add laptop
+Created key #1.
+
+    sk-eggpass-3nQ7fB2xWvKcR8dTmZaYhLpEuJqXf1s
+
+This is the only time the key is shown — only its hash is stored.
+Send it as:
+    Authorization: Bearer sk-eggpass-3nQ7fB2xWvKcR8dTmZaYhLpEuJqXf1s
+```
+
+```
+$ eggpass key list
+  #  key                  label          created
+  1  sk-eggpass-3nQ7fB2x   laptop        2026-11-13T21:30:00Z
+  2  sk-eggpass-qR7xZ9mT   phone         2026-11-13T21:44:12Z
+
+Revoke one with `eggpass key revoke <number>`.
+```
+
+```
+$ eggpass key revoke 2
+Revoked key #2 (sk-eggpass-qR7xZ9mT).
+```
+
+**Exit codes:** `0` ok · `1` the key number does not exist, the store could not
+be read or written, or the arguments were wrong.
+
+---
+
 ## Files
 
 | Path | Purpose | Mode |
 | --- | --- | --- |
 | `~/.config/eggpass/config.toml` | User-editable config | `0644` |
+| `~/.config/eggpass/keys.json` | The keys `eggpass` issued — salted hashes, never the keys | `0600` |
 | `~/.config/eggpass/credentials/xai.json` | x.ai OAuth tokens | `0600` (dir `0700`) |
 | `~/.config/eggpass/credentials/openai.json` | ChatGPT OAuth tokens, issued client id, host id | `0600` (dir `0700`) |
 | `~/.config/eggpass/eggpass.pid` | Daemon PID, the host it bound and the port it is serving | `0644` |
@@ -609,7 +697,9 @@ nothing the second time.
 
 host = "127.0.0.1"  # the address to bind; "localhost"/"local"/"loopback" mean 127.0.0.1
 port = 8484
-api_key = ""          # empty = accept any key (safe only while the host is loopback)
+api_key = ""          # empty = accept any key (safe only while the host is loopback);
+                      # `eggpass key add` issues keys of its own, and those are
+                      # accepted alongside this one
 log_level = "info"    # error | warn | info | debug
 allow_privileged_port = false
 
@@ -701,3 +791,10 @@ not understand survive.
 `GET /v1/models` is a **live round trip**. There is no static catalogue: the
 union of the signed-in providers' catalogues is what is advertised, and a
 model id no provider advertises is a `404`.
+
+**Authentication.** Every endpoint except `/health` needs a key when one is
+configured. The key may arrive as `Authorization: Bearer <key>`, as
+`X-Api-Key: <key>`, or as a `key` query parameter, and may be one of the keys
+`eggpass key add` issued or the `api_key` in the config file. A request
+without an accepted key is a `401` in the OpenAI error shape. The client's key
+is stripped before the request is forwarded upstream.

@@ -76,7 +76,8 @@ waiting for it, exactly as the official CLI does.
 | `eggpass stop` | Stop the daemon. |
 | `eggpass restart` | Stop the daemon, then start it again. |
 | `eggpass port` | Show the listen port, or change it. A change is applied and the server is restarted for you. |
-| `eggpass host` | Show the bind address, or change it. Same behaviour as `port` — loopback only unless you set an API key. |
+| `eggpass host` | Show the bind address, or change it. Same behaviour as `port` — loopback only unless you have a key. |
+| `eggpass key` | Issue, list and revoke the keys your clients use. `add` mints one and shows it once, `list` shows the numbers, `revoke <n>` takes one away. |
 | `eggpass edit` | Open the config file in `$EDITOR`. |
 | `eggpass croncheck` | Start the daemon only if it is not already running. Prints nothing. |
 | `eggpass update` | Update to the latest released version, or to one exact version. `--check` reports without changing anything. |
@@ -114,6 +115,45 @@ keystroke. `j`/`k` and the arrow keys both move the cursor, and the cursor
 stops at the ends rather than wrapping. `q` or `Esc` cancels, and `Ctrl-C`
 interrupts the command.
 
+### Client keys
+
+`eggpass` issues the keys your clients use. You never bring your own — it
+mints them, shows them once, and stores only a salted hash:
+
+```sh
+$ eggpass key add laptop
+
+Created key #1.
+
+    sk-eggpass-3nQ7fB2xWvKcR8dTmZaYhLpEuJqXf1s
+
+This is the only time the key is shown — only its hash is stored.
+Send it as:
+    Authorization: Bearer sk-eggpass-3nQ7fB2xWvKcR8dTmZaYhLpEuJqXf1s
+```
+
+`eggpass key list` shows what exists, with the number each key is revoked by
+and enough of the key to tell two of them apart:
+
+```
+  #  key                  label          created
+  1  sk-eggpass-3nQ7fB2x   laptop        2026-11-13T21:30:00Z
+  2  sk-eggpass-qR7xZ9mT   phone         2026-11-13T21:44:12Z
+```
+
+`eggpass key revoke 2` takes the second one away, and `eggpass key revoke --all`
+takes every one away. A key is not tied to a single client: issue one and use
+it on your laptop and your phone, or issue one per device if you would rather
+know which is which.
+
+A new key works on the **next request** — the server re-reads the store
+whenever it changes, so nothing has to be restarted.
+
+While there are no keys at all the endpoint is open to anything on the machine,
+which is the safe default for a loopback socket. The moment you issue a key, a
+key is required. Revoking the last one puts it back to open, and the command
+says so when it happens.
+
 ### Keeping it alive with cron
 
 ```cron
@@ -135,6 +175,7 @@ port = 8484
 
 # Key clients must send as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
 # Leave empty to accept any key — which is only safe while the host is loopback.
+# `eggpass key add` issues keys of its own; this is the older, hand-written way.
 api_key = ""
 
 # Log verbosity: error | warn | info | debug
@@ -263,7 +304,7 @@ Add the provider to `~/.config/opencode/opencode.json`:
 | --- | --- |
 | API provider | OpenAI Compatible |
 | Base URL | `http://127.0.0.1:8484/v1` |
-| API key | anything, e.g. `sk-local` — unless you set `api_key` in the config |
+| API key | anything, e.g. `sk-local` — unless you have issued a key with `eggpass key add`, in which case use that one |
 | Model | any model name from `GET /v1/models` |
 
 ### curl
@@ -295,6 +336,10 @@ curl http://127.0.0.1:8484/v1/chat/completions \
   before the request is forwarded, and the provider's token is put in their
   place. The provider-owned headers are stripped too, so a client cannot make
   the proxy claim to be a different build.
+- **Client keys are issued by `eggpass`.** `eggpass key add` mints a key, shows
+  it exactly once, and stores a salted hash of it — never the key itself. The
+  server re-reads the store whenever it changes, so a key can be added or
+  revoked without a restart.
 - **Tokens refresh themselves** five minutes before they expire. A refresh
   that returns no new refresh token keeps the old one, so a rotating provider
   cannot lock you out. Each provider has its own credential file and its own
@@ -311,6 +356,7 @@ curl http://127.0.0.1:8484/v1/chat/completions \
 | Path | Purpose | Mode |
 | --- | --- | --- |
 | `~/.config/eggpass/config.toml` | Your configuration | `0644` |
+| `~/.config/eggpass/keys.json` | The keys `eggpass` issued — salted hashes only | `0600` |
 | `~/.config/eggpass/credentials/xai.json` | x.ai OAuth tokens | `0600` (directory `0700`) |
 | `~/.config/eggpass/credentials/openai.json` | ChatGPT OAuth tokens | `0600` |
 | `~/.config/eggpass/eggpass.pid` | Daemon pid, the host it bound, the port it serves | `0644` |
@@ -337,8 +383,8 @@ the official Grok CLI will need its own login again. Log in with
 expired and cannot be refreshed. Log in again.
 
 **`401` from the proxy** — either you are logged out, or the client is
-sending the wrong key. Check `eggpass status`, and check `api_key` in the
-config.
+sending the wrong key. Check `eggpass status`, and check `eggpass key list`:
+if it shows a key, the client has to send one of them.
 
 **`address already in use`** — something else is on the port. Pick another one
 with `eggpass port 9000`; the command checks the port is free before it
@@ -406,8 +452,10 @@ up where it was.
 
 `host` defaults to loopback, and that default is the safe one: binding
 elsewhere puts the proxy, and through it your paid subscriptions, on the
-network. A non-loopback host is refused unless you set an `api_key`, and warns
-when it is allowed.
+network. A non-loopback host is refused unless you have a key — one issued by
+`eggpass key add`, or the `api_key` in the config file — and warns when it is
+allowed. A server bound outside loopback with no key at all refuses every
+request rather than serving as an open proxy.
 
 ### Updating
 

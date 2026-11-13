@@ -20,6 +20,8 @@ pub const PID_FILE_NAME: &str = "eggpass.pid";
 pub const LOG_FILE_NAME: &str = "eggpass.log";
 /// Name of the directory holding the per-provider credential files.
 pub const CREDENTIALS_DIR_NAME: &str = "credentials";
+/// Name of the file holding the keys `eggpass` issues to its clients.
+pub const KEY_STORE_FILE_NAME: &str = "keys.json";
 /// The legacy single-provider credential file, kept for the migration.
 pub const LEGACY_AUTH_FILE_NAME: &str = "auth.json";
 /// The name this project had before the rename.
@@ -104,6 +106,11 @@ impl Paths {
     /// The credential file for one provider (`credentials/<provider>.json`).
     pub fn credential_file(&self, provider: &str) -> PathBuf {
         self.credentials_dir().join(format!("{provider}.json"))
+    }
+
+    /// The file holding the keys `eggpass` issues to its clients.
+    pub fn key_store_file(&self) -> PathBuf {
+        self.dir.join(KEY_STORE_FILE_NAME)
     }
 
     /// The daemon pid file.

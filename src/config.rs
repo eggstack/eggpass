@@ -380,6 +380,7 @@ port = 8484
 
 # Key clients must send as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
 # Leave empty to accept any key — which is only safe while the host is loopback.
+# `eggpass key add` issues keys of its own; this is the older, hand-written way.
 api_key = ""
 
 # Log verbosity: error | warn | info | debug

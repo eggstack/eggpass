@@ -521,8 +521,28 @@ The multi-provider phase — the rename, the provider layer, the ChatGPT SIWC
 path, the picker, the address commands and the updater — is recorded
 separately in [`shipped-2026-11-13.md`](shipped-2026-11-13.md).
 
-### Open risk #1 is resolved
+### Added after the plan: `eggpass` issues the client keys
 
+The plan had one key for clients — the `api_key` in the config file, written by
+hand. `eggpass` now issues its own:
+
+```
+eggpass key add [LABEL]   mint a key and show it once
+eggpass key list           the numbers, the visible parts, the labels
+eggpass key revoke <N>     take one away
+```
+
+`src/keys.rs` holds the store: a per-key random salt and the SHA-256 of
+`salt || key`, never the key itself, in `~/.config/eggpass/keys.json` at mode
+`0600`. The numbers are stable and never reused, so `revoke 2` always means
+the same key. The store has one writer — this command — and the server re-reads
+it whenever it changes, so a key takes effect on the next request with no
+restart.
+
+One behaviour changed with it: a server bound outside loopback with no key at
+all now refuses every request rather than serving as an open proxy.
+
+### Open risk #1 is resolved
 `api.x.ai` **does** accept the x.ai OAuth token. Verified live on
 2026-11-13 through the proxy: `GET /v1/models` returned thirteen models
 including `grok-4.7` and `grok-4.6`, and a `grok-4.7` chat completion and a

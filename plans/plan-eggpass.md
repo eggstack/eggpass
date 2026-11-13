@@ -1774,6 +1774,7 @@ and the delta.
 | 6.2 — The rename | Shipped | The crate, the binary, `EGGPASS_HOME`, the pid file, the log file, and the config directory. |
 | 7 — The picker | Shipped | On `nix`'s termios, following the family's own terminal selector, with the numbered-list fallback and pseudoterminal tests. |
 | 8 — Packaging and updates | Shipped | The updater's **policy** is ours; the mechanics are `eggup`'s. |
+| 9 — Client keys | Shipped | `eggpass key add`, `eggpass key list`, `eggpass key revoke`. `eggpass` issues the keys, shows each one once, and stores only a salted hash. Added after the plan was written. |
 
 ### The delta from the plan
 

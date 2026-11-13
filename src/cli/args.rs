@@ -58,6 +58,30 @@ pub enum Command {
         /// Report what would happen without changing anything.
         check: bool,
     },
+    /// Issue, list and revoke the keys clients use.
+    Key {
+        /// What to do with the keys.
+        action: KeyAction,
+    },
+}
+
+/// What `eggpass key` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Mint a key and show it once.
+    Add {
+        /// What the key is for, when the user said.
+        label: Option<String>,
+    },
+    /// Show the keys that exist.
+    List,
+    /// Take a key away.
+    Revoke {
+        /// The number of the key to take away.
+        id: Option<u32>,
+        /// Whether to take every key away.
+        all: bool,
+    },
 }
 
 /// A parsed command line.
@@ -343,6 +367,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
             }
             Command::Update { version, check }
         }
+        "key" => {
+            let action = parse_key_action(&rest)?;
+            Command::Key { action }
+        }
         other => {
             return Err(UsageError {
                 message: format!("unknown command `{other}`"),
@@ -387,6 +415,83 @@ fn parse_port(value: &str) -> Result<u16, UsageError> {
     Ok(port as u16)
 }
 
+/// Parse the arguments of `eggpass key`.
+///
+/// With no arguments at all the keys are listed, which is what the user most
+/// often wants to see.
+fn parse_key_action(rest: &[String]) -> Result<KeyAction, UsageError> {
+    let Some(first) = rest.first() else {
+        return Ok(KeyAction::List);
+    };
+
+    match first.as_str() {
+        "add" => {
+            if let Some(extra) = rest.get(2) {
+                return Err(UsageError {
+                    message: format!("`eggpass key add` takes at most one label (got `{extra}`)"),
+                });
+            }
+            Ok(KeyAction::Add {
+                label: rest.get(1).cloned(),
+            })
+        }
+        "list" => {
+            if let Some(extra) = rest.get(1) {
+                return Err(UsageError {
+                    message: format!("`eggpass key list` takes no arguments (got `{extra}`)"),
+                });
+            }
+            Ok(KeyAction::List)
+        }
+        "revoke" => {
+            let mut id = None;
+            let mut all = false;
+            for arg in &rest[1..] {
+                if arg == "--all" {
+                    all = true;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    return Err(UsageError {
+                        message: format!("unknown option `{arg}` for `eggpass key revoke`"),
+                    });
+                }
+                if id.is_some() {
+                    return Err(UsageError {
+                        message: "`eggpass key revoke` takes at most one key number".to_string(),
+                    });
+                }
+                id = Some(parse_key_number(arg)?);
+            }
+            if id.is_none() && !all {
+                return Err(UsageError {
+                    message: "`eggpass key revoke` needs the number of a key, or `--all`"
+                        .to_string(),
+                });
+            }
+            Ok(KeyAction::Revoke { id, all })
+        }
+        other => Err(UsageError {
+            message: format!(
+                "unknown action `{other}` for `eggpass key` (expected \"add\", \"list\" or \"revoke\")"
+            ),
+        }),
+    }
+}
+
+/// Parse the number of a key given on the command line.
+fn parse_key_number(value: &str) -> Result<u32, UsageError> {
+    let number: u32 = value.parse().map_err(|_| UsageError {
+        message: format!("invalid key number `{value}` (expected a number from 1 upwards)"),
+    })?;
+    if number == 0 {
+        return Err(UsageError {
+            message: format!("invalid key number `{value}` (expected a number from 1 upwards)"),
+        });
+    }
+    Ok(number)
+}
+
 /// The top-level help text.
 pub fn global_help() -> String {
     format!(
@@ -406,7 +511,8 @@ pub fn global_help() -> String {
              host        Show or change the bind address\n    \
              edit        Open the config file in your editor\n    \
              croncheck   Start the daemon only if it is not already running\n    \
-             update      Update to the latest released version\n\
+             update      Update to the latest released version\n    \
+             key         Issue, list and revoke the keys clients use\n\
          \n\
          OPTIONS:\n    \
              --config <path>     Use a different config file\n    \
@@ -453,6 +559,16 @@ pub fn command_help(name: &str) -> String {
         "update" => {
             "eggpass update [VERSION]\n\nUpdate to the latest released version, or to one exact\n            version. A running server keeps the old binary until it is restarted.\n\n\
              \x20           --check   Report what would happen, change nothing\n"
+                .to_string()
+        }
+        "key" => {
+            "eggpass key [add | list | revoke]\n\n\
+            Issue, list and revoke the keys your clients use. A key is shown\n\
+            once, when it is created, and only its hash is stored.\n\n\
+            add [LABEL]   Mint a key and show it once\n\
+            list          Show the keys, with their numbers and visible parts\n\
+            revoke <N>    Revoke the key numbered N\n\
+            revoke --all  Revoke every key\n"
                 .to_string()
         }
         other => format!("unknown command `{other}`\n"),
@@ -649,5 +765,62 @@ mod tests {
             parse_args(&["--version"]).unwrap(),
             ParseOutcome::Version(_)
         ));
+    }
+
+    #[test]
+    fn the_key_command_is_parsed() {
+        let key_of = |args: &[&str]| -> KeyAction {
+            let ParseOutcome::Run(cli) = parse_args(args).unwrap() else {
+                panic!("expected a command")
+            };
+            match cli.command {
+                Command::Key { action } => action,
+                other => panic!("expected a key command, got {other:?}"),
+            }
+        };
+
+        assert_eq!(key_of(&["key"]), KeyAction::List);
+        assert_eq!(key_of(&["key", "list"]), KeyAction::List);
+        assert_eq!(key_of(&["key", "add"]), KeyAction::Add { label: None });
+        assert_eq!(
+            key_of(&["key", "add", "laptop"]),
+            KeyAction::Add {
+                label: Some("laptop".to_string())
+            }
+        );
+        assert_eq!(
+            key_of(&["key", "revoke", "2"]),
+            KeyAction::Revoke {
+                id: Some(2),
+                all: false
+            }
+        );
+        assert_eq!(
+            key_of(&["key", "revoke", "--all"]),
+            KeyAction::Revoke {
+                id: None,
+                all: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_mistyped_key_command_is_a_usage_error() {
+        assert!(parse_args(&["key", "mint"]).is_err());
+        assert!(parse_args(&["key", "revoke"]).is_err());
+        assert!(parse_args(&["key", "revoke", "0"]).is_err());
+        assert!(parse_args(&["key", "revoke", "abc"]).is_err());
+        assert!(parse_args(&["key", "revoke", "1", "2"]).is_err());
+        assert!(parse_args(&["key", "revoke", "--nope"]).is_err());
+        assert!(parse_args(&["key", "list", "extra"]).is_err());
+        assert!(parse_args(&["key", "add", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn the_key_command_has_its_own_help() {
+        let ParseOutcome::Help(text) = parse_args(&["key", "--help"]).unwrap() else {
+            panic!("expected help")
+        };
+        assert!(text.contains("revoke"), "{text}");
     }
 }

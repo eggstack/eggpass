@@ -178,8 +178,31 @@ fn serve(context: &Context) -> Result<(), CommandError> {
         .default_provider
         .unwrap_or(ProviderId::Xai);
 
+    // The keys `eggpass` issued. The server reads them afresh whenever the
+    // file changes, so `eggpass key add` and `eggpass key revoke` take
+    // effect without a restart.
+    let keys = Arc::new(
+        crate::keys::KeyStore::open(context.paths.key_store_file())
+            .map_err(|err| CommandError::new(err.to_string()))?,
+    );
+
+    // A server that is reachable from the network and has no key refuses
+    // every request rather than serving as an open proxy. Say so loudly: the
+    // user probably means to issue a key.
+    if !crate::config::is_loopback_host(&context.config.host)
+        && context.config.api_key.is_empty()
+        && keys.is_empty()
+    {
+        crate::logging::error(&format!(
+            "bound to {} with no API key configured; every request will be refused until `eggpass key add` is run",
+            context.config.host
+        ));
+    }
+
     let server_context = Arc::new(ServerContext {
+        host: context.config.host.clone(),
         api_key: context.config.api_key.clone(),
+        keys,
         providers,
         default_provider,
         routing: context.config.routing.clone(),

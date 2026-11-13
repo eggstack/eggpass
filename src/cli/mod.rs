@@ -172,5 +172,6 @@ fn dispatch(context: &Context) -> Result<(), CommandError> {
         Command::Update { version, check } => {
             commands::update::update(context, version.clone(), *check)
         }
+        Command::Key { action } => commands::key::key(context, action.clone()),
     }
 }

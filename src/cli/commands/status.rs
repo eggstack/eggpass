@@ -94,6 +94,7 @@ fn print_server(context: &Context) {
             );
             println!("  host:      {host}");
             println!("  port:      {port}");
+            println!("  auth:      {}", auth_summary(context));
             println!("  upstream:  {}", context.config.upstream.display_name());
             println!("  models:    {}", model_count(context));
         }
@@ -101,11 +102,31 @@ fn print_server(context: &Context) {
             println!("Server:   stopped");
             println!("  pid:       {pid} (stale)");
             println!("  url:       {}", context.config.api_base_url());
+            println!("  auth:      {}", auth_summary(context));
         }
         DaemonState::Stopped => {
             println!("Server:   stopped");
             println!("  url:       {}", context.config.api_base_url());
+            println!("  auth:      {}", auth_summary(context));
         }
+    }
+}
+
+/// How the endpoint is protected.
+///
+/// The keys `eggpass` issued are counted; the one in the configuration file
+/// is mentioned separately, because it is not one of them.
+fn auth_summary(context: &Context) -> String {
+    let issued = crate::keys::KeyStore::open(context.paths.key_store_file())
+        .map(|store| store.len())
+        .unwrap_or(0);
+    let configured = !context.config.api_key.is_empty();
+
+    match (issued, configured) {
+        (0, false) => "open — no key configured".to_string(),
+        (0, true) => "the key from the configuration file".to_string(),
+        (issued, false) => format!("{issued} key(s)"),
+        (issued, true) => format!("{issued} key(s), plus the one from the configuration file"),
     }
 }
 
