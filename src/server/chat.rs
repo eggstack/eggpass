@@ -44,8 +44,16 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
     let (path, query) = upstream::normalize_target(&request.target);
     let forwarded = upstream::sanitize_headers(&request.headers);
 
-    // Does the provider serve this path natively?
-    let native = handle.spec.native_paths == NativePaths::Both;
+    // Does the provider speak the shape the client used?
+    //
+    // A Responses-only provider speaks the Responses API natively, so a
+    // request to `/v1/responses` is forwarded as it is — only a Chat
+    // Completions request needs translating. Deciding this on the provider
+    // alone would translate a native Responses request into nonsense.
+    let native = match handle.spec.native_paths {
+        NativePaths::Both => true,
+        NativePaths::ResponsesOnly => path == "/v1/responses",
+    };
     let upstream_path = if native {
         path.clone()
     } else {
@@ -109,7 +117,20 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
         .to_string();
     let headers = super::forwarded_headers(&response.headers);
 
-    if content_type.starts_with("text/event-stream") {
+    // Whether this is an event stream.
+    //
+    // The `Content-Type` header is not enough on its own: `api.openai.com`
+    // answers a streamed Responses request with **no `Content-Type` header
+    // at all**, so a header-only check sends the stream down the plain-body
+    // path and tries to parse `event: response.created` as JSON.
+    //
+    // A provider that forces `stream: true` was asked for an event stream, so
+    // the answer is one — whatever the header says. The header is still
+    // honoured for providers that stream without being asked to.
+    let is_event_stream =
+        content_type.starts_with("text/event-stream") || handle.spec.policy.force_stream;
+
+    if is_event_stream {
         // The upstream is streaming.
         let body = response.body;
 

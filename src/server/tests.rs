@@ -187,8 +187,15 @@ fn serve_stub(
             content_type,
             chunks,
         } => {
+            // An empty content type means "send no Content-Type header",
+            // which is what `api.openai.com` does with a streamed response.
+            let content_type_line = if content_type.is_empty() {
+                String::new()
+            } else {
+                format!("Content-Type: {content_type}\r\n")
+            };
             let head = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nX-Ratelimit-Remaining: 42\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 {status} OK\r\n{content_type_line}X-Ratelimit-Remaining: 42\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(head.as_bytes())?;
             stream.flush()?;
@@ -250,16 +257,64 @@ fn stub_spec(stub: &Stub) -> ProviderSpec {
     }
 }
 
+/// A ChatGPT-shaped provider: Responses only, and a stream is mandatory.
+///
+/// This is the shape that matters for the `Content-Type` bug: OpenAI answers a
+/// streamed request with **no `Content-Type` header at all**, so the proxy
+/// cannot rely on the header to know it is looking at an event stream.
+fn chatgpt_stub_spec(stub: &Stub) -> ProviderSpec {
+    ProviderSpec {
+        id: ProviderId::OpenAi,
+        display_name: "ChatGPT",
+        issuer: stub.base_url(),
+        authorize_path: "/oauth2/authorize".to_string(),
+        token_path: "/oauth2/token".to_string(),
+        device_path: None,
+        userinfo_path: None,
+        revocation_path: None,
+        callback_path: "/auth/callback",
+        entry_client_id: "client".to_string(),
+        scopes: vec!["openid".to_string()],
+        extra_authorize_params: Vec::new(),
+        registration_params: Vec::new(),
+        extra_token_params: Vec::new(),
+        base_url: stub.base_url(),
+        extra_headers: Vec::new(),
+        policy: RequestPolicy {
+            strip_fields: &["temperature", "top_p"],
+            force_stream: true,
+            force_store_false: true,
+            require_input_array: true,
+        },
+        supports_device_flow: false,
+        issues_client_id: true,
+        trusted_device_hosts: &["auth.openai.com"],
+        catalogue: CatalogueKind::SlugArray,
+        native_paths: NativePaths::ResponsesOnly,
+    }
+}
+
 /// Start a proxy in front of a stub upstream.
 ///
 /// The stub upstream is also the OAuth issuer, so a refresh can be exercised
 /// without the network.
 fn harness(stub: &Stub, api_key: &str, access_token: &str) -> Harness {
+    harness_with_spec(stub, api_key, access_token, stub_spec(stub))
+}
+
+/// Start a proxy in front of a stub upstream, with an explicit provider spec.
+///
+/// The spec is written out here rather than derived from the configuration, so
+/// the test exercises the proxy rather than the configuration loader.
+fn harness_with_spec(
+    stub: &Stub,
+    api_key: &str,
+    access_token: &str,
+    spec: ProviderSpec,
+) -> Harness {
     let directory = tempfile::tempdir().expect("temp dir");
     let paths = Paths::in_directory(directory.path());
     paths.ensure_dir().expect("config dir");
-
-    let spec = stub_spec(stub);
 
     let now = timeutil::now_unix();
     let auth = StoredAuth {
@@ -277,16 +332,16 @@ fn harness(stub: &Stub, api_key: &str, access_token: &str) -> Harness {
         ext_agent_host_id: None,
         plan_enabled: false,
     };
-    crate::auth::store::save(&paths.credential_file("xai"), &auth)
+    crate::auth::store::save(&paths.credential_file(spec.id.as_str()), &auth)
         .expect("credentials are written");
 
     let upstream = UpstreamClient::new(&spec);
     let client = OAuthClient::for_provider(&spec, "client");
-    let tokens = TokenManager::new(paths.credential_file("xai"), client);
+    let tokens = TokenManager::new(paths.credential_file(spec.id.as_str()), client);
 
     let mut providers = HashMap::new();
     providers.insert(
-        ProviderId::Xai,
+        spec.id,
         ProviderHandle {
             spec: spec.clone(),
             upstream,
@@ -297,7 +352,7 @@ fn harness(stub: &Stub, api_key: &str, access_token: &str) -> Harness {
     let context = Arc::new(ServerContext {
         api_key: api_key.to_string(),
         providers,
-        default_provider: ProviderId::Xai,
+        default_provider: spec.id,
         routing: Routing::default(),
         upstream_in_flight: Arc::new(AtomicUsize::new(0)),
         max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
@@ -739,4 +794,177 @@ fn a_client_cannot_inject_the_provider_owned_headers() {
     assert_eq!(upstream.header("X-XAI-Token-Auth"), None);
     assert_eq!(upstream.header("x-grok-client-version"), None);
     assert_eq!(upstream.header("x-grok-client-identifier"), None);
+}
+
+#[test]
+fn a_streamed_response_without_a_content_type_is_still_a_stream() {
+    // `api.openai.com` answers a streamed Responses request with no
+    // `Content-Type` header at all. A header-only check sends the stream down
+    // the plain-body path and tries to parse `event: response.created` as
+    // JSON, which fails with "the response is not JSON".
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/responses") {
+            Reply::Stream {
+                status: 200,
+                // No Content-Type header, exactly as OpenAI sends it.
+                content_type: "",
+                chunks: vec![
+                    (
+                        Duration::from_millis(0),
+                        concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                        )
+                        .to_string(),
+                    ),
+                    (
+                        Duration::from_millis(0),
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                        )
+                        .to_string(),
+                    ),
+                    (
+                        Duration::from_millis(0),
+                        concat!(
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi there\"}]}]}}\n\n",
+                        )
+                        .to_string(),
+                    ),
+                ],
+            }
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness_with_spec(&stub, "", "chatgpt-token", chatgpt_stub_spec(&stub));
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .send(
+            json!({"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hello"}]})
+                .to_string(),
+        )
+        .expect("the proxy answers");
+
+    let body = read_json_body(response);
+    assert_eq!(body["object"], "chat.completion", "{body}");
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "hi there",
+        "{body}"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "stop", "{body}");
+}
+
+#[test]
+fn a_streamed_response_without_a_content_type_reaches_a_streaming_client() {
+    // The same missing header must not break the streaming path either.
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/responses") {
+            Reply::Stream {
+                status: 200,
+                content_type: "",
+                chunks: vec![
+                    (
+                        Duration::from_millis(0),
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                        )
+                        .to_string(),
+                    ),
+                    (
+                        Duration::from_millis(0),
+                        concat!(
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi there\"}]}]}}\n\n",
+                        )
+                        .to_string(),
+                    ),
+                ],
+            }
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness_with_spec(&stub, "", "chatgpt-token", chatgpt_stub_spec(&stub));
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .send(json!({"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hello"}], "stream": true}).to_string())
+        .expect("the proxy answers");
+
+    assert_eq!(response.status(), 200);
+    let text = response.into_body().read_to_string().expect("stream text");
+    // The deltas arrive as they do upstream; the completed event closes the
+    // stream rather than repeating the whole answer.
+    assert!(text.contains("chat.completion.chunk"), "{text}");
+    assert!(text.contains(r#""content":"hi""#), "{text}");
+    assert!(text.contains(r#""finish_reason":"stop""#), "{text}");
+    assert!(text.contains("[DONE]"), "{text}");
+}
+
+#[test]
+fn a_native_responses_request_is_forwarded_untouched() {
+    // A Responses-only provider speaks the Responses API natively. A request
+    // to `/v1/responses` must be forwarded as it is; translating it as if it
+    // were a Chat Completions request loses the input entirely.
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/responses") {
+            Reply::Stream {
+                status: 200,
+                content_type: "",
+                chunks: vec![(
+                    Duration::from_millis(0),
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"error\":null,\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"responses works\"}]}]}}\n\n",
+                    )
+                    .to_string(),
+                )],
+            }
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness_with_spec(&stub, "", "chatgpt-token", chatgpt_stub_spec(&stub));
+
+    let response = agent()
+        .post(harness.url("/v1/responses"))
+        .header("Content-Type", "application/json")
+        .send(
+            json!({
+                "model": "gpt-5.6-sol",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+            })
+            .to_string(),
+        )
+        .expect("the proxy answers");
+
+    assert_eq!(response.status(), 200);
+    let text = response.into_body().read_to_string().expect("body text");
+
+    // The upstream saw the input, unchanged.
+    let requests = stub.requests();
+    let upstream = requests.first().expect("the upstream saw the request");
+    let sent: serde_json::Value =
+        serde_json::from_str(&upstream.body).expect("the upstream body is json");
+    assert_eq!(
+        sent["input"][0]["content"][0]["text"], "hello",
+        "the native request was mangled: {sent}"
+    );
+
+    // And the answer came back in the Responses shape, not a Chat
+    // Completions one.
+    let answer: serde_json::Value = serde_json::from_str(&text).expect("a json body");
+    assert_eq!(answer["object"], "response", "{answer}");
+    assert_eq!(answer["status"], "completed", "{answer}");
+    assert_eq!(
+        answer["output"][0]["content"][0]["text"], "responses works",
+        "{answer}"
+    );
 }

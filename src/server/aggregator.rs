@@ -35,6 +35,7 @@ pub fn aggregate_responses(body: impl Read) -> Result<Aggregated, String> {
     let mut buffer = [0u8; 8192];
 
     let mut outcome = Aggregated::Incomplete;
+    let mut saw_event = false;
 
     loop {
         let read = reader
@@ -57,6 +58,10 @@ pub fn aggregate_responses(body: impl Read) -> Result<Aggregated, String> {
             None => String::new(),
         };
 
+        if complete.contains("data:") || complete.contains("event:") {
+            saw_event = true;
+        }
+
         for event in split_events(&complete) {
             if let Some(value) = parse_event(&event)
                 && let Some(result) = classify(&value)
@@ -72,10 +77,45 @@ pub fn aggregate_responses(body: impl Read) -> Result<Aggregated, String> {
         && let Some(value) = parse_event(&rest)
         && let Some(result) = classify(&value)
     {
+        saw_event = true;
         outcome = result;
     }
 
+    if !saw_event {
+        // The upstream did not send an event stream at all. It sent a plain
+        // body: either a response object, or an error object — a refusal or a
+        // rejected request, which arrives as JSON even though a stream was
+        // asked for.
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok(Aggregated::Incomplete);
+        }
+        let value: Value = serde_json::from_str(rest).map_err(|err| {
+            format!("the upstream response was neither an event stream nor JSON: {err}")
+        })?;
+        return Ok(classify_plain(&value));
+    }
+
     Ok(outcome)
+}
+
+/// Classify a body that arrived as one JSON object rather than as a stream.
+fn classify_plain(value: &Value) -> Aggregated {
+    // The Responses object always carries an `error` key, and it is `null` on
+    // success. A key that is merely *present* is not a failure.
+    let Some(error) = value.get("error").filter(|error| !error.is_null()) else {
+        return Aggregated::Completed(value.clone());
+    };
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("the request failed")
+        .to_string();
+    Aggregated::Failed { code, message }
 }
 
 /// Turn one event into an outcome, when it is a terminal one.
@@ -186,5 +226,36 @@ mod tests {
             panic!("expected a completed response")
         };
         assert_eq!(value["id"], "resp_9");
+    }
+
+    #[test]
+    fn a_plain_response_body_is_taken_as_the_answer() {
+        // The upstream does not always send a stream, even when one was
+        // asked for. A plain response object is the answer.
+        let body = "{\"id\":\"resp_10\",\"status\":\"completed\"}";
+        let Aggregated::Completed(value) = aggregate_responses(body.as_bytes()).unwrap() else {
+            panic!("expected a completed response")
+        };
+        assert_eq!(value["id"], "resp_10");
+    }
+
+    #[test]
+    fn a_plain_error_body_is_a_failure() {
+        let body = "{\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\",\"message\":\"no quota\"}}";
+        let Aggregated::Failed { code, message } = aggregate_responses(body.as_bytes()).unwrap()
+        else {
+            panic!("expected a failure")
+        };
+        assert_eq!(
+            code.as_deref(),
+            Some("subscription_sharing_usage_limit_exceeded")
+        );
+        assert_eq!(message, "no quota");
+    }
+
+    #[test]
+    fn a_body_that_is_neither_a_stream_nor_json_is_an_error() {
+        let err = aggregate_responses(b"<html>nope</html>".as_slice()).unwrap_err();
+        assert!(err.contains("neither an event stream nor JSON"), "{err}");
     }
 }

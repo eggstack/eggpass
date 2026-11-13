@@ -171,7 +171,10 @@ pub fn responses_to_chat_completion(body: &[u8]) -> Result<Vec<u8>, String> {
     })];
 
     // A failed response carries an error rather than an answer.
-    if let Some(error) = value.get("error") {
+    //
+    // The Responses object always carries an `error` key, and it is `null` on
+    // success. A key that is merely *present* is not a failure.
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
         choices[0]["message"] = json!({
             "role": "assistant",
             "content": Value::Null,
@@ -627,5 +630,50 @@ mod tests {
 
         assert!(out.contains("\"finish_reason\":\"error\""), "{out}");
         assert!(out.contains("nope"), "{out}");
+    }
+
+    #[test]
+    fn a_successful_response_with_a_null_error_is_an_answer() {
+        // The Responses object always carries an `error` key, and it is `null`
+        // on success. Treating a present-but-null error as a failure turned
+        // every successful ChatGPT answer into `content: null`.
+        let body = br#"{
+            "id": "resp_1",
+            "model": "gpt-5.6-sol",
+            "status": "completed",
+            "error": null,
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "chatgpt works"}]
+            }]
+        }"#;
+
+        let bytes = responses_to_chat_completion(body).expect("a chat completion");
+        let value: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(value["object"], "chat.completion", "{value}");
+        assert_eq!(
+            value["choices"][0]["message"]["content"], "chatgpt works",
+            "{value}"
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "stop", "{value}");
+    }
+
+    #[test]
+    fn a_failed_response_is_an_error() {
+        let body = br#"{
+            "id": "resp_2",
+            "status": "failed",
+            "error": {"code": "server_error", "message": "it broke"}
+        }"#;
+
+        let bytes = responses_to_chat_completion(body).expect("a chat completion");
+        let value: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(value["choices"][0]["finish_reason"], "error", "{value}");
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            Value::Null,
+            "{value}"
+        );
     }
 }
