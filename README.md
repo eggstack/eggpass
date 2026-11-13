@@ -7,12 +7,16 @@ on your machine, and serves an OpenAI-compatible API on `127.0.0.1:8484` so any
 OpenAI client — OpenCode, Cline, Continue, a shell script, the OpenAI SDK —
 can talk to Grok models such as `grok-4.7` and `grok-4.6` without an x.ai API key.
 
-> **Status: research phase.** No implementation code yet. See
-> [`docs/research.md`](docs/research.md) for the technical findings this build
-> is based on — including the
-> [locked decisions](docs/research.md#locked-decisions-2026-11-13) (Rust
-> runtime, `api.x.ai` upstream, browser-loopback OAuth) — and
-> [`docs/cli-spec.md`](docs/cli-spec.md) for the command surface.
+> **Status: planning phase.** No implementation code yet. All planning,
+> research and spec documents live in [`plans/`](plans/):
+>
+> - [`plans/research.md`](plans/research.md) — technical findings this build is
+>   based on, including the
+>   [locked decisions](plans/research.md#locked-decisions-2026-11-13) (Rust
+>   runtime, `api.x.ai` upstream, browser-loopback OAuth)
+> - [`plans/cli-spec.md`](plans/cli-spec.md) — the command surface
+> - [`plans/implementation-plan.md`](plans/implementation-plan.md) — phased
+>   build order, module layout and acceptance criteria
 
 ## Requirements
 
@@ -50,15 +54,17 @@ grokproxy edit      # open the config file in $EDITOR
 grokproxy croncheck # start the daemon only if it is not already running
 ```
 
-Full semantics in [`docs/cli-spec.md`](docs/cli-spec.md).
+Full semantics in [`plans/cli-spec.md`](plans/cli-spec.md).
 
 ## Layout
 
 ```
 .
-├── docs/
-│   ├── research.md   # OAuth flow, upstream hosts, model catalog, gotchas
-│   └── cli-spec.md   # command-by-command contract
+├── plans/
+│   ├── README.md             # index of planning documents
+│   ├── research.md           # OAuth flow, upstream hosts, model catalog, gotchas
+│   ├── cli-spec.md           # command-by-command contract
+│   └── implementation-plan.md # phased build order and acceptance criteria
 └── README.md
 ```
 

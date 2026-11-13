@@ -1,0 +1,467 @@
+# Implementation plan
+
+Phased build order for `grokproxy`. Each phase lists the files it creates,
+what it must do, and how we know it is done. **No phase starts until the
+previous one is verified.**
+
+Decisions this plan implements are recorded in
+[`research.md`](research.md#locked-decisions-2026-11-13); the command
+behaviour it implements is specified in [`cli-spec.md`](cli-spec.md).
+
+---
+
+## Ground rules
+
+- **Rust stable only.** `rust-version = "1.85"`, `edition = "2024"`. No
+  `rust-toolchain.toml` pin. No nightly features.
+- **No async runtime.** Blocking, thread-per-connection. This keeps the
+  dependency tree small and SSE proxying straightforward.
+- **Secrets never logged.** Token values are redacted everywhere, including
+  error messages.
+- **Every command is idempotent** and safe under `cron`.
+- **Write code that a stranger can maintain.** No clever abstractions; prefer
+  boring, well-named functions and explicit error types.
+
+---
+
+## Module layout
+
+```
+src/
+├── main.rs              # arg parsing + dispatch
+├── cli/
+│   ├── mod.rs           # subcommand dispatch, shared output helpers
+│   ├── args.rs          # hand-rolled parser (no clap)
+│   └── commands/
+│       ├── mod.rs
+│       ├── login.rs     # login / logout
+│       ├── status.rs    # status
+│       ├── run.rs       # run / stop / restart / croncheck
+│       ├── port.rs      # port
+│       └── edit.rs      # edit
+├── config.rs            # Config struct, TOML load/save, defaults
+├── paths.rs             # config dir, auth file, pid file, log file
+├── auth/
+│   ├── mod.rs
+│   ├── pkce.rs          # verifier + S256 challenge
+│   ├── client.rs        # authorize URL, token exchange, refresh, device code
+│   ├── flow.rs          # loopback browser flow, device-code flow
+│   ├── store.rs         # auth.json read/write (atomic, 0600)
+│   └── refresh.rs       # proactive refresh with skew + rotation handling
+├── upstream.rs          # api.x.ai and cli-chat-proxy clients, header rules
+├── server/
+│   ├── mod.rs           # listener, thread-per-connection, shutdown
+│   ├── router.rs        # path normalisation and matching
+│   ├── chat.rs          # /v1/chat/completions, /v1/responses
+│   ├── models.rs        # /v1/models, /v1/models/{id}
+│   ├── health.rs        # /health
+│   └── sse.rs           # streaming passthrough
+├── daemon.rs            # daemonize, PID file, liveness, stop
+└── logging.rs           # log file, levels, redaction
+```
+
+---
+
+## Dependencies
+
+| Crate | Purpose | Notes |
+| --- | --- | --- |
+| `serde` + `serde_json` | JSON | `derive` feature |
+| `toml` | Config file | Serialize + deserialize |
+| `ureq` | Outbound HTTP | rustls, streaming response reader for SSE |
+| `tiny_http` | Inbound HTTP | thread-per-connection, streamed response bodies |
+| `sha2` | PKCE challenge | `Sha256` |
+| `base64` | base64url | `URL_SAFE_NO_PAD` engine |
+| `rand` | Randomness | `state`, `nonce`, PKCE verifier |
+| `daemonize` | Daemonization | double-fork, `setsid`, PID file |
+| `signal-hook` | Signals | graceful `SIGTERM` |
+| `nix` | Process control | `kill(pid, 0)` liveness, signal sending |
+| `dirs` | Paths | config directory resolution |
+| `webbrowser` | OAuth | open the authorize URL |
+
+Dev-dependencies: `tempfile` (credential-store tests), `httptest` or
+`wiremock` (upstream stubbing). Prefer `httptest` — fewer dependencies.
+
+Deliberately excluded: `tokio`/`async`/`axum`/`reqwest`, `keyring`, `clap`.
+
+---
+
+## Phase 1 — Skeleton, config and paths
+
+**Files:** `Cargo.toml`, `src/main.rs`, `src/cli/{mod,args}.rs`,
+`src/config.rs`, `src/paths.rs`, `src/logging.rs`
+
+**Work**
+
+1. `cargo init --bin --vcs git` style scaffold, name `grokproxy`.
+   Set `rust-version = "1.85"`, `edition = "2024"`, `resolver` inherited from
+   edition 2024 (v3, MSRV-aware dependency resolution).
+2. `paths.rs` resolves, in order:
+   - `$GROKPROXY_HOME` if set,
+   - else `$XDG_CONFIG_HOME/grokproxy` if set,
+   - else `~/.config/grokproxy`.
+   Files: `config.toml`, `auth.json`, `grokproxy.pid`, `grokproxy.log`.
+3. `config.rs`:
+   ```toml
+   port = 8484
+   upstream = "api"      # "api" | "build"
+   api_key = ""          # empty = accept any key
+   log_level = "info"    # error | warn | info | debug
+   ```
+   Load: missing file → defaults, do not error. Malformed file → hard error
+   naming the file and the parse position (never silently reset it).
+   Save: preserve unknown keys and comments as far as `toml` allows; at
+   minimum never drop keys it does not understand.
+4. `args.rs`: hand-rolled parser for `--config`, `--verbose`, `--help`,
+   `--version`, and the nine subcommands. Unknown flags → usage error, exit 1.
+5. `logging.rs`: writes to the log file and stderr; levels per config;
+   **redacts** any value that looks like a token.
+
+**Done when**
+
+- `grokproxy --version` prints a version.
+- `grokproxy --help` lists the nine commands.
+- A missing config file does not error; a malformed one does, with a clear message.
+- `cargo test` passes and `cargo clippy -- -D warnings` is clean.
+
+---
+
+## Phase 2 — OAuth core
+
+**Files:** `src/auth/{mod,pkce,client,flow,store}.rs`
+
+This is the riskiest phase — it is the first thing that talks to x.ai.
+
+**Work**
+
+1. **PKCE** (`pkce.rs`): verifier = 32 random bytes → `URL_SAFE_NO_PAD` base64.
+   Challenge = `URL_SAFE_NO_PAD(SHA256(verifier))`. `state` and `nonce` = 16
+   random bytes each.
+2. **Constants** (`client.rs`) — all in one place, all overridable by config
+   so a future client-id change needs no release:
+
+   | Constant | Value |
+   | --- | --- |
+   | `CLIENT_ID` | `b1a00492-073a-47ea-816f-4c329264a828` |
+   | `ISSUER` | `https://auth.x.ai` |
+   | `AUTHORIZE_URL` | `https://auth.x.ai/oauth2/authorize` |
+   | `TOKEN_URL` | `https://auth.x.ai/oauth2/token` |
+   | `DEVICE_CODE_URL` | `https://auth.x.ai/oauth2/device/code` |
+   | `USERINFO_URL` | `https://auth.x.ai/oauth2/userinfo` |
+   | `SCOPES` | `openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write` |
+   | `REFERER` | `grokproxy` (fallback `grok-build`) |
+
+3. **Loopback flow** (`flow.rs`):
+   - Bind `127.0.0.1:0` (ephemeral port). **Never the API port.**
+   - Build the authorize URL exactly as the official CLI does:
+     `response_type=code`, `client_id`, `redirect_uri`,
+     `scope`, `code_challenge`, `code_challenge_method=S256`, `state`,
+     `nonce`, `referrer`.
+   - Open the browser at that URL; also print the URL so it can be opened
+     manually when no browser is available.
+   - Serve `GET /callback`; verify `state` matches before exchanging the code.
+     Reject a mismatched `state` and any `error`/`error_description`.
+   - Timeout: **600 seconds**, then exit with a clear message.
+   - Exchange the code at the token endpoint; persist the tokens.
+4. **Device flow** (`flow.rs`):
+   - `POST` the device-code request with `client_id`, `scope`, `referrer`.
+   - **Validate `verification_uri` against a trusted-host allowlist**
+     (`accounts.x.ai`, `auth.x.ai`) before displaying or opening it. Never
+     open a provider-supplied URL unchecked.
+   - Poll the token endpoint every `interval` seconds (default 5), sleeping
+     *before* the first poll. Handle `authorization_pending`,
+     `slow_down` (increase interval), `access_denied`, `expired_token`.
+   - Honor `expires_in` (30 min) as the hard deadline.
+5. **Token exchange** (`client.rs`):
+   ```
+   POST https://auth.x.ai/oauth2/token
+   Content-Type: application/x-www-form-urlencoded
+   grant_type=authorization_code &code=… &redirect_uri=… &client_id=… &code_verifier=…
+   ```
+   Do **not** send `code_challenge_method` in the token request — the verifier
+   is sufficient and the parameter is not in RFC 6749.
+6. **Store** (`store.rs`): `auth.json` at `~/.config/grokproxy/auth.json`,
+   directory `0700`, file `0600`, written atomically (temp file in the same
+   directory + `rename`). Fields: `access_token`, `refresh_token`,
+   `expires_at` (unix seconds), `token_type`, `id_token`, `scope`, `client_id`,
+   `issuer`, `obtained_at`.
+7. **Import** (`store.rs`): if our `auth.json` is absent, try
+   `~/.grok/auth.json` — the official Grok Build CLI's file — and convert a
+   usable entry (`key` → `access_token`, `refresh_token`, `expires_at`,
+   `user_id`, `email`). This lets a user who already ran `grok login` skip
+   our login entirely.
+
+**Done when**
+
+- `grokproxy login` completes a real browser login against x.ai and writes
+  `auth.json` with mode `0600`.
+- `grokproxy login --device` completes against x.ai from a headless shell.
+- `grokproxy logout` removes the file; `grokproxy logout` again is a no-op
+  that exits `0`.
+- A tampered `state` on the callback is rejected.
+- A `verification_uri` pointing at an untrusted host is refused.
+
+---
+
+## Phase 3 — Token refresh
+
+**Files:** `src/auth/refresh.rs`, `src/auth/client.rs`
+
+**Work**
+
+1. `refresh_token` grant:
+   ```
+   grant_type=refresh_token &refresh_token=… &client_id=…
+   ```
+2. **Rotation handling — the subtle part.** If the response omits
+   `refresh_token`, keep the previous one. If it returns a new one, store it.
+   Losing this breaks the second refresh.
+3. **Proactive refresh**: refresh when the access token expires within
+   **5 minutes**. Use the server's `expires_at` when present; otherwise fall
+   back to a conservative TTL (30 days, matching the official CLI's
+   `TOKEN_TTL`).
+4. **Concurrency**: a mutex around refresh, and re-read the store *inside* the
+   lock so a refresh performed by another process is not clobbered. If the
+   token is already fresh after re-reading, return it without refreshing.
+5. **Forced refresh** after an upstream `401`: refresh only if the failing
+   access token is still the current one. Otherwise a burst of parallel
+   requests triggers a refresh stampede.
+6. On refresh failure, return a clear `401` to the client
+   ("token expired, run `grokproxy login`"), never a generic `500`.
+
+**Done when**
+
+- An expired access token is refreshed transparently before a request goes out.
+- A refresh response without `refresh_token` does not break the next refresh.
+- A refresh failure surfaces a `401` with an actionable message.
+
+---
+
+## Phase 4 — Upstream client
+
+**Files:** `src/upstream.rs`
+
+**Work**
+
+1. Two upstreams behind one trait:
+
+   | `upstream` | Base URL | Extra headers |
+   | --- | --- | --- |
+   | `"api"` (default) | `https://api.x.ai/v1` | none |
+   | `"build"` | `https://cli-chat-proxy.grok.com/v1` | `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version: <VERSION>` |
+
+   `VERSION` is a single constant (currently `1.0.77`, the current Grok Build
+   release) and is only sent on the `build` upstream, which returns `426`
+   below `1.0.13`.
+2. **Header hygiene** — before forwarding, strip from the incoming request:
+   `Authorization`, `X-Api-Key`, `X-Api-Key-*`, `Host`, `Content-Length`,
+   `Accept-Encoding`, `Connection`, `Transfer-Encoding`, `Upgrade`,
+   `Forwarded`, `X-Forwarded-*`, `Cf-*`, `X-Real-Ip`, `Cdn-Loop`.
+   Then set `Authorization: Bearer <grok token>`.
+   **The client's key must never reach x.ai.**
+3. **Path normalisation**: accept both `/v1/chat/completions` and
+   `/chat/completions`; strip a leading `/v1` and re-apply `/v1` so the
+   upstream always sees `/v1/...`. Also strip a `key` query parameter before
+   forwarding.
+4. **Retry-once on `401`**: force-refresh the token and retry once. No second
+   retry (avoid loops).
+5. **Model list**: `GET /v1/models` upstream, pass through. Optionally merge
+   aliases we want to advertise (`grok-4.7` etc.) that upstream does not list,
+   without dropping upstream entries.
+
+**Done when**
+
+- `GET /v1/models` returns the upstream catalog.
+- A client-supplied `Authorization` header does not appear in the upstream
+  request (assert in a test with a stub server).
+- A `401` from upstream triggers exactly one refresh + retry.
+
+---
+
+## Phase 5 — HTTP server
+
+**Files:** `src/server/*`
+
+**Work**
+
+1. `tiny_http` server on `127.0.0.1:<port>`. Thread-per-connection.
+   **Loopback only** — never `0.0.0.0`.
+2. Routes:
+
+   | Route | Behaviour |
+   | --- | --- |
+   | `POST /v1/chat/completions` | Forward; support streaming and non-streaming |
+   | `POST /v1/responses` | Forward |
+   | `GET /v1/models` | Forward |
+   | `GET /v1/models/{id}` | Forward or synthesise from the list |
+   | `GET /health` | Liveness, no auth |
+   | anything else | `404` in OpenAI error shape |
+
+3. **Auth**: if `api_key` is configured, require it as `Authorization: Bearer`,
+   `X-Api-Key`, or `?key=`. If not configured, accept anything — the server is
+   loopback-only. `401` in OpenAI error shape when required and absent.
+4. **OpenAI error shape**:
+   ```json
+   {"error": {"message": "...", "type": "invalid_request_error", "code": null}}
+   ```
+5. **Streaming** (`sse.rs`): when the client sends `"stream": true`, forward
+   the upstream response as `text/event-stream` **without buffering** — copy
+   chunks from the upstream reader to the client writer as they arrive and
+   flush each time. Set `Cache-Control: no-cache`,
+   `Connection: keep-alive`, `X-Accel-Buffering: no`.
+6. **Non-streaming**: buffer and pass the JSON through unchanged, preserving
+   the upstream status code.
+7. **Graceful shutdown**: `SIGTERM` → stop accepting new connections, let
+   in-flight requests finish (bounded, ~5s), then exit.
+8. Do not follow redirects upstream; pass upstream status codes through
+   faithfully.
+
+**Done when**
+
+- A non-streaming chat completion round-trips correctly.
+- A streaming chat completion arrives at the client incrementally (verify by
+  timing chunk arrival, not just by content).
+- `401` without a key when a key is configured.
+- `GET /health` answers without auth.
+- `SIGTERM` shuts the server down promptly.
+
+---
+
+## Phase 6 — Daemon lifecycle
+
+**Files:** `src/daemon.rs`, `src/cli/commands/run.rs`
+
+**Work**
+
+1. **PID file** at `~/.config/grokproxy/grokproxy.pid`.
+2. **Liveness check** — a daemon is "running" only if **both**:
+   - the PID in the file is alive (`kill(pid, 0)`), **and**
+   - `GET /health` on the configured port responds.
+   The PID check alone is defeated by PID reuse; the health check alone can be
+   satisfied by a different process on the same port. Together they are
+   reliable.
+3. **`run`**: if already running → print PID and URL, exit `0`, do not start a
+   second instance. Otherwise `daemonize` (double-fork + `setsid` + stdio
+   redirect to the log file), write the PID, then wait up to ~10s for
+   `/health`. If it never comes up, print the tail of the log and exit `1`.
+4. **`stop`**: read the PID; if not alive, remove the stale PID file, print
+   "not running", exit `0`. Otherwise `SIGTERM`, wait up to 10s, then
+   `SIGKILL`. Remove the PID file.
+5. **`restart`**: `stop` then `run`.
+6. **`croncheck`**: if running → do nothing, exit `0`, **write nothing to
+   stdout**. If not running → start it, exit `0`. All diagnostics go to the
+   log file so a crontab entry stays silent.
+
+**Done when**
+
+- `run` twice does not create two daemons.
+- `stop` then `run` cycles cleanly.
+- `croncheck` in a crontab produces no output when the server is already up.
+- Killing the process by hand leaves a stale PID file that `status` reports
+  correctly as "stopped" and `run` cleans up.
+
+---
+
+## Phase 7 — Remaining commands
+
+**Files:** `src/cli/commands/{status,port,edit}.rs`
+
+**Work**
+
+1. **`status`** — print both sections always, in the fixed shape from
+   `cli-spec.md`: account (email, user id, token validity) and server
+   (running/stopped, pid, url, upstream, model count). Exit `0` always.
+2. **`port`** — no argument prints the current port and URL. With an
+   argument: validate (integer, 1–65535, not privileged), write to config,
+   and report that it takes effect on the next restart. **Never restart
+   implicitly.** If the daemon is running, print both the new and the
+   currently-serving port.
+3. **`edit`** — create the config with defaults if missing, open `$EDITOR`
+   (fallback `$VISUAL`, then `helix`, then `vim`, then `nano`). After the
+   editor exits, validate the file and report parse errors **without**
+   overwriting the user's file.
+
+**Done when**
+
+- `status` output is stable across runs and greppable.
+- `port 9000` then `port` prints `9000`; the running daemon still serves the
+  old port until `restart`.
+- `port 70000` is rejected with a clear message and exit `1`.
+- `edit` opens the right editor and reports a syntax error without losing it.
+
+---
+
+## Phase 8 — Packaging, tests, hardening
+
+**Work**
+
+1. **Tests**
+   - Unit: PKCE vectors, base64url no-pad, config round-trip, token parsing,
+     refresh-rotation logic, header-stripping list, path normalisation.
+   - Integration (stub upstream): chat completion pass-through, streaming
+     pass-through, `401` → refresh → retry, key enforcement.
+   - Never hit the network in a test except the explicitly-marked manual
+     verification script below.
+2. **Manual verification script** (`scripts/verify-live.sh`) — the only place
+   that talks to x.ai for real:
+   - device-code login → token stored
+   - `GET /v1/models` returns `grok-4.7` and `grok-4.6`  ← **this validates
+     open risk #1** (does `api.x.ai` accept our OAuth token?)
+   - a chat completion and a streaming chat completion
+   - token refresh after expiry
+3. **Packaging** — `cargo install --path .`; a `release` profile with
+   `strip = true`, `lto = true`, `codegen-units = 1`, `panic = "abort"`.
+4. **Hardening**
+   - `config.toml` `0600` if it ever holds a key; `auth.json` always `0600`.
+   - Never log `access_token`, `refresh_token`, or `id_token`.
+   - Redact `Authorization` in request logs.
+   - Refuse to start if the configured port is privileged (<1024) unless
+     explicitly overridden.
+5. **CI** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`
+   on push.
+6. **Docs** — final `README.md` with install, usage, client setup examples
+   (OpenCode, Cline, Continue, OpenAI SDK), and troubleshooting.
+
+**Done when**
+
+- `cargo test` and `cargo clippy -- -D warnings` pass.
+- `scripts/verify-live.sh` passes end to end against the real x.ai.
+- The release binary runs from a clean machine with no Rust toolchain present.
+
+---
+
+## Sequencing rationale
+
+OAuth (Phase 2) comes first because it is the only part that requires an
+external account and an interactive browser — it is the most likely to
+surprise us, and every other phase depends on it. The upstream reachability
+test (Phase 4) comes early for the same reason: it resolves open risk #1, and
+if `api.x.ai` turns out to reject the OAuth token, the whole upstream choice
+changes. The server (Phase 5) and daemon (Phase 6) are the parts most likely
+to go smoothly, so they come after the risky unknowns are retired.
+
+---
+
+## Open risks carried into implementation
+
+| # | Risk | Mitigation | Verified in |
+| --- | --- | --- | --- |
+| 1 | `api.x.ai` may not accept the OAuth token for our subscription tier | `upstream` is a config value; fall back to `"build"` | Phase 8 live script |
+| 2 | The public client id could change or be revoked | Config-overridable constant | — |
+| 3 | `referrer` value may be validated by x.ai | Try `grokproxy`, fall back to `grok-build` | Phase 2 |
+| 4 | Full scope set may cause consent friction | Fall back to the shorter set used by the reference | Phase 2 |
+| 5 | Token lifetime ambiguity (6h / 7d / 30d) | Always trust the server's `expires_at`; conservative fallback | Phase 3 |
+| 6 | Upstream streams can end without a finish reason | Buffer-and-retry at the client boundary, not mid-stream | Phase 5 |
+| 7 | Rate limits differ between OAuth and API-key billing | Measure during Phase 8 | Phase 8 |
+
+---
+
+## Definition of done
+
+- All nine commands behave exactly as `cli-spec.md` describes.
+- `grokproxy login && grokproxy run` yields a working OpenAI-compatible
+  endpoint serving `grok-4.7` / `grok-4.6`.
+- `grokproxy croncheck` is safe as a 5-minute crontab entry.
+- The dependency list matches the table above with nothing extra.
+- `cargo test` green, `clippy` clean, `fmt` clean.
+- No token material in logs, in the repository, or in a crash dump.
