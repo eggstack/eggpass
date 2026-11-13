@@ -1,15 +1,25 @@
-# Plan: a combined Grok + ChatGPT proxy, and the server-hardening that goes with it
+# Plan: `eggpass` — a multi-provider AI proxy
 
 Date: 2026-11-13. Planning only — no code changed.
 
-This document answers the three questions raised in review, then lays out the
-design for turning `grokproxy` into a proxy for both x.ai and ChatGPT.
+`eggpass` is a local, OpenAI-compatible proxy that authenticates against
+several AI providers with their own subscription OAuth credentials and serves
+them behind one base URL. This document is the umbrella plan: the original
+design questions, the multi-provider design, and the later clarifications —
+the rename, the interactive provider picker, and the packaging/update
+ecosystem.
 
-- [Part 1 — The blocking question](#part-1--the-blocking-question-answered-with-measurements)
-- [Part 2 — Dropping the static model half](#part-2--dropping-the-static-model-half)
-- [Part 3 — The combined proxy design](#part-3--the-combined-proxy-design)
-- [Part 4 — Phasing](#part-4--phasing)
-- [Part 5 — Risks and open questions](#part-5--risks-and-open-questions)
+| Part | Covers |
+| --- | --- |
+| [1](#part-1--the-blocking-question-answered-with-measurements) | The blocking question, answered with measurements |
+| [2](#part-2--dropping-the-static-model-half) | Dropping the static model half |
+| [3](#part-3--the-combined-proxy-design) | The multi-provider design |
+| [4](#part-4--phasing) | Phasing |
+| [5](#part-5--risks-and-open-questions) | Risks and open questions |
+| [6](#part-6--the-rename) | **The rename** |
+| [7](#part-7--the-interactive-provider-picker) | **The interactive provider picker** |
+| [8](#part-8--packaging-and-updates-eggpack--eggup) | **Packaging and updates: eggpack / eggup** |
+| [9](#part-9--relationship-to-eggpool) | **Relationship to eggpool** |
 
 ---
 
@@ -22,7 +32,7 @@ design for turning `grokproxy` into a proxy for both x.ai and ChatGPT.
 > **Sign in with ChatGPT for Open Source**
 > (<https://developers.openai.com/siwc/token-sharing-open-source>).
 >
-> grokproxy is open-source and runs locally, so it is squarely in that path's
+> eggpass is open-source and runs locally, so it is squarely in that path's
 > audience — and dynamic registration needs **no client secret and no partner
 > API key**, which the Codex-CLI route would have needed.
 >
@@ -170,7 +180,7 @@ one refresh. The lock is **not** held during a request or during a stream.
 
 Because structural arguments can be wrong, I measured it against the live
 x.ai API using the shipped binary — six concurrent SSE streams through one
-`grokproxy` instance, with short requests interleaved.
+`eggpass` instance, with short requests interleaved.
 
 ```
 === BASELINE: 4 sequential short requests, no streams in flight ===
@@ -432,14 +442,14 @@ be added to the stripped list.
 
 ### 3.2 Credential storage
 
-Today: one `~/.config/grokproxy/auth.json`, mode 0600, in a 0700 directory,
+Today: one `~/.config/eggpass/auth.json`, mode 0600, in a 0700 directory,
 with an import from `~/.grok/auth.json`.
 
 Proposed: one file per provider under a directory.
 
 ```
-~/.config/grokproxy/credentials/xai.json
-~/.config/grokproxy/credentials/openai.json
+~/.config/eggpass/credentials/xai.json
+~/.config/eggpass/credentials/openai.json
 ```
 
 Each 0600. The existing `auth.json` is imported into `credentials/xai.json` on
@@ -485,7 +495,7 @@ default_provider = "xai"
 "o4"     = "openai"
 ```
 
-Deterministic, zero network, zero latency, and editable with `grokproxy edit`
+Deterministic, zero network, zero latency, and editable with `eggpass edit`
 rather than a rebuild. The cost: when OpenAI ships a new model family, the map
 needs a new entry. Mitigated by a generous default set and the fact that
 unmatched models fall through to `default_provider`.
@@ -518,7 +528,7 @@ machinery.
 > [Registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),
 > [Token reference](https://developers.openai.com/siwc/token-sharing-open-source/token-reference).
 
-grokproxy is open-source and runs locally, which puts it squarely in the
+eggpass is open-source and runs locally, which puts it squarely in the
 audience SIWC was written for: *"ChatGPT plan usage is available to open-source
 projects, personal projects that run locally, and selected private apps."*
 
@@ -807,7 +817,7 @@ OpenAI instead documents:
 OpenAI does not publish a usage/quota API for this route. Whether the WHAM
 `/wham/usage` endpoint happens to accept a SIWC token is **unverified** and
 worth a quick test — if it works, it gives us the same rich window data the
-Codex CLI gets, and `grokproxy status` could show the user's real remaining
+Codex CLI gets, and `eggpass status` could show the user's real remaining
 allowance. If it does not, the honest position is that ChatGPT plan usage is
 reported to the user through OpenAI's own settings page and through the
 in-band error codes.
@@ -871,7 +881,7 @@ scopes = [...]
 issuer = "https://auth.openai.com"
 scopes = ["openid", "profile", "email", "offline_access",
           "resource.invoke", "chatgpt.tokens.use.direct"]
-agent_name_hint = "grokproxy"
+agent_name_hint = "eggpass"
 resource = "https://api.openai.com/v1"
 ```
 
@@ -888,7 +898,7 @@ The `[oauth.*]` tables already exist for x.ai (`[oauth]` with `client_id`,
 also keeps the OpenAI constants overridable — the same mitigation that was
 applied for x.ai's risk register.
 
-Note the existing config surgery: `grokproxy port` performs a surgical text
+Note the existing config surgery: `eggpass port` performs a surgical text
 edit so comments and unknown keys survive. Adding tables must not break that.
 
 ---
@@ -955,7 +965,7 @@ indirection.
   `plan_enabled` accordingly.
 - Refresh with rotation (1 h access, 30-day rotating refresh).
 - Revoke the refresh token on logout.
-- `grokproxy login --provider openai`, `logout`, `status`.
+- `eggpass login --provider openai`, `logout`, `status`.
 
 *Acceptance:* a real SIWC sign-in completes and stores the issued client id
 alongside the tokens; the token refreshes across rotation; `status` reports
@@ -1010,7 +1020,7 @@ built in Phase 4.
 | ~~R2~~ | ~~The Codex backend's contract can change without notice — it is an internal API (WHAM).~~ | **Closed** | **No longer applicable.** SIWC points at the *public* `https://api.openai.com/v1` and explicitly says not to use `backend-api`. |
 | R3 | The ChatGPT plan allowance is shared with the user's own ChatGPT usage and with every other app using their plan. OpenAI states the five-hour limit is shared across all apps for Plus users, and does not apply for Pro. | Medium | Document it, and link users to [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage) as OpenAI instructs. |
 | R4 | Our x.ai path is metered on the **standard API tier** (tier 1), not the SuperGrok consumer pool — it is billed like API usage. | Medium | Document it clearly in the README. It is not a defect, but it is surprising. |
-| R5 | **No headless sign-in.** SIWC documents only the browser loopback flow, so `grokproxy login --provider openai` needs a browser and a reachable loopback port. Our x.ai `--device` option has no equivalent. | Medium | Accept it for now; investigate whether the undocumented Codex device endpoint accepts a dynamically issued client id. Otherwise a user on a headless box cannot sign in. |
+| R5 | **No headless sign-in.** SIWC documents only the browser loopback flow, so `eggpass login --provider openai` needs a browser and a reachable loopback port. Our x.ai `--device` option has no equivalent. | Medium | Accept it for now; investigate whether the undocumented Codex device endpoint accepts a dynamically issued client id. Otherwise a user on a headless box cannot sign in. |
 | R6 | **Silent parameter loss.** The route rejects `temperature`, `top_p`, `max_output_tokens` and a dozen other fields. A Chat Completions client that sends `temperature: 0.7` will have it stripped rather than honoured — the request succeeds but behaves differently. | Medium | Strip deliberately, and surface it in the response (a header or a note) rather than silently dropping it. This is a fidelity trade-off, not a bug. |
 | R7 | **`stream: true` is mandatory**, so every ChatGPT request is a stream upstream. The aggregator that collapses it for non-streaming clients is required work, and it is where bugs will live. | Medium | Build it in Phase 4 with a proper event-parsing test suite; treat `response.completed` as the only success signal. |
 | R8 | SIWC is labelled a **preview**. Field lists, error codes and the registration flow can change. | Medium | Keep the provider's constants in one place and make them config-overridable so a change is a config edit, not a release. |
@@ -1026,7 +1036,7 @@ built in Phase 4.
    sends it, so a cheap test is worth doing.
 2. **Does the WHAM `/wham/usage` endpoint accept a SIWC token?** It is the
    Codex CLI's endpoint, not part of SIWC, but if it works it gives us the
-   user's real remaining allowance for `grokproxy status`. Worth one test.
+   user's real remaining allowance for `eggpass status`. Worth one test.
 3. **Is the `build` fallback upstream actually used?** Determines whether
    dropping `KNOWN_MODELS` costs anything.
 4. **Does the undocumented Codex device endpoint accept a dynamically issued
@@ -1037,4 +1047,499 @@ built in Phase 4.
 6. **Should the ChatGPT provider be on by default?** With a supported path the
    original argument for opt-in weakens, but the first release should still
    not surprise anyone by reaching for OpenAI. My recommendation remains
-   opt-in via `grokproxy login --provider openai`.
+   opt-in via `eggpass login --provider openai`.
+
+---
+
+## Part 6 — The rename
+
+> **Update (2026-11-13).** The project was renamed. `eggpass` is the name
+> going forward, everywhere: binary, crate, config directory, environment
+> variable, documentation and CI.
+
+### 6.1 Why
+
+The tool is no longer a Grok proxy with a chat-CGPT afterthought. It is a
+multi-provider proxy whose providers are peers. A name that names one vendor
+misdescribes it, and would need renaming again the moment a third provider
+appears. `eggpass` also sits naturally alongside the rest of the eggstack
+family (`eggpack`, `eggup`, `eggpool`, `eggserve`, …), which matters for
+Part 8.
+
+### 6.2 The rename map
+
+This is the one place the old identifiers are written down — a rename
+specification that does not name the old identifiers is not actionable.
+
+| Old | New | Where |
+| --- | --- | --- |
+| `grokproxy` | `eggpass` | crate name, binary name, `Server:` header, user-agent |
+| `GROKPROXY` | `EGGPASS` | environment variable (`EGGPASS_HOME`) |
+| `~/.config/grokproxy/` | `~/.config/eggpass/` | config dir, PID file, log file |
+| `grokproxy.pid` | `eggpass.pid` | PID file name |
+| `grokproxy.log` | `eggpass.log` | log file name |
+| `grokproxy auth.json` | `eggpass/credentials/xai.json` | credential file (see Part 3.2) |
+
+### 6.3 Why the config directory moves
+
+The config directory name is part of the environment contract: `EGGPASS_HOME`,
+`XDG_CONFIG_HOME`, the PID file and the log file all key off it. Keeping the
+old directory name under a new binary name would leave the tool looking like
+it belongs to another project, and would collide with the `credentials/`
+subdirectory layout the multi-provider design needs anyway.
+
+**Migration.** The directory moves. On first run, if
+`~/.config/eggpass/` does not exist but `~/.config/grokproxy/` does, `eggpass`
+migrates it: create the new directory `0700`, move `config.toml`, move the
+credential file to `credentials/xai.json`, move the PID and log files, and
+leave the old directory in place with a `migrated-to-eggpass` marker rather
+than deleting it. Deleting user data is not something a proxy should do
+unprompted. If the old directory is unreadable, `eggpass` says so and starts
+with defaults.
+
+The migration is one-time, idempotent, and never overwrites an existing
+`~/.config/eggpass/`.
+
+### 6.4 How the rename is executed
+
+The rename is mechanical, but it is not one `sed`:
+
+1. `Cargo.toml`: `[package] name = "eggpass"`. The crate is a single binary, so
+   the binary name follows automatically.
+2. `src/paths.rs`: the resolution order is `$EGGPASS_HOME` →
+   `$XDG_CONFIG_HOME/eggpass` → `~/.config/eggpass`, plus the file names
+   `eggpass.pid` and `eggpass.log`.
+3. `src/cli/args.rs`: the usage text, the help text, and the binary name in
+   error messages.
+4. `src/main.rs`, `src/cli/commands/*`: the user-visible strings.
+5. `src/server/http.rs`: the `Server:` response header.
+6. `src/upstream.rs`: the `User-Agent`, currently `grokproxy/<version>`.
+7. `src/auth/*`: error strings that name the tool.
+8. `scripts/verify-live.sh`: the binary path and the `EGGPASS_HOME` variable.
+9. `.github/workflows/ci.yml`: any binary-name references.
+10. `README.md` and everything under `plans/`.
+
+**Renaming the crate changes the `Cargo.lock` package name**, so the lock file
+is regenerated rather than edited.
+
+**Regression risk is low but not zero**: the tests assert on strings that
+include the tool name (the `Server:` header, usage text), so a missed
+occurrence shows up as a test failure rather than as a silent inconsistency.
+The grep for the old string across the tree must come back empty before the
+change is considered done — with one deliberate exception: this rename map.
+
+---
+
+## Part 7 — The interactive provider picker
+
+### 7.1 The requirement
+
+`eggpass login` and `eggpass logout` both present a picker. The user moves
+with the arrow keys **or** `j`/`k`, and confirms with `Enter`.
+
+```
+$ eggpass login
+
+  Select a provider to sign in with:
+
+    ❯ x.ai
+      ChatGPT
+
+  ↑/↓ or j/k to move · Enter to select · Esc to cancel
+```
+
+`eggpass logout` uses the same picker but lists **only the providers that are
+actually logged in**. A provider with no stored credential is not shown.
+
+### 7.2 The non-TTY fallback is not optional
+
+Every command in this tool is documented as cron-safe, and `eggpass login` is
+the one command a user might reasonably want to run from a script, a CI job,
+or over a pipe. A picker that hangs on a non-terminal stdin would be a trap.
+
+So the picker has two modes:
+
+- **Interactive** — stdin is a TTY. Raw-mode key handling, arrow keys, `j`/`k`,
+  `Enter`, `Esc`, `Ctrl-C`.
+- **Fallback** — stdin is a pipe or a file. Print a numbered list and read one
+  line:
+
+  ```
+  Select a provider to sign in with:
+    1) x.ai
+    2) ChatGPT
+  Provider [1-2]:
+  ```
+
+  An empty line takes the first entry. An out-of-range answer re-prompts
+  rather than failing, so a typo does not end a scripted login.
+
+  `EGGPASS_PROVIDER=xai` is also accepted as an explicit, non-interactive way
+  to name the provider — useful in scripts where even a prompt is unwelcome.
+
+**Every command must also work when the picker is skipped entirely.** A
+`--provider <id>` flag selects a provider directly and suppresses the picker.
+The picker is the default, not the only way in. That keeps the tool
+scriptable, keeps the CLI spec honest, and gives `croncheck` and friends a
+path that never touches the terminal.
+
+### 7.3 How to read keys without an async runtime
+
+The project constraint is no async runtime, so the picker must be a blocking
+read loop. Three options:
+
+| Option | How | Verdict |
+| --- | --- | --- |
+| **crossterm** | `crossterm::event::read()` in a loop, with `terminal::enable_raw_mode()` | **Recommended** |
+| Hand-rolled | `nix::sys::termios` for raw mode on Unix; `windows-sys` for the Windows console mode | Viable, but two platform paths to maintain |
+| Line mode only | Print a numbered list, read a line | Necessary as the fallback, insufficient on its own |
+
+**crossterm** is what the rest of the family uses — `snip-it` (another
+eggstack project) builds its fuzzy-search TUI on `ratatui` + `crossterm`.
+crossterm's `event::read()` is blocking and its dependency tree does not
+require tokio, so the "no async runtime" constraint survives. The cost is
+`crossterm` plus its own dependencies (`mio`, `parking_lot`, `signal-hook`,
+`bitflags`), which is a real addition to a dependency list we have kept
+deliberately small.
+
+**Hand-rolling with `nix`** would add nothing on Unix — we already depend on
+`nix` — but Windows would need `windows-sys` for `SetConsoleMode`, and the
+`IS_ENHANCED_VK` arrow-key decoding is fiddly. crossterm already solves both,
+and solves them on the platforms where they actually bite.
+
+**Recommendation: crossterm.** The dependency is justified by one feature
+that is unpleasant to write twice, and it buys the ecosystem consistency the
+project wants anyway.
+
+If the dependency budget is judged too tight, the fallback is to ship the
+numbered-list picker first (no new dependency, works everywhere) and add the
+raw-mode picker in a later phase.
+
+### 7.4 Drawing the picker
+
+The picker needs to redraw in place. The simplest correct approach is to
+print the menu, then on each keypress move the cursor up by the number of
+lines the menu occupies and reprint. That needs no full-screen alternate
+buffer, no diffing, and no terminal-size negotiation — and it leaves the
+final menu visible in the scrollback, which is what a user wants after a
+login.
+
+If `ratatui` is ever adopted for a richer UI, the picker moves into it. But
+for two to five providers, redraw-in-place is the right size of solution.
+
+### 7.5 Failure modes to handle
+
+- **Ctrl-C during the picker** — restore the terminal, exit `130`. The
+  terminal must be restored on *every* exit path, including panic: use a
+  guard object whose `Drop` restores the terminal mode.
+- **EOF on stdin** in the fallback — treat it as "no selection", exit `0`.
+- **Terminal width** — truncate long provider descriptions rather than
+  wrapping them, so the redraw arithmetic stays correct.
+- **No providers configured** — cannot happen today (x.ai and ChatGPT are
+  built in), but if the provider set ever becomes empty the picker must say so
+  rather than loop forever.
+
+### 7.6 Where the picker lives in the code
+
+A new `src/cli/prompt.rs` module, deliberately kept out of `src/cli/commands/`
+because it is a UI primitive, not a command:
+
+```rust
+pub fn select(label: &str, options: &[Option]) -> Result<Option, PromptError>;
+```
+
+The command layer supplies the option list; the module owns the terminal
+handling. `logout` filters the list before calling it, so the "only show what
+you are logged into" rule lives in the command, and the picker stays dumb.
+
+---
+
+## Part 8 — Packaging and updates: eggpack / eggup
+
+> **Update (2026-11-13).** New. The goal is for `eggpass` to use the same
+> packaging and update machinery as the rest of the eggstack family, so the
+> repos look and behave alike.
+
+### 8.1 What the two tools are
+
+They are a matched pair, and the split matters:
+
+| | eggpack | eggup |
+| --- | --- | --- |
+| Side | **producer** | **consumer** |
+| Job | Turns a versioned release contract into a build/qualify/finalize plan, a deterministic GitHub Actions workflow, and a **draft** GitHub release | Performs verified local installs, updates and rollbacks of release artifacts |
+| Publishes? | **Never.** It stages a draft; publication is a separate human action | No — it installs locally |
+| Authenticity | **None.** SHA-256 checksums are integrity facts only | **None.** Same posture, explicitly |
+| Published to crates.io | `eggpack-manifest` 0.1.1 (schema-v1 evidence) | `eggup-core`, `eggup-acquisition`, `eggup-eggfetch`, `eggup-curl`, `eggup-archive`, `eggup-eggpack`, `eggup-service` — all 0.2.0 |
+| MSRV | 1.89 | 1.89 |
+
+The `eggpack-cli` binary itself is **not** published to crates.io — it is built
+from the eggstack source (`cargo build -p eggpack-cli`). That matters: the
+producer side is a tool we vendor or invoke in CI, while the consumer side is
+a normal dependency.
+
+### 8.2 The producer side: eggpack
+
+A release is three pure file-in/file-out commands — no network, no token, no
+real build. It needs six input files:
+
+| File | What it holds |
+| --- | --- |
+| `distribution.toml` | The release contract: targets, artifacts, names |
+| `pack-config.toml` | Pack configuration |
+| `build-bindings.toml` | How each target is built |
+| `qualification-bindings.toml` | How each target is qualified |
+| `draft-template.json` | The GitHub draft release template |
+| GitHub policy | Release/draft policy |
+
+The flow:
+
+```sh
+# 1. resolve intent -> release plan + executable CI graph + draft identity
+eggpack ci _resolve-release --contract distribution.toml --pack-config pack-config.toml \
+  --build-bindings build-bindings.toml --qualification-bindings qualification-bindings.toml \
+  --selected linux-x64 --tag 1.2.6 --source-revision "$REV" --template draft-template.json \
+  --source-root . --output-plan out/release-plan.json \
+  --output-ci-plan out/release-ci-plan.json --output-github-policy out/draft-policy.json
+
+# 2. render the workflow — deterministic: same inputs, byte-identical output
+eggpack ci generate --ci-plan out/release-ci-plan.json \
+  --github-policy github-policy.json --output out/release.yml
+
+# 3. prove a checked-in workflow still matches its plan — never writes, exit 1 on drift
+eggpack ci check --ci-plan out/release-ci-plan.json \
+  --github-policy github-policy.json --workflow out/release.yml
+```
+
+**What this gives `eggpass`:**
+
+- A **deterministic** release workflow. The same inputs render byte-identical
+  output, so the workflow file is generated, not hand-maintained.
+- **Drift detection.** `eggpack ci check` exits non-zero when the checked-in
+  workflow no longer matches its plan. That belongs in our existing CI as a
+  required gate, exactly like `cargo fmt --check`.
+- **A draft-only release.** `_prepare-stage` materialises the finalised
+  assets, checksum sidecars, `release-manifest.json`, `install.sh` and
+  `install.ps1`. `_stage-github-draft` reconciles that into a GitHub draft
+  via `GITHUB_TOKEN`. **Publication stays a human action.**
+- **A release manifest** — `release-manifest.json` — which is exactly what
+  `eggup-eggpack` consumes on the other side.
+
+`eggpack contract expand --contract distribution.toml --release-id v1.2.6
+--target linux-x64 --field asset` lets a *consumer* repository read a producer
+fact without re-implementing TOML parsing. `eggpass` is a producer, so this
+is mostly for other repos that ship `eggpass` binaries — worth knowing about,
+not needed now.
+
+**Targets.** `eggpool` and `eggress` publish Linux x86_64, Linux aarch64 and
+macOS arm64, and treat Windows as unqualified. `eggpass` should match:
+those three targets, and Windows documented as unsupported rather than
+half-supported.
+
+### 8.3 The consumer side: eggup
+
+`eggup` is the library behind `eggpool update` and `eggress update`. Its core
+is a five-step transaction, and each step returns the next type so a
+committed transaction is only reachable by passing all five:
+
+| Step | Guarantee |
+| --- | --- |
+| `.prepare()` | Bytes staged in an owner-private directory (`0700`/`0600` on Unix) |
+| `.verify_integrity()` | Staged bytes match the declared SHA-256 |
+| `.validate(&v)` | The candidate check passed — every member must be `Verified` |
+| `.commit(ownership)` | Ownership re-proven and digests re-hashed **under the lock** |
+
+`RolledBack` and `RecoveryRequired` are real outcomes, not errors — the
+transaction models failure, rather than pretending it cannot happen.
+
+**Which crates `eggpass` would use:**
+
+| Crate | Use |
+| --- | --- |
+| `eggup-core` | The transaction mechanics. Sole dependency `sha2`. |
+| `eggup-eggfetch` | Native HTTP acquisition, in-process Rustls. Or `eggup-curl` if we prefer an external `curl` and a smaller link footprint — the choice is explicitly a footprint-and-trust decision, and both implement the same `AcquisitionTransport` seam. |
+| `eggup-archive` | Bounded, allowlisted extraction of already-verified tar.gz / zip |
+| `eggup-eggpack` | Reads an Eggpack `ReleaseManifest` v1 — the bridge between the two halves |
+| `eggup-service` | **Optional.** systemd / launchd / cron / Windows SCM registration, "without automatic privilege escalation" |
+
+**`eggup-service` is the interesting one for us.** Our daemon is
+deliberately self-contained and PID-file based, with no launchd or systemd
+involvement — a deliberate choice recorded in the original plan. `eggup-service`
+offers exactly the service managers we decided not to depend on. The
+recommendation is to keep our own PID-file daemon as the default and treat
+`eggup-service` as an *optional* `eggpass service install` extra, if at all.
+It must not become a dependency of the default path.
+
+### 8.4 The install pattern
+
+Both `eggpool` and `eggress` ship the same shape:
+
+- `scripts/install.sh` — a `curl | bash` installer that fetches the
+  **qualified GitHub raw binary** for the target, **verifies its SHA-256
+  before executing it**, and commits it to `~/.local/bin/<name>`. It never
+  invokes a language runtime or a source build.
+- `<name> update` — self-update through eggup: the latest catalogued release,
+  or one exact historical version.
+- `<name> update 0.8.0` — an exact version switch, which doubles as rollback.
+- `<name> install-provenance` — shows whether the installation is
+  package-manager-managed or standalone, and which is the update authority.
+
+`eggpack`'s `_prepare-stage` emits **both** `install.sh` and `install.ps1`,
+so the staging step generates the installers rather than us hand-maintaining
+them.
+
+**For `eggpass` this gives us, for free:**
+
+- `eggpass update` — a verified, rollback-capable self-update.
+- `eggpass install-provenance` — a clear answer to "who is allowed to update
+  this binary?".
+- The same install ergonomics as every other eggstack tool, which is the
+  point.
+
+### 8.5 The MSRV cost
+
+**eggpack and eggup both require Rust 1.89. Our project is MSRV 1.85.**
+
+Adopting `eggup-*` as a dependency raises our MSRV to 1.89. That is not a
+problem in itself — 1.89 is well behind current stable — but it is a real
+change to a stated project constraint, and it should be made deliberately
+rather than discovered at build time.
+
+If staying on 1.85 matters more than the shared update ecosystem, the fallback
+is to implement `eggpass update` directly on `ureq` + `sha2` (both already
+dependencies) and skip eggup. That is a few hundred lines, and it would make
+`eggpass` the one eggstack tool with a bespoke updater — which is exactly the
+uniformity this decision is trying to buy. **Recommendation: raise the MSRV
+to 1.89 and adopt eggup.**
+
+### 8.6 The `eggpass update` command
+
+New command, matching the family:
+
+```
+eggpass update              # latest catalogued release, same owner
+eggpass update 0.2.0       # exact historical-version switch (also the rollback)
+eggpass install-provenance  # show the update authority
+```
+
+Behaviour:
+
+- Acquire the release manifest (via `eggup-eggpack`), select a candidate,
+  verify integrity, validate, and commit under eggup's lock.
+- **Never** self-update in place while the daemon is running with the old
+  binary. The update replaces the binary on disk; the running daemon keeps
+  the old image until it is restarted. `eggpass update` says so.
+- The daemon is **not** restarted automatically. Restarting is `eggpass
+  restart`, which the user already knows about. An implicit restart during an
+  update would cut live streams — see the SIGTERM truncation issue in Part 1.
+- Rollback is the same command with the older version.
+
+### 8.7 What this means for the CI we already have
+
+Our `.github/workflows/ci.yml` stays as the *check* workflow (fmt, clippy,
+test, MSRV). eggpack generates a **separate, deterministic release workflow**
+(`out/release.yml`) that chains preflight → build → qualify → required gate →
+aggregate → stage → draft.
+
+Both are checked in. `eggpack ci check` runs in the check workflow and fails
+on drift, so the generated release workflow can never silently diverge from
+its plan.
+
+---
+
+## Part 9 — Relationship to eggpool
+
+> **Update (2026-11-13).** New. This is the most consequential discovery in
+> the whole review, and it needs to be settled before the ChatGPT provider is
+> built.
+
+### 9.1 What eggpool already is
+
+[`eggstack/eggpool`](https://github.com/eggstack/eggpool) is a **lightweight,
+LAN-hosted proxy that aggregates multiple AI provider accounts behind OpenAI
+Chat Completions, OpenAI Responses, and Anthropic Messages-compatible
+paths.** Its own README describes, among other things:
+
+- "Load-based routing across multiple providers and accounts with dynamic
+  model discovery, quota awareness, and health gating"
+- "Optional sticky model-router aliases for virtual-model selection"
+- `eggpool connect` — "Add a provider account", with an **interactive
+  onboarding wizard** (`eggpool onboard`)
+- `eggpool serve` / `status` / `stop` / `restart` / `rehash`
+- `eggpool models refresh` — "Refresh the model catalog"
+- `eggpool update` — verified updates, with exact-version rollback
+- `eggpool accounts status`, `eggpool accounts explain --model <id>`
+- Model pinning as `model/provider` (e.g. `"gpt-4o/openai"`)
+- A SQLite-backed dashboard, multi-user personal tokens, per-user budgets
+
+That is, feature for feature, the multi-provider proxy this plan has been
+designing — and it already has the interactive provider onboarding, the model
+catalogue merging, the routing table, and the update path.
+
+### 9.2 Why eggpass is still not eggpool
+
+The constraints that shaped this project are deliberately narrower than
+eggpool's:
+
+| | eggpool | eggpass |
+| --- | --- | --- |
+| Audience | LAN-hosted, multi-user, managed | single user, loopback only |
+| Storage | SQLite + dashboard + backups | none — one config file, no database |
+| Exposure | binds `0.0.0.0:11300` by default, login page, personal tokens | binds `127.0.0.1` only |
+| Credentials | primarily API keys from the environment | **subscription OAuth credentials** (x.ai, ChatGPT) |
+| OAuth | provider accounts | PKCE loopback, ephemeral port, device code, SIWC dynamic registration |
+| Extra surface | admin/dashboard, multi-user budgets, live rehash, model enrichment from OpenRouter/Artificial Analysis/HuggingFace | none — "no database, no cloud, no admin API" |
+
+The distinctive part of eggpass is **subscription OAuth**: signing in with a
+ChatGPT Plus account or an X Premium subscription and using that plan's
+allowance through an OpenAI-compatible API. eggpool's `connect` is built around
+API keys and provider accounts; the OAuth-flavoured, subscription-credential
+flow is not what it is for.
+
+So eggpass is the **minimal, single-user, OAuth-first sibling** — not a
+duplicate.
+
+### 9.3 The decision to make
+
+There are three honest positions:
+
+1. **Build eggpass as planned.** It stays small, single-binary, single-user,
+   OAuth-first. Accept that some capabilities — model enrichment, quota
+   awareness across accounts, a dashboard, multi-user budgets — are not
+   reimplemented, and say so plainly.
+2. **Fold eggpass into eggpool** as an OAuth credential source. Much less code,
+   but eggpool's deployment shape (LAN, SQLite, dashboard, multi-user) is not
+   what this project wants, and the daemon model, the config layout and the
+   CLI surface are all different.
+3. **Do nothing and use eggpool.** Viable if the subscription-OAuth angle
+   turns out not to matter.
+
+**Recommendation: option 1**, with an explicit statement of what eggpass
+deliberately does *not* do, and a pointer to eggpool for anyone who wants the
+heavier version. The two can coexist: they are separate binaries on separate
+ports with separate configs.
+
+**But this should be confirmed before the ChatGPT provider is built**, because
+if the answer is "eggpool already does this and we should just use it", the
+ChatGPT provider work in Part 4 Phase 4 is largely redundant — and that is a
+cheaper thing to discover now than after building it.
+
+Two things worth checking either way:
+
+- **Does eggpool already support ChatGPT subscription OAuth?** If its
+  `connect` flow already handles SIWC, the gap is much smaller than it looks.
+- **Does eggpool's `model/provider` pinning give us the routing we designed?**
+  It looks close to the prefix-map routing in Part 3.3.
+
+### 9.4 Other eggstack projects worth knowing about
+
+| Project | Relevance |
+| --- | --- |
+| `eggserve` | Evaluated in the research note. A hardened static file server with an async custom-service seam; **not adopted** — it requires tokio. |
+| `eggress` | A Rust-native multi-protocol **network** proxy (SOCKS5/HTTP/CONNECT, pproxy-compatible). A different layer from our API server — not a replacement for our HTTP server, but the right tool if `eggpass` ever needs an outbound proxy chain or a SOCKS listener. It has a blocking embed API (`start_blocking()` / `shutdown_blocking()`). |
+| `eggup-service` | systemd / launchd / cron / Windows SCM lifecycle adapters. Optional extra, never a default dependency (Part 8.3). |
+| `eggfetch` | The native HTTP client behind `eggup-eggfetch`. Relevant if we ever want to replace `ureq`. |
+| `eggchaos` | A stream-fault engine for testing chaotic network conditions. Potentially valuable for our SSE paths — a fault-injection harness for the streaming and refresh-retry logic would be a real quality win. |
+| `eggreplay` | A semantic interaction recorder/replayer and regression engine. Also potentially valuable for replaying recorded upstream responses in tests. |
+| `eggplan` | A repo planning work-order engine. Possibly relevant to how the eggstack family structures planning work — worth a look when formalising our own plan documents. |
+| `gregg`, `snip-it` | The family's TUI references. `snip-it` uses `ratatui` + `crossterm`, which is the precedent for our provider picker (Part 7.3). |

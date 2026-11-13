@@ -1,6 +1,6 @@
 # CLI specification
 
-Binary name: `grokproxy`
+Binary name: `eggpass`
 
 Every command is **idempotent** and safe to run from cron. All commands exit
 `0` on success, `1` on usage/operational error, `2` on "not logged in" where
@@ -10,81 +10,174 @@ Global flags:
 
 ```
 --config <path>   override the config file location
+--provider <id>   name the provider directly; suppresses the picker
 --verbose         verbose logging
 --help, -h        show help for a command
 --version         print version
 ```
 
----
-
-## `grokproxy login`
-
-Authenticate with x.ai over OAuth.
+Environment variables:
 
 ```
-grokproxy login              # loopback browser flow (opens the browser)
-grokproxy login --device     # device-code flow, for headless / SSH
-grokproxy login --force      # discard existing credentials and log in again
+EGGPASS_HOME       override the config directory
+EGGPASS_PROVIDER   same as --provider <id>, lower precedence than the flag
+```
+
+`--provider <id>` applies to the commands that talk to a provider (`login`,
+`logout`). It is the non-interactive path into every command: with it set, the
+picker is never drawn and stdin is never read, so the command behaves the same
+whether it is run from a terminal, a pipe or cron. An unknown provider id is
+an error, not a silent fallback.
+
+---
+
+## `eggpass login`
+
+Authenticate with a provider over OAuth.
+
+```
+eggpass login              # interactive provider picker, then the login flow
+eggpass login --provider xai   # pick the provider directly, no picker
+eggpass login --device     # x.ai only: device-code flow, for headless / SSH
 ```
 
 **Behaviour**
 
-1. If already logged in and `--force` was not passed, print the account
-   (email or user id) and the token expiry, and exit `0` without re-authenticating.
-2. Otherwise start an OAuth flow:
-   - **Loopback (default):** bind a **random ephemeral** port on `127.0.0.1`,
-     generate PKCE verifier/challenge plus `state` and `nonce`, open the
-     browser at the authorize URL, and wait up to **10 minutes** for the
-     callback on `http://127.0.0.1:<ephemeral>/callback`.
-   - **Device (`--device`):** request a device code, print the user code and
-     the verification URL, and poll every `interval` seconds (default 5) until
-     approved, denied, or expired (30 minutes).
-3. Exchange the code for tokens and write them to `~/.config/grokproxy/auth.json`
-   (mode `0600`).
+1. **Choose a provider.** With no provider named — by neither `--provider` nor
+   `EGGPASS_PROVIDER` — present an interactive picker over every provider the
+   build knows about:
+
+   ```
+   $ eggpass login
+
+     Select a provider to sign in with:
+
+       ❯ x.ai
+         ChatGPT
+
+     ↑/↓ or j/k to move · Enter to select · Esc to cancel
+   ```
+
+   - `↑`/`↓` **and** `j`/`k` both move the cursor; `Enter` selects; `Esc` and
+     `Ctrl-C` cancel.
+   - Cancelling exits `0` and changes nothing.
+   - When stdin is **not** a terminal (piped input, CI, cron), the picker
+     falls back to a numbered list and reads one line:
+
+     ```
+     Select a provider to sign in with:
+       1) x.ai
+       2) ChatGPT
+     Provider [1-2]:
+     ```
+
+   - `--device` is accepted only for x.ai. Choosing ChatGPT with `--device` is
+     an error, because the ChatGPT path has no documented device flow.
+
+2. **Sign in.** The flow is per provider:
+   - **x.ai — loopback (default):** bind a **random ephemeral** port on
+     `127.0.0.1`, generate PKCE verifier/challenge plus `state` and `nonce`,
+     open the browser at the authorize URL, and wait up to **10 minutes** for
+     the callback on `http://127.0.0.1:<ephemeral>/callback`.
+   - **x.ai — device (`--device`):** request a device code, print the user code
+     and the verification URL, and poll every `interval` seconds (default 5)
+     until approved, denied, or expired (30 minutes).
+   - **ChatGPT — loopback:** bind a random ephemeral port on `127.0.0.1` and
+     use the path `/auth/callback` — Sign in with ChatGPT requires the path to
+     match exactly, and only the port may vary. On a **first** sign-in the
+     client id is `dynamic_agent_client` and OpenAI issues the real client id
+     during the callback; that issued id is stored. On a **re-login** the
+     saved issued client id is reused, so no second registration is created.
+3. Exchange the code for tokens and write them to the provider's credential
+   file under `~/.config/eggpass/credentials/` (mode `0600`).
 4. Print success, the account identifier, and when the access token expires.
+
+**Re-login replaces.** Signing in to a provider that is already logged in
+**replaces** the stored credential. It never fails with "already logged in",
+and it never creates a second record for the same provider. The write is
+atomic, so an interrupted re-login leaves the previous credential intact.
+
+There is no `--force` flag: replacement is the only behaviour.
 
 The OAuth callback port is **independent of the API port**. Login works while
 the daemon is running and does not require the daemon to be stopped.
 
-**Exit codes:** `0` success · `2` already logged in without `--force` (not an
-error, prints a notice) · `1` denied/expired/failed.
+**Exit codes:** `0` success or cancelled · `1` denied/expired/failed ·
+`2` `--device` requested for a provider that has no device flow.
 
 ---
 
-## `grokproxy logout`
+## `eggpass logout`
 
-Remove stored OAuth credentials.
+Revoke and remove stored OAuth credentials.
 
 ```
-grokproxy logout
+eggpass logout
+eggpass logout --provider xai   # pick the provider directly, no picker
 ```
 
 **Behaviour**
 
-- Delete `~/.config/grokproxy/auth.json` (or blank the token fields).
-- Stop the running daemon? **No.** The daemon stays up and will begin returning
-  `401` until the next login. `logout` prints a notice saying so.
-- If no credentials are stored, print "not logged in" and exit `0`.
+1. **Choose a provider.** With no provider named — by neither `--provider` nor
+   `EGGPASS_PROVIDER` — present the same picker as `login`, but listing **only
+   the providers that are actually logged in**. A provider with no stored
+   credential is not shown at all.
 
-**Exit codes:** `0` always.
+   ```
+   $ eggpass logout
+
+     Select a provider to sign out of:
+
+       ❯ x.ai
+
+     ↑/↓ or j/k to move · Enter to select · Esc to cancel
+   ```
+
+   With no provider logged in anywhere, print "not logged in" and exit `0`
+   **without** showing the picker.
+
+2. **Recycle the credential.** Revoke it at the provider before deleting it:
+   - **x.ai:** `POST https://auth.x.ai/oauth2/revoke` with the refresh token.
+     This is the `revocation_endpoint` published in x.ai's OIDC discovery.
+   - **ChatGPT:** `POST` to the `revocation_endpoint` from
+     `https://auth.openai.com/.well-known/openid-configuration` with
+     `token=<refresh_token>`, `token_type_hint=refresh_token` and the issued
+     client id. An empty `200` is success.
+3. Delete the provider's credential file.
+4. Stop the running daemon? **No.** The daemon stays up and will begin
+   returning `401` for that provider until the next login. `logout` prints a
+   notice saying so.
+
+Revocation is **best-effort**. If the network call fails, the local credential
+is still deleted, and the command says the remote revocation was not
+confirmed — the token then lapses on its own, and the user can also disconnect
+the app from the provider's own settings page.
+
+**Exit codes:** `0` always (a failed revocation is not an error) · `1` the
+credential file could not be removed.
 
 ---
 
-## `grokproxy status`
+## `eggpass status`
 
 Report account state and daemon state.
 
 ```
-grokproxy status
+eggpass status
 ```
 
 **Output** — both sections, always, so the output is stable for scripting:
 
 ```
-Account:  logged in
-  email:      david@example.com
-  user id:    01J...
-  token:      valid, expires in 5h 12m
+Accounts:
+  x.ai      logged in
+    email:    david@example.com
+    user id:  01J...
+    token:    valid, expires in 5h 12m
+  ChatGPT   logged in
+    email:    david@example.com
+    plan:     plus (plan usage enabled)
+    token:    valid, expires in 47m
 
 Server:   running
   pid:       51234
@@ -94,23 +187,29 @@ Server:   running
 ```
 
 ```
-Account:  logged out
+Accounts:
+  x.ai      logged out
+  ChatGPT   logged out
 
 Server:   stopped
 ```
+
+Each provider appears in a fixed order so the output stays diffable. The
+`models` line is only meaningful for the provider serving inference; it is
+omitted when no provider is logged in.
 
 **Exit codes:** `0` always. Parseability matters more than status codes here —
 `status` is a human-facing command.
 
 ---
 
-## `grokproxy run`
+## `eggpass run`
 
 Start the server as a background daemon.
 
 ```
-grokproxy run
-grokproxy run --foreground    # run in the foreground instead (debugging)
+eggpass run
+eggpass run --foreground    # run in the foreground instead (debugging)
 ```
 
 **Behaviour**
@@ -118,8 +217,8 @@ grokproxy run --foreground    # run in the foreground instead (debugging)
 1. If a daemon is already running, print its PID and URL and exit `0`
    **without** starting a second one.
 2. Otherwise spawn a detached child, write its PID to
-   `~/.config/grokproxy/grokproxy.pid`, redirect stdout/stderr to
-   `~/.config/grokproxy/grokproxy.log`.
+   `~/.config/eggpass/eggpass.pid`, redirect stdout/stderr to
+   `~/.config/eggpass/eggpass.log`.
 3. Wait for the child to bind the port and answer `/health` (up to ~10s).
    If it does not come up, print the last lines of the log and exit `1`.
 4. Print the base URL that clients should use:
@@ -129,12 +228,12 @@ grokproxy run --foreground    # run in the foreground instead (debugging)
 
 ---
 
-## `grokproxy stop`
+## `eggpass stop`
 
 Stop the running daemon.
 
 ```
-grokproxy stop
+eggpass stop
 ```
 
 **Behaviour**
@@ -149,12 +248,12 @@ grokproxy stop
 
 ---
 
-## `grokproxy restart`
+## `eggpass restart`
 
 Stop, then start.
 
 ```
-grokproxy restart
+eggpass restart
 ```
 
 **Behaviour** — `stop` then `run`, in that order. Prints the new PID and URL.
@@ -164,13 +263,13 @@ A restart is the point at which a changed `port` takes effect.
 
 ---
 
-## `grokproxy port`
+## `eggpass port`
 
 Show or change the listen port.
 
 ```
-grokproxy port            # print the current port
-grokproxy port 9000       # change it
+eggpass port            # print the current port
+eggpass port 9000       # change it
 ```
 
 **Behaviour**
@@ -180,19 +279,19 @@ grokproxy port 9000       # change it
   1024), write it to the config file, and report that it takes effect on the
   next restart.
 - If the daemon is running and the port changed, print:
-  `port set to 9000 — run 'grokproxy restart' to apply (currently serving 8484)`.
+  `port set to 9000 — run 'eggpass restart' to apply (currently serving 8484)`.
 - Changing the port **does not** restart the daemon.
 
 **Exit codes:** `0` ok · `1` invalid port.
 
 ---
 
-## `grokproxy edit`
+## `eggpass edit`
 
 Open the config file in the user's editor.
 
 ```
-grokproxy edit
+eggpass edit
 ```
 
 **Behaviour**
@@ -207,13 +306,13 @@ grokproxy edit
 
 ---
 
-## `grokproxy croncheck`
+## `eggpass croncheck`
 
 Designed for a `crontab` entry — start the server only if it is not already
 running.
 
 ```
-grokproxy croncheck
+eggpass croncheck
 ```
 
 **Behaviour**
@@ -231,7 +330,7 @@ grokproxy croncheck
 **Example crontab entry**
 
 ```cron
-*/5 * * * * /usr/local/bin/grokproxy croncheck >> ~/.config/grokproxy/cron.log 2>&1
+*/5 * * * * /usr/local/bin/eggpass croncheck >> ~/.config/eggpass/cron.log 2>&1
 ```
 
 ---
@@ -240,19 +339,21 @@ grokproxy croncheck
 
 | Path | Purpose | Mode |
 | --- | --- | --- |
-| `~/.config/grokproxy/config.toml` | User-editable config | `0644` |
-| `~/.config/grokproxy/auth.json` | OAuth tokens | `0600` (dir `0700`) |
-| `~/.config/grokproxy/grokproxy.pid` | Daemon PID | `0644` |
-| `~/.config/grokproxy/grokproxy.log` | Daemon + cron log | `0644` |
+| `~/.config/eggpass/config.toml` | User-editable config | `0644` |
+| `~/.config/eggpass/credentials/xai.json` | x.ai OAuth tokens | `0600` (dir `0700`) |
+| `~/.config/eggpass/credentials/openai.json` | ChatGPT OAuth tokens, issued client id, host id | `0600` (dir `0700`) |
+| `~/.config/eggpass/eggpass.pid` | Daemon PID | `0644` |
+| `~/.config/eggpass/eggpass.log` | Daemon + cron log | `0644` |
 
 `~/.grok/auth.json` (written by the official Grok Build CLI) is read as an
-**import source** when `~/.config/grokproxy/auth.json` is absent, so a user who
-already ran `grok login` can start using the proxy without logging in again.
+**import source** when `~/.config/eggpass/credentials/xai.json` is absent, so a
+user who already ran `grok login` can start using the proxy without logging in
+again.
 
 ## Config file
 
 ```toml
-# ~/.config/grokproxy/config.toml
+# ~/.config/eggpass/config.toml
 
 port = 8484
 upstream = "api"      # "api" = api.x.ai  |  "build" = cli-chat-proxy.grok.com

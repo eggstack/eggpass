@@ -95,7 +95,7 @@ If a cache is ever wanted, the TTL would want to be short-ish and the
 > The details that follow are still accurate as a description of the Codex
 > CLI's own implementation — which is what the reference material describes —
 > but the *design* should now be based on SIWC. See
-> [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md)
+> [`plan-eggpass.md`](plan-eggpass.md)
 > §3.4–3.5 for the revised design, and §2.7 below for why this matters.
 
 The shape is genuinely parallel to the x.ai path — same PKCE, same
@@ -259,7 +259,7 @@ third-party-use permission.
 > an internal backend.
 >
 > The guidance above therefore applies only to the **Codex CLI's own**
-> implementation. A grokproxy built on SIWC does not inherit the risk — but it
+> implementation. A eggpass built on SIWC does not inherit the risk — but it
 > does inherit SIWC's own constraints: browser-loopback-only sign-in, a
 > mandatory `stream: true`, and a list of request fields the route rejects.
 
@@ -363,7 +363,7 @@ own merits.
 
 **Reconsider if** the requirement changes to: serve untrusted networks, need
 HTTP/2 or HTTP/3, need WebSocket upgrade/tunnel semantics, or need to expose
-grokproxy as a library to other Rust projects that already use eggserve.
+eggpass as a library to other Rust projects that already use eggserve.
 
 ---
 
@@ -472,7 +472,7 @@ and the CLI-proxy billing endpoint (consumer weekly pool).
 > [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
 >
 > Whether the WHAM `/wham/usage` endpoint happens to accept a SIWC token is
-> **unverified** and worth one test — if it does, `grokproxy status` could
+> **unverified** and worth one test — if it does, `eggpass status` could
 > show the user's real remaining allowance. See the plan's §3.7.
 
 **Endpoint.** `GET https://chatgpt.com/backend-api/wham/usage` with the
@@ -534,7 +534,7 @@ One subtlety: `plan_type` is **not** in the HTTP headers. Codex only sets it
 from WebSocket `codex.rate_limits` events; the HTTP header parser writes it
 as null. So the endpoint is the only place to get the plan type.
 
-### 4.3 What this means for grokproxy today
+### 4.3 What this means for eggpass today
 
 **The good news: we already forward upstream headers.** `forwarded_headers`
 in `src/server/chat.rs:59` copies everything except hop-by-hop headers, so
@@ -555,7 +555,7 @@ client automatically on non-streaming responses.
    headers. Only the non-200 branch forwards them. This one is harmless
    (verified: `/v1/models` carries no rate-limit headers anyway).
 
-**A design question for any plan-limits feature:** should grokproxy expose
+**A design question for any plan-limits feature:** should eggpass expose
 the limits as *response headers* (pass-through, zero effort, works today for
 non-streaming), or as a *first-class endpoint* (e.g. `GET /v1/usage`)? A
 `/v1/usage` endpoint would need a provider-specific implementation — Codex has
@@ -585,7 +585,7 @@ is a reason to keep this a *provider capability* rather than a core feature.
 
 3. **ChatGPT path: use Sign in with ChatGPT, not the Codex CLI's client.**
    > **Update (2026-11-13).** This recommendation is superseded in detail by
-   > [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md),
+   > [`plan-eggpass.md`](plan-eggpass.md),
    > but the shape of the answer holds: the auth plumbing is the easy part and
    > our `TokenProvider` trait is the right seam; the real work is on the
    > inference side.
@@ -616,6 +616,6 @@ is a reason to keep this a *provider capability* rather than a core feature.
 
 5. **Worth recording in the README:** our current path is metered on the
    standard xAI API tier system (tier 1 for this account), *not* drawn from
-   the SuperGrok consumer weekly pool. Anyone using grokproxy should know
-   that the Grok subscription allowance and grokproxy's API usage are
+   the SuperGrok consumer weekly pool. Anyone using eggpass should know
+   that the Grok subscription allowance and eggpass's API usage are
    billed separately.

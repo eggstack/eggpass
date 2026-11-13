@@ -1,4 +1,4 @@
-# grokproxy
+# eggpass
 
 A lightweight, local, OpenAI-compatible proxy for Grok.
 
@@ -7,9 +7,14 @@ machine, and serves an OpenAI-compatible API on `127.0.0.1:8484`. Any OpenAI
 client — OpenCode, Cline, Continue, the OpenAI SDK, a shell script — can talk
 to Grok models such as `grok-4.7` and `grok-4.6` without an x.ai API key.
 
+> **Status.** The proxy works today against x.ai. The rename to `eggpass`, the
+> interactive provider picker, the ChatGPT provider and the eggpack/eggup
+> packaging pipeline are designed and written up, but **not yet implemented** —
+> see [`plans/plan-eggpass.md`](plans/plan-eggpass.md).
+
 ```
 ┌──────────────┐   OpenAI API    ┌────────────┐   OAuth bearer   ┌──────────────┐
-│ your client  │ ──────────────► │ grokproxy  │ ───────────────► │  api.x.ai    │
+│ your client  │ ──────────────► │ eggpass    │ ───────────────► │  api.x.ai    │
 │ (OpenCode…)  │  127.0.0.1:8484 │  (daemon)  │                  │  /v1/chat/…  │
 └──────────────┘                  └────────────┘                  └──────────────┘
 ```
@@ -22,20 +27,20 @@ to Grok models such as `grok-4.7` and `grok-4.6` without an x.ai API key.
 ## Install
 
 ```sh
-git clone https://github.com/you/grokproxy
-cd grokproxy
+git clone https://github.com/you/eggpass
+cd eggpass
 cargo install --path .
 ```
 
-The result is a single binary, `grokproxy`, with no runtime dependencies
+The result is a single binary, `eggpass`, with no runtime dependencies
 beyond a certificate store.
 
 ## Quick start
 
 ```sh
-grokproxy login      # opens your browser; approve the login
-grokproxy run        # starts the server in the background
-grokproxy status     # shows the account and the server
+eggpass login      # opens your browser; approve the login
+eggpass run        # starts the server in the background
+eggpass status     # shows the account and the server
 ```
 
 Point your client at `http://127.0.0.1:8484/v1`.
@@ -43,42 +48,69 @@ Point your client at `http://127.0.0.1:8484/v1`.
 On a headless machine, or over SSH, use the device-code flow instead:
 
 ```sh
-grokproxy login --device
+eggpass login --device
 ```
 
 Already running the official Grok CLI? Its credentials are picked up
-automatically — `grokproxy status` will show you as logged in.
+automatically — `eggpass status` will show you as logged in.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `grokproxy login` | Authenticate with x.ai over OAuth. `--device` for headless, `--force` to log in again. |
-| `grokproxy logout` | Remove the stored credentials. The daemon keeps running and answers `401` until you log in again. |
-| `grokproxy status` | Show the account state and the daemon state. |
-| `grokproxy run` | Start the server as a background daemon. `--foreground` to stay in the terminal. |
-| `grokproxy stop` | Stop the daemon. |
-| `grokproxy restart` | Stop the daemon, then start it again. |
-| `grokproxy port` | Show the listen port, or change it. A change takes effect at the next `restart`. |
-| `grokproxy edit` | Open the config file in `$EDITOR`. |
-| `grokproxy croncheck` | Start the daemon only if it is not already running. Prints nothing. |
+| `eggpass login` | Authenticate with x.ai over OAuth. `--device` for headless. Replaces an existing login. |
+| `eggpass logout` | Revoke the credential at x.ai, then delete it. The daemon keeps running and answers `401` until you log in again. |
+| `eggpass status` | Show the account state and the daemon state. |
+| `eggpass run` | Start the server as a background daemon. `--foreground` to stay in the terminal. |
+| `eggpass stop` | Stop the daemon. |
+| `eggpass restart` | Stop the daemon, then start it again. |
+| `eggpass port` | Show the listen port, or change it. A change takes effect at the next `restart`. |
+| `eggpass edit` | Open the config file in `$EDITOR`. |
+| `eggpass croncheck` | Start the daemon only if it is not already running. Prints nothing. |
 
 Every command is idempotent and safe to script from cron.
+
+### Signing in to more than one provider
+
+`eggpass login` and `eggpass logout` open an interactive picker when no
+provider is named:
+
+```
+$ eggpass login
+
+  Select a provider to sign in with:
+
+    ❯ x.ai
+      ChatGPT
+
+  ↑/↓ or j/k to move · Enter to select · Esc to cancel
+```
+
+`login` lists every provider the build knows about; `logout` lists only the
+ones you are actually signed in to. Signing in to a provider you are already
+signed in to simply **replaces** the stored credential — there is no `--force`
+flag. When stdin is not a terminal the picker falls back to a numbered list,
+and `--provider <id>` skips it entirely.
+
+This is **designed but not yet implemented**; today `login` and `logout`
+target x.ai only. See
+[`plans/cli-spec.md`](plans/cli-spec.md#eggpass-login) and
+[Part 7](plans/plan-eggpass.md#part-7--the-interactive-provider-picker).
 
 ### Keeping it alive with cron
 
 ```cron
-*/5 * * * * /usr/local/bin/grokproxy croncheck >> ~/.config/grokproxy/cron.log 2>&1
+*/5 * * * * /usr/local/bin/eggpass croncheck >> ~/.config/eggpass/cron.log 2>&1
 ```
 
 `croncheck` does nothing and exits quietly when the server is already up.
 
 ## Configuration
 
-`~/.config/grokproxy/config.toml`:
+`~/.config/eggpass/config.toml`:
 
 ```toml
-# TCP port the local API listens on. Takes effect after `grokproxy restart`.
+# TCP port the local API listens on. Takes effect after `eggpass restart`.
 port = 8484
 
 # Upstream that serves model requests.
@@ -102,10 +134,10 @@ allow_privileged_port = false
 client_id = "b1a00492-073a-47ea-816f-4c329264a828"
 issuer = "https://auth.x.ai"
 scopes = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
-referrer = "grokproxy"
+referrer = "eggpass"
 ```
 
-Run `grokproxy edit` to change it in your editor; the file is validated when
+Run `eggpass edit` to change it in your editor; the file is validated when
 the editor exits.
 
 ## Endpoints
@@ -147,7 +179,7 @@ Add the provider to `~/.config/opencode/opencode.json`:
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "grokproxy": {
+    "eggpass": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Grok (local proxy)",
       "options": { "baseURL": "http://127.0.0.1:8484/v1" },
@@ -198,39 +230,44 @@ curl http://127.0.0.1:8484/v1/chat/completions \
 
 | Path | Purpose | Mode |
 | --- | --- | --- |
-| `~/.config/grokproxy/config.toml` | Your configuration | `0644` |
-| `~/.config/grokproxy/auth.json` | OAuth tokens | `0600` (directory `0700`) |
-| `~/.config/grokproxy/grokproxy.pid` | Daemon pid and the port it serves | `0644` |
-| `~/.config/grokproxy/grokproxy.log` | Daemon log | `0644` |
+| `~/.config/eggpass/config.toml` | Your configuration | `0644` |
+| `~/.config/eggpass/auth.json` | OAuth tokens | `0600` (directory `0700`) |
+| `~/.config/eggpass/eggpass.pid` | Daemon pid and the port it serves | `0644` |
+| `~/.config/eggpass/eggpass.log` | Daemon log | `0644` |
+
+When the multi-provider work lands, this becomes
+`~/.config/eggpass/credentials/<provider>.json` — one `0600` file per
+provider (`xai.json`, `openai.json`) — and the existing `auth.json` is
+migrated into `credentials/xai.json` on first sight, so nothing is lost.
 
 `~/.grok/auth.json`, written by the official Grok CLI, is read as an import
 source when `auth.json` is missing.
 
 **One thing to know about refresh tokens.** x.ai rotates them: every refresh
-returns a new refresh token and revokes the old one. `grokproxy` keeps the new
+returns a new refresh token and revokes the old one. `eggpass` keeps the new
 one, so it keeps working — but if the credential was *imported* from
 `~/.grok/auth.json`, the file it came from still holds the revoked token, and
 the official Grok CLI will need its own login again. Log in with
-`grokproxy login` rather than relying on the import if you use both tools.
+`eggpass login` rather than relying on the import if you use both tools.
 
 ## Troubleshooting
 
-**`not logged in — run 'grokproxy login'`** — the credentials are missing or
+**`not logged in — run 'eggpass login'`** — the credentials are missing or
 expired and cannot be refreshed. Log in again.
 
 **`401` from the proxy** — either you are logged out, or the client is
-sending the wrong key. Check `grokproxy status`, and check `api_key` in the
+sending the wrong key. Check `eggpass status`, and check `api_key` in the
 config.
 
 **`address already in use`** — something else is on the port. Pick another one
-with `grokproxy port 9000` and then `grokproxy restart`.
+with `eggpass port 9000` and then `eggpass restart`.
 
 **The server says it is running but nothing answers** — the daemon is running
-but its port has changed. `grokproxy status` prints the port it is actually
-serving. `grokproxy restart` applies the configured port.
+but its port has changed. `eggpass status` prints the port it is actually
+serving. `eggpass restart` applies the configured port.
 
 **The browser did not open for the login** — the URL is printed as well; open
-it by hand, or use `grokproxy login --device`.
+it by hand, or use `eggpass login --device`.
 
 **Streaming feels slow** — check that the client is not buffering. `curl -N`
 shows the raw stream.
@@ -273,6 +310,12 @@ The reasoning behind the design lives in [`plans/`](plans/):
   order, the acceptance criteria, and
   [what shipped](plans/implementation-plan.md#what-shipped-2026-11-13),
   including the places where the build departed from the plan.
+- [`plans/research-model-refresh-codex-eggserve-limits.md`](plans/research-model-refresh-codex-eggserve-limits.md)
+  — catalogue refresh, the ChatGPT auth path, the HTTP server choice, and
+  what x.ai and OpenAI actually expose about plan limits.
+- [`plans/plan-eggpass.md`](plans/plan-eggpass.md) — the plan for the
+  combined Grok + ChatGPT proxy, the rename map, the interactive provider
+  picker, and the eggpack/eggup packaging ecosystem.
 
 ## License
 

@@ -14,7 +14,7 @@ called out explicitly.
 | Upstream | **`api.x.ai/v1`** | Full model catalog (`grok-4.7`, `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-*`). The Grok Build proxy exposes one model and renames models to `-build` variants. |
 | Login | **Browser loopback**, `--device` fallback | Best desktop UX; device code covers headless/SSH and needs no port. |
 | OAuth callback port | **Random ephemeral loopback**, independent of the API port | Lets `login` run while the daemon is up and survives a `port` change. |
-| Config format | **TOML** at `~/.config/grokproxy/config.toml` | Same as the official Grok CLI; comment-friendly for `$EDITOR`; no parser dependency beyond one crate. |
+| Config format | **TOML** at `~/.config/eggpass/config.toml` | Same as the official Grok CLI; comment-friendly for `$EDITOR`; no parser dependency beyond one crate. |
 | Daemon model | **Self-contained, PID-file based** | Identical behaviour on macOS and Linux; no root, no install step, no platform branching. |
 | Async runtime | **None** — blocking, thread-per-connection | Keeps the dependency tree small and the SSE proxying code straightforward. |
 
@@ -180,7 +180,7 @@ Details that matter:
   duplicate referrer parameters"*, so this parameter is tracked by xAI. The
   reference project sends `referrer=hermes-agent`; using our own identifier is
   more honest but `grok-build` is the proven-working value. **Recommendation:
-  send a stable identifier of our own (e.g. `grokproxy`) and fall back to
+  send a stable identifier of our own (e.g. `eggpass`) and fall back to
   `grok-build` if the login is rejected.** This is a low-risk, easily-changed
   constant.
 - **Callback port**: the official CLI binds a **random ephemeral port** and
@@ -190,9 +190,9 @@ Details that matter:
   hardcodes port 56121.
 
   **Recommendation: use a random ephemeral loopback port for the OAuth
-  callback, completely separate from the API port.** This means `grokproxy
+  callback, completely separate from the API port.** This means `eggpass
   login` works while the daemon is running on 8484, and works after
-  `grokproxy port 9000` without a restart dance.
+  `eggpass port 9000` without a restart dance.
 
 - **Callback timeout**: the official CLI uses **600 seconds (10 minutes)**.
 - **Consent screen**: when a *Team* principal is chosen, xAI strips the
@@ -319,10 +319,10 @@ The official CLI stores credentials in `~/.grok/auth.json`, keyed by scope:
 Grok Build CLI), `~/.grok/auth.json` already exists and can be read directly.
 A third-party library does exactly this. We should:
 
-- Prefer our own credential file (`~/.config/grokproxy/auth.json`, mode 0600) as
+- Prefer our own credential file (`~/.config/eggpass/auth.json`, mode 0600) as
   the source of truth.
 - **Also** support reading `~/.grok/auth.json` as a fallback/import source, so
-  `grokproxy login` is not mandatory if the user already has a Grok login.
+  `eggpass login` is not mandatory if the user already has a Grok login.
 
 Security posture for our own file: directory mode `0700`, file mode `0600`,
 write atomically (temp file + `rename`), never log token values.
@@ -502,11 +502,11 @@ Details:
 | Concern | Approach |
 | --- | --- |
 | Detach | `setsid()` / double-fork; child re-parents to init. Redirect stdio to the log file. |
-| PID file | `~/.config/grokproxy/grokproxy.pid` — write PID after bind succeeds. |
+| PID file | `~/.config/eggpass/eggpass.pid` — write PID after bind succeeds. |
 | Liveness | PID exists **and** process alive (`kill(pid, 0)`) **and** `/health` responds on the configured port. PID reuse is a real hazard — the health probe disambiguates. |
 | Stale PID | If the PID file exists but the process is dead, treat as not-running and clean up. |
 | `stop` | `SIGTERM` → wait up to ~10s → `SIGKILL`. Graceful shutdown closes the listener and finishes in-flight requests. |
-| Log | `~/.config/grokproxy/grokproxy.log`, with rotation or size cap. |
+| Log | `~/.config/eggpass/eggpass.log`, with rotation or size cap. |
 | `run` semantics | **Idempotent**: if already running, print the PID and exit 0. Never start a second instance. |
 | Port change | Write the new port to config; the running daemon keeps the old port until `restart`. The CLI should say so explicitly. |
 | Single-instance guard | Bind failure on the port is itself the guard; also check the PID file before starting. |
@@ -524,11 +524,11 @@ can be offered later as an optional `install-service` command.
 Use XDG-ish conventions, which macOS and Linux both tolerate:
 
 ```
-~/.config/grokproxy/
+~/.config/eggpass/
 ├── config.toml      # port, upstream, api key, log level
 ├── auth.json        # OAuth tokens (0600)
-├── grokproxy.pid
-└── grokproxy.log
+├── eggpass.pid
+└── eggpass.log
 ```
 
 Config format: **TOML** — it is what the official Grok CLI uses
@@ -545,7 +545,7 @@ api_key = ""              # empty = accept any key (loopback only)
 log_level = "info"
 ```
 
-`grokproxy edit` should open this file in `$EDITOR` (falling back to
+`eggpass edit` should open this file in `$EDITOR` (falling back to
 `$VISUAL`, then a sensible default). On this machine that means **helix** or
 **vim** — both are what the user named.
 
@@ -571,7 +571,7 @@ log_level = "info"
 4. **Token lifetime ambiguity** (6h vs 7d vs 30d). Mitigated by always
    trusting `expires_at` from the server.
 5. **`referrer` parameter** — unverified whether xAI validates the value.
-   Test with `grokproxy`; fall back to `grok-build`.
+   Test with `eggpass`; fall back to `grok-build`.
 6. **Scope consent friction.** Requesting the full official scope set may
    show a longer consent screen. If `conversations:*` causes issues, drop to
    the reference project's shorter set — inference does not need them.

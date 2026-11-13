@@ -1,6 +1,6 @@
 # Implementation plan
 
-Phased build order for `grokproxy`. Each phase lists the files it creates,
+Phased build order for `eggpass`. Each phase lists the files it creates,
 what it must do, and how we know it is done. **No phase starts until the
 previous one is verified.**
 
@@ -93,14 +93,14 @@ Deliberately excluded: `tokio`/`async`/`axum`/`reqwest`, `keyring`, `clap`.
 
 **Work**
 
-1. `cargo init --bin --vcs git` style scaffold, name `grokproxy`.
+1. `cargo init --bin --vcs git` style scaffold, name `eggpass`.
    Set `rust-version = "1.85"`, `edition = "2024"`, `resolver` inherited from
    edition 2024 (v3, MSRV-aware dependency resolution).
 2. `paths.rs` resolves, in order:
-   - `$GROKPROXY_HOME` if set,
-   - else `$XDG_CONFIG_HOME/grokproxy` if set,
-   - else `~/.config/grokproxy`.
-   Files: `config.toml`, `auth.json`, `grokproxy.pid`, `grokproxy.log`.
+   - `$EGGPASS_HOME` if set,
+   - else `$XDG_CONFIG_HOME/eggpass` if set,
+   - else `~/.config/eggpass`.
+   Files: `config.toml`, `auth.json`, `eggpass.pid`, `eggpass.log`.
 3. `config.rs`:
    ```toml
    port = 8484
@@ -119,8 +119,8 @@ Deliberately excluded: `tokio`/`async`/`axum`/`reqwest`, `keyring`, `clap`.
 
 **Done when**
 
-- `grokproxy --version` prints a version.
-- `grokproxy --help` lists the nine commands.
+- `eggpass --version` prints a version.
+- `eggpass --help` lists the nine commands.
 - A missing config file does not error; a malformed one does, with a clear message.
 - `cargo test` passes and `cargo clippy -- -D warnings` is clean.
 
@@ -149,7 +149,7 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
    | `DEVICE_CODE_URL` | `https://auth.x.ai/oauth2/device/code` |
    | `USERINFO_URL` | `https://auth.x.ai/oauth2/userinfo` |
    | `SCOPES` | `openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write` |
-   | `REFERER` | `grokproxy` (fallback `grok-build`) |
+   | `REFERER` | `eggpass` (fallback `grok-build`) |
 
 3. **Loopback flow** (`flow.rs`):
    - Bind `127.0.0.1:0` (ephemeral port). **Never the API port.**
@@ -180,7 +180,7 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
    ```
    Do **not** send `code_challenge_method` in the token request — the verifier
    is sufficient and the parameter is not in RFC 6749.
-6. **Store** (`store.rs`): `auth.json` at `~/.config/grokproxy/auth.json`,
+6. **Store** (`store.rs`): `auth.json` at `~/.config/eggpass/auth.json`,
    directory `0700`, file `0600`, written atomically (temp file in the same
    directory + `rename`). Fields: `access_token`, `refresh_token`,
    `expires_at` (unix seconds), `token_type`, `id_token`, `scope`, `client_id`,
@@ -193,10 +193,10 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
 
 **Done when**
 
-- `grokproxy login` completes a real browser login against x.ai and writes
+- `eggpass login` completes a real browser login against x.ai and writes
   `auth.json` with mode `0600`.
-- `grokproxy login --device` completes against x.ai from a headless shell.
-- `grokproxy logout` removes the file; `grokproxy logout` again is a no-op
+- `eggpass login --device` completes against x.ai from a headless shell.
+- `eggpass logout` removes the file; `eggpass logout` again is a no-op
   that exits `0`.
 - A tampered `state` on the callback is rejected.
 - A `verification_uri` pointing at an untrusted host is refused.
@@ -227,7 +227,7 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
    access token is still the current one. Otherwise a burst of parallel
    requests triggers a refresh stampede.
 6. On refresh failure, return a clear `401` to the client
-   ("token expired, run `grokproxy login`"), never a generic `500`.
+   ("token expired, run `eggpass login`"), never a generic `500`.
 
 **Done when**
 
@@ -333,7 +333,7 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
 
 **Work**
 
-1. **PID file** at `~/.config/grokproxy/grokproxy.pid`.
+1. **PID file** at `~/.config/eggpass/eggpass.pid`.
 2. **Liveness check** — a daemon is "running" only if **both**:
    - the PID in the file is alive (`kill(pid, 0)`), **and**
    - `GET /health` on the configured port responds.
@@ -448,7 +448,7 @@ to go smoothly, so they come after the risky unknowns are retired.
 | --- | --- | --- | --- |
 | 1 | `api.x.ai` may not accept the OAuth token for our subscription tier | `upstream` is a config value; fall back to `"build"` | Phase 8 live script |
 | 2 | The public client id could change or be revoked | Config-overridable constant | — |
-| 3 | `referrer` value may be validated by x.ai | Try `grokproxy`, fall back to `grok-build` | Phase 2 |
+| 3 | `referrer` value may be validated by x.ai | Try `eggpass`, fall back to `grok-build` | Phase 2 |
 | 4 | Full scope set may cause consent friction | Fall back to the shorter set used by the reference | Phase 2 |
 | 5 | Token lifetime ambiguity (6h / 7d / 30d) | Always trust the server's `expires_at`; conservative fallback | Phase 3 |
 | 6 | Upstream streams can end without a finish reason | Buffer-and-retry at the client boundary, not mid-stream | Phase 5 |
@@ -459,9 +459,9 @@ to go smoothly, so they come after the risky unknowns are retired.
 ## Definition of done
 
 - All nine commands behave exactly as `cli-spec.md` describes.
-- `grokproxy login && grokproxy run` yields a working OpenAI-compatible
+- `eggpass login && eggpass run` yields a working OpenAI-compatible
   endpoint serving `grok-4.7` / `grok-4.6`.
-- `grokproxy croncheck` is safe as a 5-minute crontab entry.
+- `eggpass croncheck` is safe as a 5-minute crontab entry.
 - The dependency list matches the table above with nothing extra.
 - `cargo test` green, `clippy` clean, `fmt` clean.
 - No token material in logs, in the repository, or in a crash dump.
@@ -495,7 +495,7 @@ transparently on the first request, keeping the refresh token.
 | `src/auth/store.rs` holds the credential format | Unchanged | — |
 | A separate `src/timeutil.rs` module | Added | The plan had no home for RFC 3339 conversion, which is needed to read `expires_at` out of the official Grok CLI's credential file. |
 | The config file has four keys | Five — `allow_privileged_port` was added | Phase 8 requires refusing to bind a privileged port "unless explicitly overridden", which needs a key to override it with. |
-| The pid file holds a pid | It holds a pid **and** the port the daemon is serving | Without it, `status` and `port` cannot report the port that is live right now, which differs from the configured port after a `grokproxy port` change. |
+| The pid file holds a pid | It holds a pid **and** the port the daemon is serving | Without it, `status` and `port` cannot report the port that is live right now, which differs from the configured port after a `eggpass port` change. |
 
 ### The dependency list, as built
 
