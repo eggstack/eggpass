@@ -465,3 +465,51 @@ to go smoothly, so they come after the risky unknowns are retired.
 - The dependency list matches the table above with nothing extra.
 - `cargo test` green, `clippy` clean, `fmt` clean.
 - No token material in logs, in the repository, or in a crash dump.
+
+---
+
+## What shipped (2026-11-13)
+
+All eight phases are implemented, committed and verified. The notes below
+record the places where the build did not match this plan, and why.
+
+### Open risk #1 is resolved
+
+`api.x.ai` **does** accept the x.ai OAuth token. Verified live on
+2026-11-13 through the proxy: `GET /v1/models` returned thirteen models
+including `grok-4.7` and `grok-4.6`, and a `grok-4.7` chat completion and a
+streaming completion both succeeded. The upstream stays `api.x.ai`; the
+`"build"` upstream remains available in the config.
+
+The token used for that check was imported from the official Grok CLI's
+`~/.grok/auth.json`, which also exercised the import path and the refresh
+path: the imported access token was expired, and the proxy refreshed it
+transparently on the first request, keeping the refresh token.
+
+### Deviations from the plan
+
+| Plan | What shipped | Why |
+| --- | --- | --- |
+| `tiny_http` for the inbound server | A small HTTP/1.1 server in `src/server/http.rs` | `tiny_http` wraps the response socket in a hard-coded one-kilobyte `BufWriter` that is only flushed when the response ends. Streaming responses would have been delivered in one-kilobyte bursts and the first token of every answer would have been withheld. The replacement is about three hundred lines, flushes after every chunk, and removes a dependency. |
+| `httptest` or `wiremock` for the stub upstream | A stub upstream written directly against a socket, in `src/server/tests.rs` | Fewer dependencies, and it can stream, which `httptest` cannot do without its own buffering. |
+| `src/auth/store.rs` holds the credential format | Unchanged | — |
+| A separate `src/timeutil.rs` module | Added | The plan had no home for RFC 3339 conversion, which is needed to read `expires_at` out of the official Grok CLI's credential file. |
+| The config file has four keys | Five — `allow_privileged_port` was added | Phase 8 requires refusing to bind a privileged port "unless explicitly overridden", which needs a key to override it with. |
+| The pid file holds a pid | It holds a pid **and** the port the daemon is serving | Without it, `status` and `port` cannot report the port that is live right now, which differs from the configured port after a `grokproxy port` change. |
+
+### The dependency list, as built
+
+Runtime: `serde`, `serde_json`, `toml`, `ureq`, `sha2`, `base64`, `rand`,
+`daemonize`, `signal-hook`, `nix`, `dirs`, `webbrowser`.
+Development: `tempfile`.
+
+That is the plan's table minus `tiny_http`, with nothing added.
+
+### Verification
+
+- `cargo test` — 84 tests, no network.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean.
+- `scripts/verify-live.sh` — passes end to end against the real x.ai:
+  device-code login, model catalogue, single model, chat completion, streaming
+  completion, client-credential stripping, token refresh, clean shutdown.

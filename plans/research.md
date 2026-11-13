@@ -553,10 +553,15 @@ log_level = "info"
 
 ## 8. Risks and open items
 
+> **Update (2026-11-13).** Risk 1 is closed: `api.x.ai` was verified to
+> accept the x.ai OAuth token through the finished proxy. The catalogue came
+> back with thirteen models including `grok-4.7` and `grok-4.6`, and both a
+> plain and a streaming `grok-4.7` completion succeeded. The upstream stays
+> `api.x.ai`.
+
 1. **Does `api.x.ai` accept the OAuth token for *our* subscription tier?**
-   Verified by a third party on 2026-07-30, but not by us. **First thing to
-   test once implementation exists.** If it fails, fall back to
-   `cli-chat-proxy.grok.com` and accept the narrower catalog.
+   Verified by a third party on 2026-07-30, and by us on 2026-11-13 through the
+   finished proxy. **Closed.**
 2. **The public client id could change or be revoked.** It is embedded in a
    shipped binary, so xAI has an interest in keeping it working, but it is not
    contractual. Make it a config value with the current value as default, so it

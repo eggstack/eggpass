@@ -7,7 +7,7 @@ Nothing in this directory ships with the binary.
 | --- | --- | --- |
 | [`research.md`](research.md) | x.ai OAuth surface, the two-host upstream comparison, model catalog, a file-by-file review of the reference implementation, daemon design, config layout, and the open-risk register. Includes the **locked decisions**. | Current — 2026-11-13 |
 | [`cli-spec.md`](cli-spec.md) | The command-by-command contract for `login`, `logout`, `status`, `run`, `stop`, `restart`, `port`, `edit` and `croncheck`: behaviour, exit codes, side effects, file paths and config schema. | Current — 2026-11-13 |
-| [`implementation-plan.md`](implementation-plan.md) | Phased build order, module layout, dependency set, per-phase acceptance criteria, test strategy and the risk-to-phase mapping. | Current — 2026-11-13 |
+| [`implementation-plan.md`](implementation-plan.md) | Phased build order, module layout, dependency set, per-phase acceptance criteria, test strategy and the risk-to-phase mapping. Ends with **what shipped**, including the deviations from the plan and why. | Current — 2026-11-13 |
 
 ## Reading order
 
@@ -28,3 +28,9 @@ Nothing in this directory ships with the binary.
 | OAuth callback port | Random ephemeral loopback, independent of the API port |
 | Config | TOML at `~/.config/grokproxy/config.toml` |
 | Daemon | Self-contained, PID-file based — no launchd, no systemd |
+
+## Status
+
+The implementation is complete. `api.x.ai` has been verified to accept the
+x.ai OAuth token, and the proxy has been checked end to end against the real
+service — see [what shipped](implementation-plan.md#what-shipped-2026-11-13).
