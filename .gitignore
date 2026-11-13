@@ -1,0 +1,46 @@
+# Secrets — never commit
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+secrets/
+*.secret
+
+# Build output
+bin/
+dist/
+build/
+target/
+out/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+
+# Dependencies
+node_modules/
+vendor/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime state
+*.log
+*.pid
+*.sock
+run/
+tmp/
+.cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
