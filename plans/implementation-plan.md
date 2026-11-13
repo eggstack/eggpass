@@ -507,7 +507,7 @@ That is the plan's table minus `tiny_http`, with nothing added.
 
 ### Verification
 
-- `cargo test` — 84 tests, no network.
+- `cargo test` — 87 tests, no network.
 - `cargo clippy --all-targets -- -D warnings` — clean.
 - `cargo fmt --all -- --check` — clean.
 - `scripts/verify-live.sh` — passes end to end against the real x.ai:
