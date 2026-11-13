@@ -9,7 +9,7 @@ Nothing in this directory ships with the binary.
 | [`cli-spec.md`](cli-spec.md) | The command-by-command contract for `login`, `logout`, `status`, `run`, `stop`, `restart`, `port`, `edit` and `croncheck`: behaviour, exit codes, side effects, file paths and config schema. | Current — 2026-11-13 |
 | [`implementation-plan.md`](implementation-plan.md) | Phased build order, module layout, dependency set, per-phase acceptance criteria, test strategy and the risk-to-phase mapping. Ends with **what shipped**, including the deviations from the plan and why. | Current — 2026-11-13 |
 | [`research-model-refresh-codex-eggserve-limits.md`](research-model-refresh-codex-eggserve-limits.md) | Follow-up research: how the model catalogue is refreshed today, what adding a ChatGPT/Codex OAuth path would take, whether `eggserve` should replace the handrolled HTTP server, and what plan/usage limits x.ai and OpenAI actually expose. | Current — 2026-11-13 |
-| [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md) | The plan for turning `grokproxy` into a combined Grok + Codex proxy: the streaming-concurrency findings, whether to drop the static model catalogue, the provider/routing/credential design, and the phase breakdown. | Current — 2026-11-13 |
+| [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md) | The plan for turning `grokproxy` into a combined Grok + ChatGPT proxy: the streaming-concurrency findings, whether to drop the static model catalogue, the provider/routing/credential design, and the phase breakdown. Built on **Sign in with ChatGPT for Open Source**, not the Codex CLI's OAuth client. | Current — 2026-11-13 |
 
 ## Reading order
 
@@ -23,7 +23,7 @@ Nothing in this directory ships with the binary.
    — the follow-up questions: catalogue refresh, a Codex auth path, HTTP
    server choice, and plan limits.
 5. [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md)
-   — the design and phasing for the combined Grok + Codex proxy.
+   — the design and phasing for the combined Grok + ChatGPT proxy.
 
 ## Key decisions
 
@@ -35,9 +35,14 @@ Nothing in this directory ships with the binary.
 | OAuth callback port | Random ephemeral loopback, independent of the API port |
 | Config | TOML at `~/.config/grokproxy/config.toml` |
 | Daemon | Self-contained, PID-file based — no launchd, no systemd |
+| ChatGPT auth (planned) | Sign in with ChatGPT for Open Source — dynamic registration, no client secret, public `https://api.openai.com/v1` |
+| ChatGPT callback port (planned) | Random ephemeral loopback, path `/auth/callback`, host `127.0.0.1` — SIWC permits a variable port |
 
 ## Status
 
 The implementation is complete. `api.x.ai` has been verified to accept the
 x.ai OAuth token, and the proxy has been checked end to end against the real
 service — see [what shipped](implementation-plan.md#what-shipped-2026-11-13).
+
+The ChatGPT provider is **planned but not built**. See
+[`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md).

@@ -75,6 +75,29 @@ If a cache is ever wanted, the TTL would want to be short-ish and the
 
 ## 2. Adding a ChatGPT/Codex OAuth path
 
+> **Update (2026-11-13).** Section 2 below was written before OpenAI published
+> **Sign in with ChatGPT for Open Source**
+> (<https://developers.openai.com/siwc/token-sharing-open-source>).
+>
+> **OpenAI does not intend third-party applications to reuse the Codex CLI's
+> `client_id`.** SIWC is the supported path for open-source and locally hosted
+> apps, and it changes most of what follows:
+>
+> - The client id is **issued at registration**, not a constant we ship.
+> - The **redirect port is free** — SIWC explicitly permits an ephemeral
+>   loopback port, where the Codex CLI pins itself to 1455/1457.
+> - Inference goes to the **public** `https://api.openai.com/v1`, not the
+>   internal WHAM backend.
+> - There is **no `ChatGPT-Account-Id` header** and no compiled-in model list.
+> - There is **no documented device-code flow**, so the `--device` option has
+>   no equivalent here.
+>
+> The details that follow are still accurate as a description of the Codex
+> CLI's own implementation — which is what the reference material describes —
+> but the *design* should now be based on SIWC. See
+> [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md)
+> §3.4–3.5 for the revised design, and §2.7 below for why this matters.
+
 The shape is genuinely parallel to the x.ai path — same PKCE, same
 authorization-code grant, same refresh-with-rotation. But there are two
 important structural differences, and one of them changes the design.
@@ -227,6 +250,18 @@ officially supported by OpenAI. The x.ai path we built today is materially
 safer: x.ai published the OAuth constants, published the client id, and
 publishes the endpoints. OpenAI publishes the endpoints but not the
 third-party-use permission.
+
+> **Update (2026-11-13).** This risk is now **closed.** OpenAI has since
+> published Sign in with ChatGPT for Open Source, a documented registration
+> path for open-source and locally hosted applications. It explicitly avoids
+> the Codex CLI's client id, needs no client secret and no partner API key,
+> and points inference at the *public* `https://api.openai.com/v1` rather than
+> an internal backend.
+>
+> The guidance above therefore applies only to the **Codex CLI's own**
+> implementation. A grokproxy built on SIWC does not inherit the risk — but it
+> does inherit SIWC's own constraints: browser-loopback-only sign-in, a
+> mandatory `stream: true`, and a list of request fields the route rejects.
 
 ---
 
@@ -427,6 +462,19 @@ and the CLI-proxy billing endpoint (consumer weekly pool).
 
 ### 4.2 ChatGPT / Codex — rich, structured, and mostly documented
 
+> **Update (2026-11-13).** Everything in this subsection describes the **Codex
+> CLI's internal WHAM backend**. That is *not* the route the supported
+> Sign-in-with-ChatGPT path uses — SIWC points at the public
+> `https://api.openai.com/v1` and says not to use `backend-api`. On the
+> public route the rich usage endpoint and the `x-L-*` headers below are not
+> documented; the signal is the in-band error code
+> `subscription_sharing_usage_limit_exceeded`, plus a link to
+> [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
+>
+> Whether the WHAM `/wham/usage` endpoint happens to accept a SIWC token is
+> **unverified** and worth one test — if it does, `grokproxy status` could
+> show the user's real remaining allowance. See the plan's §3.7.
+
 **Endpoint.** `GET https://chatgpt.com/backend-api/wham/usage` with the
 bearer token and `ChatGPT-Account-Id` header. (The Codex CLI's
 `PathStyle::from_base_url` picks `/wham/…` when the base URL contains
@@ -535,17 +583,26 @@ is a reason to keep this a *provider capability* rather than a core feature.
    resource limits (max headers, max header bytes, max body bytes, header
    timeout) in `src/server/http.rs`.
 
-3. **ChatGPT/Codex path: feasible and genuinely parallel, but a bigger job
-   than "add a provider".** The auth plumbing is the easy part and our
-   `TokenProvider` trait is the right seam. The real work is on the inference
-   side — the Codex backend speaks the Responses API, its model catalogue uses
-   `models`/`slug` rather than `data`/`id`, it needs `ChatGPT-Account-Id`, and
-   it wants `store=false` plus `instructions`. And it must not be forgotten
-   that this path is undocumented by OpenAI and explicitly at-your-own-risk.
-
-   If we do build it, the **device-code flow** is the right entry point:
-   it needs no local port (so no collision with a running Codex CLI), the
-   redirect URI is remote, and the server hands us the PKCE pair.
+3. **ChatGPT path: use Sign in with ChatGPT, not the Codex CLI's client.**
+   > **Update (2026-11-13).** This recommendation is superseded in detail by
+   > [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md),
+   > but the shape of the answer holds: the auth plumbing is the easy part and
+   > our `TokenProvider` trait is the right seam; the real work is on the
+   > inference side.
+   >
+   > The route is now the **public** `https://api.openai.com/v1` — the same
+   > `/v1` path style as x.ai, no `ChatGPT-Account-Id` header, and a live
+   > model catalogue. What replaces the old unknowns is its own set of hard
+   > constraints: `stream: true` is mandatory on every request (so a
+   > non-streaming client request needs an upstream-stream **aggregator**),
+   > and a specific list of fields (`temperature`, `top_p`,
+   > `max_output_tokens`, …) is rejected and must be stripped.
+   >
+   > Registration is dynamic: `client_id=dynamic_agent_client` on first sign-in,
+   > and OpenAI issues the real client id during the callback. **No client
+   > secret, no partner API key.** The redirect port is free, so our
+   > ephemeral-port design works unchanged. There is **no documented
+   > device-code flow**, so headless sign-in is the one genuine gap.
 
 4. **Plan limits: surface what already exists, cheaply.** Grok's API-tier
    budget is already in the `x-ratelimit-*` headers we forward; Codex's is in
@@ -553,6 +610,9 @@ is a reason to keep this a *provider capability* rather than a core feature.
    the streaming path too**, so streaming clients can see their budget. A
    first-class `/v1/usage` endpoint is a bigger, provider-asymmetric feature
    and should be designed per-provider rather than bolted onto the core.
+   > **Update (2026-11-13).** On the supported SIWC route the ChatGPT side has
+   > **no** documented usage endpoint or budget headers, so `/v1/usage` would
+   > be x.ai-only unless the WHAM endpoint turns out to accept SIWC tokens.
 
 5. **Worth recording in the README:** our current path is metered on the
    standard xAI API tier system (tier 1 for this account), *not* drawn from

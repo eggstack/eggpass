@@ -1,15 +1,51 @@
-# Plan: a combined Grok + Codex proxy, and the server-hardening that goes with it
+# Plan: a combined Grok + ChatGPT proxy, and the server-hardening that goes with it
 
 Date: 2026-11-13. Planning only — no code changed.
 
 This document answers the three questions raised in review, then lays out the
-design for turning `grokproxy` into a proxy for both x.ai and ChatGPT/Codex.
+design for turning `grokproxy` into a proxy for both x.ai and ChatGPT.
 
 - [Part 1 — The blocking question](#part-1--the-blocking-question-answered-with-measurements)
 - [Part 2 — Dropping the static model half](#part-2--dropping-the-static-model-half)
 - [Part 3 — The combined proxy design](#part-3--the-combined-proxy-design)
 - [Part 4 — Phasing](#part-4--phasing)
 - [Part 5 — Risks and open questions](#part-5--risks-and-open-questions)
+
+---
+
+> ## Update — OpenAI now supports this properly
+>
+> The first draft of this plan assumed we would reuse the Codex CLI's OAuth
+> client id (`app_EMoamEEZ73f0CkXaXp7hrann`). **OpenAI does not intend
+> third-party applications to do that.** OpenAI now publishes a dedicated
+> registration mechanism for open-source applications called
+> **Sign in with ChatGPT for Open Source**
+> (<https://developers.openai.com/siwc/token-sharing-open-source>).
+>
+> grokproxy is open-source and runs locally, so it is squarely in that path's
+> audience — and dynamic registration needs **no client secret and no partner
+> API key**, which the Codex-CLI route would have needed.
+>
+> The update improves the design in five ways:
+>
+> 1. **R1 is closed.** The path is documented and supported, not
+>    reverse-engineered.
+> 2. **The inference endpoint is the public API** — `https://api.openai.com/v1`
+>    — not the internal `chatgpt.com/backend-api/codex` (WHAM) backend. The
+>    two providers now share the same `/v1` path style.
+> 3. **A dynamic loopback port is allowed**, so our existing ephemeral-port
+>    design works unchanged. (The Codex CLI pins itself to 1455/1457.)
+> 4. **No `ChatGPT-Account-Id` header** is needed; the token identifies the
+>    account.
+> 5. **The model catalogue is live** from the public API, so no compiled-in
+>    model list is needed on that side either.
+>
+> It also adds two hard constraints: `stream: true` is **mandatory** on every
+> request, and a specific list of request fields (`temperature`, `top_p`,
+> `max_output_tokens`, …) is **rejected** and must be stripped.
+>
+> Sections 3.4, 3.5, 3.6, 3.7, 3.9, Part 4 and Part 5 have been rewritten
+> accordingly; each carries its own inline note.
 
 ---
 
@@ -359,11 +395,19 @@ Introduce a `Provider` that bundles everything that varies:
 pub struct Provider {
     pub id: ProviderId,              // Xai | OpenAi
     pub base: String,                // origin, no /v1
-    pub path_style: PathStyle,       // /v1/... vs /backend-api/codex/...
+    pub path_style: PathStyle,       // /v1/... (both providers use it)
     pub tokens: TokenManager,        // per-provider credential + refresh
     pub headers: HeaderPolicy,       // extra headers we add
+    pub request: RequestPolicy,      // per-provider request sanitising
 }
 ```
+
+> **Update (2026-11-13).** `PathStyle` was introduced for the Codex CLI's
+> WHAM backend, whose paths are relative to `/backend-api/codex`. Under SIWC
+> the ChatGPT provider uses `https://api.openai.com/v1`, so **both providers
+> share the `/v1` prefix** and `PathStyle` collapses to one variant. It is
+> kept only because `RequestPolicy` and `HeaderPolicy` now need the same
+> per-provider hook.
 
 `HeaderPolicy` is what generalises `UpstreamClient::extra_headers()`
 (`src/upstream.rs:215`):
@@ -372,15 +416,19 @@ pub struct Provider {
 | --- | --- | --- |
 | x.ai (`api`) | none | — |
 | x.ai (`build`) | `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version: 1.0.77`, `x-grok-client-identifier` | The proxy returns 426 below client version 1.0.13 |
-| ChatGPT/Codex | `ChatGPT-Account-Id: <id>` | Required by the backend; taken from the `id_token` claim |
+| ChatGPT (SIWC) | none | The public API identifies the account from the token; no `ChatGPT-Account-Id` needed |
+
+`RequestPolicy` is new, and only the ChatGPT provider uses it: strip the
+fields the route rejects, inject `store: false` and `stream: true`, and ensure
+`instructions` are present (see §3.5).
 
 **A related fix belongs here.** `upstream::STRIPPED_HEADERS`
 (`src/upstream.rs:263`) strips the *client's* credentials but not
 *provider-owned* headers. A client can currently send its own
-`x-xai-token-auth`, `x-grok-client-version` or `chatgpt-account-id` and have
-them reach the upstream — which is both a correctness problem (we would add a
-duplicate of a header we also set) and a small injection surface. The
-provider-owned header names must be added to the stripped list.
+`x-xai-token-auth` or `x-grok-client-version` and have them reach the upstream
+— which is both a correctness problem (we would add a duplicate of a header we
+also set) and a small injection surface. The provider-owned header names must
+be added to the stripped list.
 
 ### 3.2 Credential storage
 
@@ -401,12 +449,14 @@ keeps working.
 This is better than one file with two sections because the two credential
 shapes genuinely differ:
 
-| | x.ai | ChatGPT/Codex |
+| | x.ai | ChatGPT (SIWC) |
 | --- | --- | --- |
-| Access token | opaque | opaque |
-| Refresh token | yes, rotates | yes, rotates |
-| `id_token` | not used | **yes** — carries `chatgpt_account_id`, `plan_type`, `email` |
-| Extra fields | `email`, `user_id`, `team_id`, `tier` | `account_id`, `plan_type` |
+| Access token | opaque, ~6 h | opaque, **1 h** |
+| Refresh token | yes, rotates | yes, rotates, **30-day** lifetime |
+| `id_token` | not used | **yes** — carries `sub`, `email`, `aud` (= issued client id) |
+| Issued client id | fixed, in config | **per user and workspace**, issued at registration |
+| Host id | none | `ext_agent_host_id`, stable per host |
+| Extra fields | `email`, `user_id`, `team_id`, `tier` | `subject`, `scopes`, `plan_enabled` |
 
 A single JSON file with two heterogeneous sections would need optional-field
 plumbing in every accessor. Two files keep each provider's schema honest.
@@ -457,109 +507,249 @@ proxy can retry once against the default provider before giving up. That
 catches the "new model family, stale prefix map" case without any background
 machinery.
 
-### 3.4 Codex authentication
+### 3.4 Codex authentication — Sign in with ChatGPT
 
-Two flows, both implemented in the Codex CLI's own source.
+> **Update (2026-11-13).** This section was originally written around reusing
+> the Codex CLI's OAuth client. **OpenAI does not intend third-party
+> applications to reuse the Codex CLI's `client_id`.** OpenAI now publishes a
+> supported path for exactly our case — *Sign in with ChatGPT for Open
+> Source* — and this section is rewritten around it. Sources:
+> [Overview](https://developers.openai.com/siwc/token-sharing-open-source),
+> [Registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),
+> [Token reference](https://developers.openai.com/siwc/token-sharing-open-source/token-reference).
 
-**Device code — the primary flow.** No local port, no collision with a running
-Codex CLI, and the server hands us the PKCE pair.
+grokproxy is open-source and runs locally, which puts it squarely in the
+audience SIWC was written for: *"ChatGPT plan usage is available to open-source
+projects, personal projects that run locally, and selected private apps."*
 
-| Step | Request | Response |
+**Why dynamic registration.** SIWC offers two ways to get a client id:
+
+| Route | Who | What you need |
 | --- | --- | --- |
-| 1 | `POST https://auth.openai.com/api/accounts/deviceauth/usercode`, body `{"client_id": "app_EMoamEEZ73f0CkXaXp7hrann"}` | `{device_auth_id, user_code, interval}` |
-| 2 | the user opens `https://auth.openai.com/codex/device` and types `user_code` | — |
-| 3 | poll `POST https://auth.openai.com/api/accounts/deviceauth/token`, body `{"device_auth_id", "user_code"}` | `{authorization_code, code_challenge, code_verifier}` |
-| 4 | exchange the code at `POST https://auth.openai.com/oauth/token` with `redirect_uri = https://auth.openai.com/deviceauth/callback` | tokens |
+| **Dynamic registration** | open-source and locally hosted apps | nothing but the flow itself — **no client secret, no partner API key** |
+| Static client id | selected commercial partners | apply through the interest form; it is a waitlist |
 
-Polling semantics from `codex-rs/login/src/device_code_auth.rs`: `403` and
-`404` mean keep polling; anything else is a hard failure; 15-minute overall
-timeout.
+The static route is a commercial waitlist, so **dynamic registration is the
+only route available to an open-source tool** — and the better fit besides: no
+secret to store, no secret to leak.
 
-**Browser loopback — the secondary flow.** Registered redirect URIs are
-`http://127.0.0.1:1455/auth/callback` with `1457` as the documented fallback
-(`codex-rs/login/src/server.rs:79-81` — *"Keep in sync with the Codex CLI
-Hydra redirect URI allow-list"*). The port is **not** free, so this flow
-collides with a running Codex CLI. Worth supporting, but the device flow
-should be the default for the same reason `--device` is our x.ai fallback:
-it is the one that always works.
+**The flow.**
 
-**Scope:** `openid profile email offline_access api.connectors.read
-api.connectors.invoke` (`server.rs:613`).
+| Step | What happens |
+| --- | --- |
+| 1 | Persist this host's `ext_agent_host_id` (see below). |
+| 2 | Open `https://auth.openai.com/api/accounts/authorize` with `client_id=dynamic_agent_client`, `agent_name_hint`, `ext_agent_host_id`, `scope`, `resource=https://api.openai.com/v1`, and fresh `state`, `nonce` and PKCE (`S256`). |
+| 3 | The user signs in, names and authorises the agent, and is redirected to our loopback callback with `code`, `state`, `scope` and — on a **new registration** — the **issued `client_id`**. |
+| 4 | Validate `state`, retain the issued `client_id`. |
+| 5 | Exchange at `POST https://auth.openai.com/api/accounts/oauth/token`: `grant_type=authorization_code`, the **issued** `client_id`, `code`, `code_verifier`, the same `redirect_uri`, the same `resource`. |
 
-**Token handling.** The response carries `access_token`, `refresh_token` and
-`id_token`. From the `id_token` JWT payload we extract:
+Two details that are easy to get wrong:
 
-- `chatgpt_account_id` → sent as the `ChatGPT-Account-Id` header
-- `chatgpt_plan_type` → shown by `grokproxy status`
-- `email` → shown by `grokproxy status`
+- **`dynamic_agent_client` is an entrypoint, not an id to save.** The callback
+  returns a real issued client id (`oaiapp_…`). That is what we persist, and
+  what every later token request must use. *"If a new-registration callback
+  does not include an issued ID, treat registration as incomplete."*
+- **Reauthorisation uses the issued id, not `dynamic_agent_client`**, and omits
+  `agent_name_hint`. We may send a retained `id_token` as `id_token_hint` and
+  a saved email as `login_hint`; with `id_token_hint` the flow skips the
+  account selector.
 
-Refresh: standard grant, with rotation, using the same 5-minute skew and the
-same mutex-and-re-read discipline as the x.ai path. The `TokenProvider` trait
+**The host id.** `ext_agent_host_id` is required, stable per host, and opaque
+— not an email, not a user id. Two accepted formats:
+
+- `urn:ietf:params:oauth:jwk-thumbprint:…` — derived from a public key per
+  RFC 9278. **Recommended.** (OpenAI does not verify possession of the private
+  key; it is an identifier only.)
+- `urn:uuid:…` — a UUIDv4, generated once per host and persisted.
+
+It is not a credential. It exists so ChatGPT plan usage can be attributed per
+host, separately from the issued client id.
+
+**The redirect URI — and this is the good news.** SIWC explicitly permits a
+**dynamic port**:
+
+> Use an HTTP loopback callback on `127.0.0.1` from initial registration
+> onward, for example `http://127.0.0.1:1455/auth/callback`. … Later sign-ins
+> may use another available port, such as `http://127.0.0.1:54321/auth/callback`;
+> **only the port may vary.** Keep the scheme, host, and path unchanged:
+> `/callback` does not match `/auth/callback`. … Do not substitute with
+> `localhost`.
+
+So our existing **random ephemeral port** design works as-is. Three
+constraints to honour: the host must be `127.0.0.1` (not `localhost`), the path
+must be `/auth/callback`, and the *same* URI must be sent in the
+authorization request and in the code exchange.
+
+This is a meaningful improvement on the Codex CLI, whose Hydra allow-list pins
+the port to 1455/1457. It also removes the collision risk that would have
+made a Codex-path login fight with a running Codex CLI.
+
+**No device-code flow.** SIWC documents only the browser loopback flow — there
+is no device-code page in the documentation, and `dynamic_agent_client` is not
+mentioned as usable with one. Our x.ai `--device` option therefore has no
+direct SIWC equivalent, and headless/SSH use of the ChatGPT path is an open
+question (Part 5). The Codex CLI does ship a device flow
+(`/api/accounts/deviceauth/usercode`); whether it accepts a dynamically
+registered client id is unknown and would need testing.
+
+**Scopes.** `openid profile email offline_access resource.invoke
+chatgpt.tokens.use.direct`.
+
+`chatgpt.tokens.use.direct` is the one that matters — it is what grants use of
+the user's ChatGPT plan. The docs are explicit that *"a valid ID token alone
+does not authorize ChatGPT plan usage"*: we must check the **granted scopes in
+the token response** before enabling inference, and if the scope is missing,
+keep the sign-in but mark plan usage as disabled.
+
+**Token handling.** The token response carries `access_token`, `refresh_token`,
+`id_token`, `token_type`, `expires_in`, `scope` and `earliest_refresh_at`.
+
+- Access tokens last **one hour**.
+- Refresh tokens last **30 days** and **rotate on every refresh**.
+- The access token's `aud` is `https://api.openai.com/v1`.
+
+Unlike the Codex CLI's WHAM path, there is **no `chatgpt_account_id` claim and
+no `ChatGPT-Account-Id` header** on this route — the public API identifies the
+account from the token itself. That removes a whole category of plumbing.
+
+Refresh is a form POST to the same token endpoint with
+`grant_type=refresh_token`, the **issued** client id, the refresh token, and
+`resource=https://api.openai.com/v1`, omitting `scope` to retain the grant.
+Same mutex-and-re-read discipline as the x.ai path; the `TokenProvider` trait
 is already the right interface.
 
-**Also worth capturing:** the Codex CLI exchanges the `id_token` for an
-API-key-style access token via an OAuth token-exchange grant
-(`server.rs:1036-1058`, `requested_token=openai-api-key`). That would turn a
-ChatGPT subscription into a normal `api.openai.com` API key — a different and
-broader product direction. Out of scope for this phase; worth noting as an
-option.
+**Credential record.** OpenAI publishes a suggested shape, close to what we
+want:
+
+```json
+{
+  "email": "user@example.com",
+  "issuer": "https://auth.openai.com",
+  "subject": "<validated id_token sub>",
+  "client_id": "<ISSUED client id>",
+  "ext_agent_host_id": "urn:uuid:...",
+  "id_token": "...",
+  "access_token": "...",
+  "refresh_token": "...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "scopes": ["chatgpt.tokens.use.direct", "email", "offline_access",
+             "openid", "profile", "resource.invoke"],
+  "saved_at": "<UTC timestamp>"
+}
+```
+
+We would add our own fields (`plan_enabled: bool`, our own `obtained_at`) and
+store it 0600, atomically, alongside the x.ai credential.
+
+**Signing out.** Revoke the renewable session first: form POST to the
+`revocation_endpoint` from
+`https://auth.openai.com/.well-known/openid-configuration` with
+`token=<refresh_token>`, `token_type_hint=refresh_token` and the issued client
+id. An empty `200` is success. Revoking does **not** delete the registered
+client, so the issued client id stays valid for a later sign-in.
+
+**ID-token validation.** OpenAI asks the client to verify the signature
+against the published JWKS and to check issuer, audience, expiry and nonce.
+That is right for a multi-tenant app. For a single-user local proxy the token
+arrives over TLS straight from the token endpoint, and we already read
+unverified claims on the x.ai path — but here the `aud` check *is* meaningful
+(it must equal our issued client id), so we should at minimum verify `iss`,
+`aud` against the issued client id, `exp`, and the `nonce` we sent.
 
 ### 3.5 The Codex inference surface
 
-This is where the work actually is.
+> **Update (2026-11-13).** Rewritten. The SIWC path does **not** use the
+> internal `chatgpt.com/backend-api/codex` (WHAM) backend that the Codex CLI
+> talks to. It uses the **public** Responses API. This is the single biggest
+> improvement in the update.
 
-| | x.ai | ChatGPT/Codex |
+**The endpoint is the public API.** From OpenAI's own guidance:
+
+> **Supported endpoint:** Use the public Responses API endpoint above for this
+> ChatGPT plan usage flow; **do not point it at ChatGPT's `backend-api`
+> endpoints.**
+
+| | x.ai | ChatGPT via SIWC |
 | --- | --- | --- |
-| Base | `https://api.x.ai/v1` | `https://chatgpt.com/backend-api/codex` |
-| Path style | `/v1/chat/completions`, `/v1/responses` | `/responses` only |
-| Wire API | Chat Completions *and* Responses | Responses only |
-| Catalogue | `GET /v1/models` → `{data:[{id}]}` | `GET /models?client_version=…` → `{models:[{slug}]}` |
-| Required request fields | — | `store: false`, `instructions` present, content type `input_text` |
-| Required headers | — | `ChatGPT-Account-Id` |
-| Conversation state | server-side ok | **stateless** — full history resent every turn |
+| Base | `https://api.x.ai/v1` | `https://api.openai.com/v1` |
+| Path style | `/v1/…` | `/v1/…` — **the same** |
+| Inference | `/v1/chat/completions`, `/v1/responses` | `/v1/responses` only |
+| Catalogue | `GET /v1/models` → `{data:[{id}]}` | `GET /v1/models` → `{models:[{slug, display_name, visibility}]}` |
+| Required headers | — | none beyond `Authorization` |
+| Required fields | — | `store: false`, `stream: true` |
 
-**Path mapping.** Our `upstream::normalize_path` (`src/upstream.rs:316`)
-prefixes `/v1` to everything. That is wrong for the Codex backend, whose paths
-are relative to `/backend-api/codex`. This is exactly why `PathStyle` belongs
-on the `Provider`: one provider prefixes `/v1`, the other does not.
+Two consequences fall straight out of this table.
 
-**Catalogue translation.** The Codex catalogue returns `models`/`slug`; our
-`/v1/models` must return `data`/`id` to stay OpenAI-compatible. So the
-provider needs a catalogue adapter, not just a passthrough.
+**The path style is no longer a problem.** Our `upstream::normalize_path`
+(`src/upstream.rs:316`) prefixes `/v1` to everything, and `api.openai.com/v1`
+is exactly that. `PathStyle` collapses to a single variant. That removes the
+largest piece of complexity the WHAM design would have needed — and it means
+the two providers are *more* alike than the Codex CLI's path ever was.
 
-**`/v1/chat/completions` for a Codex model.** This is the expensive decision.
-Options:
+**No `ChatGPT-Account-Id` header.** The public API identifies the account from
+the token. `HeaderPolicy` for the OpenAI provider is empty.
 
-- **(b) Do not translate.** Codex models are served on `/v1/responses` only.
-  A `/v1/chat/completions` request naming a Codex model gets a clear error
-  naming the endpoint to use instead.
-- **(c) Translate both ways.** Convert chat completions to the Responses
-  request shape and the Responses response back to chat completions, for both
-  buffered and streamed output.
+**But `stream: true` is mandatory.** From the preview limitations:
 
-The cost of (c), honestly:
+> **HTTP requests:** Set `store: false` and `stream: true`.
 
-- *Request*: `messages[]` → `input[]` items with `content: [{type:
-  "input_text", text}]`; the system message → `instructions`; `max_tokens` →
-  `max_output_tokens`; tools change from `{type:"function", function:{…}}` to
-  `{type:"function", name, parameters}`; `store: false` injected.
-- *Buffered response*: `output[]` → find the `message` item → concatenate its
-  `content[].text` → build `choices[0].message.content`; map `usage`.
-- *Streaming response*: the two event vocabularies do not overlap. Chat
-  Completions emits `chat.completion.chunk` with `choices[].delta.content`;
-  Responses emits `response.output_text.delta`,
-  `response.output_item.added`, `response.function_call_arguments.delta`,
-  `response.completed`, and more. A full event-mapping state machine is
-  needed, including the final `[DONE]` sentinel and `usage`.
+That is a real constraint on our proxy, and it cuts both ways:
 
-That is several hundred lines plus tests, and it is the part most likely to
-carry subtle bugs.
+- For a **streaming** client request, we forward the upstream SSE unchanged.
+  Easy.
+- For a **non-streaming** client request, we must still ask the upstream for a
+  stream, then **aggregate it into a single response object**. That is a
+  genuine piece of work: consume the event stream, reassemble the output text
+  and usage, and emit one JSON body.
 
-**Recommendation: ship (b) first.** Our proxy already exposes `/v1/responses`
-and it already works against x.ai, so the Responses surface exists and Codex
-slots into it with no new translation layer at all. Many current OpenAI-compatible
-clients support the Responses API natively. Add (c) later only if there is
-demand, and if so, as its own phase with its own test matrix.
+**Unsupported request fields must be stripped.** The route rejects a specific
+list outright:
+
+> **Unsupported fields:** Omit `background`, `conversation`, `max_output_tokens`,
+> `max_tool_calls`, `metadata`, `moderation`, `multi_agent`, `prompt`,
+> `prompt_cache_retention`, `safety_identifier`, `temperature`, `top_logprobs`,
+> `top_p`, `truncation`, and `user`.
+
+A Chat Completions client sending `temperature: 0.7` or `max_tokens` would be
+rejected outright. So the OpenAI provider needs a **request sanitizer** that
+removes these fields, injects `store: false` and `stream: true`, and ensures
+`instructions` (or developer messages) are present — the docs note that
+explicit `{type: "message", role: "system"}` items are rejected.
+
+**Unsupported tools.** Image generation, file search, Code Interpreter, native
+computer use, hosted MCP/connectors and Responses `tool_search` are all
+rejected on this route. `error.code = subscription_sharing_unsupported_capability`
+with an `error.param` naming the offending input is how that surfaces.
+
+**Conversation state.** `previous_response_id` must be omitted; the full
+history goes in `input` on every turn.
+
+**`/v1/chat/completions` for a ChatGPT model.** The trade-off looks different
+now, because the upstream route is Responses-only *and* streaming-only:
+
+- **(b) Do not translate.** ChatGPT models are served on `/v1/responses` only.
+  A `/v1/chat/completions` request naming one gets a clear error naming the
+  endpoint to use instead.
+- **(c) Translate both ways.** Convert Chat Completions to the Responses
+  request shape and the Responses response back — *and* aggregate the
+  mandatory upstream stream into a buffered Chat Completions response when
+  the client did not ask for a stream.
+
+Option (c) now has to do **three** things rather than two: request
+translation, event-stream → buffered response, and event-stream → Chat
+Completions SSE. The event vocabularies do not overlap
+(`chat.completion.chunk` with `choices[].delta.content` versus
+`response.output_text.delta`, `response.output_item.added`,
+`response.function_call_arguments.delta`, `response.completed`), so each
+needs its own state machine.
+
+**Recommendation: ship (b) first, but build the aggregator in the same phase.**
+Note that the aggregator is needed even under (b) — a client asking for a
+*non-streaming* `/v1/responses` still needs the upstream stream collapsed into
+one body. That aggregator is the unavoidable piece of work and belongs in
+Phase 4. The Chat Completions translation layered on top of it is the
+optional Phase 5.
 
 ### 3.6 Merged `/v1/models`
 
@@ -568,10 +758,22 @@ each normalised to the OpenAI shape:
 
 ```
 GET /v1/models
-→ GET {xai}/v1/models          → data[].id
-→ GET {codex}/models?client_version=… → models[].slug  → data[].id
+→ GET {xai}/v1/models              → data[].id
+→ GET {openai}/v1/models           → models[].slug  → data[].id
 → merged, deduped, one array
 ```
+
+> **Update (2026-11-13).** The OpenAI catalogue is now served from the public
+> `GET https://api.openai.com/v1/models` with the same access token used for
+> inference — no `client_version` query parameter, no WHAM path. Entries carry
+> `slug`, `display_name` and `visibility`; OpenAI's own example filters to
+> `visibility == "list"` for a model picker while preserving the server's
+> ordering, and so should we.
+
+**This also settles the research note's highest-value open question.** The
+ChatGPT catalogue is live and served from the public API, so that side does
+**not** need a compiled-in model list. (The Codex CLI bundles or caches its
+own catalogue; we do not have to.)
 
 Each entry should probably carry a `owned_by` that identifies the provider
 (`xai` / `openai`), so a client can tell where a model comes from.
@@ -582,24 +784,47 @@ the provider's own entry — or, per Part 2, simply `404` for an unknown id.
 ### 3.7 Plan and usage limits
 
 The research in `plans/research-model-refresh-codex-eggserve-limits.md`
-established what each provider exposes:
+established what each provider exposes — but that note predates SIWC, so the
+ChatGPT column needs qualifying.
 
-| | x.ai | ChatGPT/Codex |
+| | x.ai | ChatGPT via SIWC |
 | --- | --- | --- |
-| Live budget | `x-ratelimit-*` headers on inference responses | `x-L-*` / `x-codex-*` headers on inference responses |
-| Plan type | `tier` claim on the token (`tier: 1`) | `plan_type` in `GET /wham/usage` — **not** in the headers |
-| Window details | headers only | `GET /wham/usage` → primary/secondary windows, credits, spend control |
+| Live budget | `x-ratelimit-*` headers on inference responses | **not documented on the public route** |
+| Plan type | `tier` claim on the token (`tier: 1`) | **not exposed** by the SIWC route |
+| Window details | headers only | not exposed; the signal is the error code |
+| In-band signal | `429` + headers | `response.failed` with `subscription_sharing_usage_limit_exceeded` (429) or `subscription_sharing_usage_unavailable` (503) |
 
-**The cheap, high-value change:** forward upstream headers on the streaming
-path. Today `src/server/sse.rs:12` builds the streaming response with exactly
-three headers and discards everything the upstream sent — so a streaming
-client sees no rate-limit information at all, while a non-streaming client
-does. That is an inconsistency worth fixing regardless of Codex.
+**What changed.** The rich `GET /wham/usage` endpoint and the `x-L-*` /
+`x-codex-*` headers belong to the **Codex CLI's internal WHAM backend** — the
+route SIWC explicitly tells us *not* to use. On the supported public route,
+OpenAI instead documents:
 
-**A provider-specific `/v1/usage` endpoint** is more work and asymmetric
-(Codex has a clean JSON endpoint; x.ai has only headers plus the CLI-proxy
-billing call). If we add it, it belongs at the provider layer, not the core:
-`GET /v1/usage` → dispatch to the provider that can answer.
+- the error codes above, which can arrive **mid-stream** after the response
+  has already begun;
+- a link to [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage),
+  where the user can review app usage and set per-app limits.
+
+OpenAI does not publish a usage/quota API for this route. Whether the WHAM
+`/wham/usage` endpoint happens to accept a SIWC token is **unverified** and
+worth a quick test — if it works, it gives us the same rich window data the
+Codex CLI gets, and `grokproxy status` could show the user's real remaining
+allowance. If it does not, the honest position is that ChatGPT plan usage is
+reported to the user through OpenAI's own settings page and through the
+in-band error codes.
+
+**The cheap, high-value change** is unchanged and still applies: forward
+upstream headers on the streaming path. Today `src/server/sse.rs:12` builds the
+streaming response with exactly three headers and discards everything the
+upstream sent — so a streaming client sees no rate-limit information at all,
+while a non-streaming client does. That is an inconsistency worth fixing
+regardless of Codex, and it is where the x.ai `x-ratelimit-*` budget becomes
+visible to users.
+
+**A provider-specific `/v1/usage` endpoint** stays asymmetric: x.ai has headers
+plus the CLI-proxy billing call; ChatGPT has nothing documented. If we add it,
+it belongs at the provider layer, not the core: `GET /v1/usage` → dispatch to
+the provider that can answer, and return a clear "not available" for the one
+that cannot.
 
 ### 3.8 CLI surface
 
@@ -607,14 +832,15 @@ The nine commands stay. The changes are:
 
 | Command | Change |
 | --- | --- |
-| `login` | `--provider xai\|openai` (default `xai`). `--device` for both. |
-| `logout` | `--provider xai\|openai` (default `xai`). |
-| `status` | Show both providers' account state; show the routing table. |
+| `login` | `--provider xai\|openai` (default `xai`). `--device` is x.ai-only — SIWC has no documented device flow. |
+| `logout` | `--provider xai\|openai` (default `xai`). Revokes the SIWC refresh token before clearing. |
+| `status` | Show both providers' account state; show the routing table; show whether ChatGPT plan usage is enabled. |
 | `run` / `stop` / `restart` / `croncheck` / `port` / `edit` | Unchanged. |
 
 `status` is where the value is clearest — one screen showing which providers
-are logged in, their plan/tier, their token lifetime, and which models route
-where.
+are logged in, their plan/tier, their token lifetime, whether ChatGPT plan
+usage is actually granted (`chatgpt.tokens.use.direct` in the granted scopes),
+and which models route where.
 
 ### 3.9 Configuration
 
@@ -642,10 +868,20 @@ issuer = "https://auth.x.ai"
 scopes = [...]
 
 [oauth.openai]
-client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
 issuer = "https://auth.openai.com"
-scopes = [...]
+scopes = ["openid", "profile", "email", "offline_access",
+          "resource.invoke", "chatgpt.tokens.use.direct"]
+agent_name_hint = "grokproxy"
+resource = "https://api.openai.com/v1"
 ```
+
+> **Update (2026-11-13).** `[oauth.openai]` has **no `client_id` key**. Under
+> SIWC the client id is not a constant we ship — it is *issued* by OpenAI
+> during the user's first sign-in and stored with their credential. The only
+> constant is the entrypoint, `dynamic_agent_client`, which OpenAI documents
+> and which we should not hardcode either if it can be overridden.
+> `agent_name_hint` is our app's actual name, sent only on initial
+> registration.
 
 The `[oauth.*]` tables already exist for x.ai (`[oauth]` with `client_id`,
 `issuer`, `scopes`, `referrer`); this generalises them per provider, which
@@ -670,8 +906,7 @@ Each phase is independently shippable and independently testable.
 - **H3** Client-connection idle timeout and a max-connection count.
 - **H4** Max-concurrent-upstream-requests cap, answering `503` beyond it.
 - **H5** Strip provider-owned headers (`x-xai-token-auth`,
-  `x-grok-client-version`, `chatgpt-account-id`, `originator`) from client
-  requests.
+  `x-grok-client-version`) from client requests.
 
 *Acceptance:* the concurrency probe in Part 1 keeps its result; a stream
 survives `SIGTERM` up to the grace window; a client cannot inject
@@ -687,7 +922,7 @@ compiled-in model names remain in the source.
 
 ### Phase 2 — Generalise the provider layer (no behaviour change yet)
 
-- `Provider`, `PathStyle`, `HeaderPolicy`.
+- `Provider`, `PathStyle`, `HeaderPolicy`, `RequestPolicy`.
 - Per-provider credential files under `credentials/`, with the `auth.json`
   migration.
 - Per-provider `TokenManager` and per-provider refresh mutex.
@@ -698,33 +933,60 @@ compiled-in model names remain in the source.
 byte-for-byte unchanged; the test suite still passes with the new
 indirection.
 
-### Phase 3 — Codex authentication
+### Phase 3 — ChatGPT authentication via Sign in with ChatGPT
 
-- Device-code flow (primary) and browser loopback at 1455/1457 (secondary).
-- `id_token` decoding for `chatgpt_account_id`, `plan_type`, `email`.
-- Refresh with rotation.
+> **Update (2026-11-13).** Rewritten. Dynamic registration via SIWC replaces
+> the Codex-CLI-client approach. No device-code flow exists on this path.
+
+- Host id: generate and persist `ext_agent_host_id` (`urn:uuid:…` or an RFC
+  9278 JWK thumbprint URI).
+- Browser loopback on an **ephemeral** port, path `/auth/callback`, host
+  `127.0.0.1`.
+- Authorize at `https://auth.openai.com/api/accounts/authorize` with
+  `client_id=dynamic_agent_client`, `agent_name_hint`, `ext_agent_host_id`,
+  `scope`, `resource=https://api.openai.com/v1`, fresh `state`, `nonce`, PKCE
+  S256.
+- Capture and persist the **issued** `client_id` from the callback.
+- Exchange at `https://auth.openai.com/api/accounts/oauth/token` with the
+  issued client id.
+- Validate `state`, then the ID token's `iss`, `aud` (against the issued
+  client id), `exp` and `nonce`.
+- Check the **granted scopes** for `chatgpt.tokens.use.direct`; store
+  `plan_enabled` accordingly.
+- Refresh with rotation (1 h access, 30-day rotating refresh).
+- Revoke the refresh token on logout.
 - `grokproxy login --provider openai`, `logout`, `status`.
 
-*Acceptance:* a real device-code login completes and stores credentials;
-the token refreshes across rotation; `status` shows the plan.
+*Acceptance:* a real SIWC sign-in completes and stores the issued client id
+alongside the tokens; the token refreshes across rotation; `status` reports
+the granted scopes and whether plan usage is enabled; a re-login reuses the
+issued client id rather than registering again.
 
-### Phase 4 — Codex inference on the Responses API
+### Phase 4 — ChatGPT inference on the public Responses API
 
-- Route `/v1/responses` to the Codex backend with `ChatGPT-Account-Id` and
-  `store: false`.
-- Catalogue adapter for `models`/`slug` → `data`/`id`.
+> **Update (2026-11-13).** Rewritten for the public API, not WHAM.
+
+- Route `/v1/responses` to `https://api.openai.com/v1/responses`.
+- `RequestPolicy`: strip the rejected fields, inject `store: false` and
+  `stream: true`, ensure `instructions` are present.
+- **Stream aggregator**: because `stream: true` is mandatory, a non-streaming
+  client request requires consuming the upstream event stream and collapsing
+  it into one JSON body.
+- Catalogue adapter for `models`/`slug` → `data`/`id`, with
+  `visibility == "list"` filtering for display.
 - Merged `/v1/models`.
 - Routing by prefix map, with the unknown-model retry to the default
   provider.
 
-*Acceptance:* a real `gpt-5.*-codex` request succeeds, buffered and streamed;
-the merged catalogue lists both providers' models; a Grok request still routes
-to x.ai.
+*Acceptance:* a real `gpt-*` request succeeds, streamed and buffered; the
+merged catalogue lists both providers' models; a Grok request still routes to
+x.ai; a rejected field (`temperature`) is stripped rather than erroring.
 
-### Phase 5 — Chat Completions translation for Codex (optional)
+### Phase 5 — Chat Completions translation for ChatGPT (optional)
 
 Only if there is demand. Chat → Responses request, Responses → Chat
-response, including the streaming event mapping.
+response, including the streaming event mapping — on top of the aggregator
+built in Phase 4.
 
 ### Phase 6 — Usage and limits
 
@@ -737,32 +999,42 @@ response, including the streaming event mapping.
 
 ### Risks
 
+> **Update (2026-11-13).** The risk register changed substantially once OpenAI
+> published Sign in with ChatGPT. The two highest-severity risks are **closed**:
+> the ChatGPT path is now a documented, supported OpenAI integration rather
+> than a reverse-engineered reuse of the Codex CLI's client.
+
 | # | Risk | Severity | Mitigation |
 | --- | --- | --- | --- |
-| R1 | **OpenAI does not support third-party use of the Codex OAuth client.** The client id `app_EMoamEEZ73f0CkXaXp7hrann` is OpenAI's own; the behaviour is reverse-engineered and explicitly "at your own risk". | **High** | Make Codex opt-in (`enabled = true` in config, off by default). Document it prominently. The x.ai path stays fully supported and unaffected. |
-| R2 | The Codex backend's contract can change without notice — it is an internal API (WHAM). | High | Keep the Codex provider's constants in one place; make the endpoints config-overridable so they can be fixed without a release. |
-| R3 | The ChatGPT subscription's usage allowance is a shared pool with the user's own ChatGPT usage; proxy traffic consumes it. | Medium | Document it. Surface the `/wham/usage` window in `status` so the user can see it. |
+| ~~R1~~ | ~~OpenAI does not support third-party use of the Codex OAuth client.~~ | **Closed** | **Replaced by SIWC.** OpenAI does not intend third-party apps to reuse the Codex CLI's `client_id`; it now provides a dedicated registration path for open-source and locally hosted apps. The plan uses that path. |
+| ~~R2~~ | ~~The Codex backend's contract can change without notice — it is an internal API (WHAM).~~ | **Closed** | **No longer applicable.** SIWC points at the *public* `https://api.openai.com/v1` and explicitly says not to use `backend-api`. |
+| R3 | The ChatGPT plan allowance is shared with the user's own ChatGPT usage and with every other app using their plan. OpenAI states the five-hour limit is shared across all apps for Plus users, and does not apply for Pro. | Medium | Document it, and link users to [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage) as OpenAI instructs. |
 | R4 | Our x.ai path is metered on the **standard API tier** (tier 1), not the SuperGrok consumer pool — it is billed like API usage. | Medium | Document it clearly in the README. It is not a defect, but it is surprising. |
-| R5 | The device-code flow may be disabled server-side for a given client id ("device code login is not enabled for this Codex server"). | Medium | Ship the browser loopback flow as well; the Codex CLI's own error message for this case is explicit. |
-| R6 | Two providers double the credential-handling and refresh surface. | Medium | The `TokenProvider` seam already exists; the per-provider `TokenManager` is a small delta. |
-| R7 | The Codex backend needs `store: false` and `instructions`; clients that omit them get errors that look like upstream bugs. | Low | Inject `store: false` and a default `instructions` in the provider layer, and normalise content types. |
+| R5 | **No headless sign-in.** SIWC documents only the browser loopback flow, so `grokproxy login --provider openai` needs a browser and a reachable loopback port. Our x.ai `--device` option has no equivalent. | Medium | Accept it for now; investigate whether the undocumented Codex device endpoint accepts a dynamically issued client id. Otherwise a user on a headless box cannot sign in. |
+| R6 | **Silent parameter loss.** The route rejects `temperature`, `top_p`, `max_output_tokens` and a dozen other fields. A Chat Completions client that sends `temperature: 0.7` will have it stripped rather than honoured — the request succeeds but behaves differently. | Medium | Strip deliberately, and surface it in the response (a header or a note) rather than silently dropping it. This is a fidelity trade-off, not a bug. |
+| R7 | **`stream: true` is mandatory**, so every ChatGPT request is a stream upstream. The aggregator that collapses it for non-streaming clients is required work, and it is where bugs will live. | Medium | Build it in Phase 4 with a proper event-parsing test suite; treat `response.completed` as the only success signal. |
+| R8 | SIWC is labelled a **preview**. Field lists, error codes and the registration flow can change. | Medium | Keep the provider's constants in one place and make them config-overridable so a change is a config edit, not a release. |
+| R9 | Two providers double the credential-handling and refresh surface. | Medium | The `TokenProvider` seam already exists; the per-provider `TokenManager` is a small delta. |
+| R10 | The issued client id is bound to **one user and one workspace**. A user with several ChatGPT accounts needs several registrations, each with its own credential record. | Low | SIWC's "Accounts and sessions" guidance describes exactly this; store one record per registration and allow switching. |
+| R11 | Usage-limit errors can arrive **mid-stream**, after the response has begun. A naive client sees a truncated body rather than a clean error. | Low | Propagate the upstream error shape; document `subscription_sharing_usage_limit_exceeded` and `subscription_sharing_usage_unavailable` in the README. |
 
 ### Open questions to resolve during implementation
 
-1. **Does the Codex backend serve a live `/models`?** Third-party sources say
-   `GET /backend-api/wham/models?client_version=…` works, but the Codex CLI
-   also ships a compiled-in model catalogue. If the live endpoint does not
-   work, the Codex catalogue has to be a static list — which is precisely the
-   maintenance burden Part 2 is trying to remove. **This is the single
-   highest-value unknown and should be verified first.**
-2. **What headers does the Codex backend require on a model request?** The
-   `ChatGPT-Account-Id` header is confirmed from the Codex source. The CLI
-   additionally sends `originator` and `version`; whether the backend requires
-   them is unverified.
+1. **Does the SIWC route accept the `ChatGPT-Account-Id` header, or is the
+   token alone sufficient?** The SIWC docs never mention the header, which
+   suggests it is unnecessary on the public route — but the Codex CLI always
+   sends it, so a cheap test is worth doing.
+2. **Does the WHAM `/wham/usage` endpoint accept a SIWC token?** It is the
+   Codex CLI's endpoint, not part of SIWC, but if it works it gives us the
+   user's real remaining allowance for `grokproxy status`. Worth one test.
 3. **Is the `build` fallback upstream actually used?** Determines whether
    dropping `KNOWN_MODELS` costs anything.
-4. **Do chat-completions clients matter enough to justify Phase 5?**
-5. **Should Codex be on by default?** R1 argues for opt-in; usability argues
-   for on. My recommendation is off by default, with `grokproxy login
-   --provider openai` as the explicit opt-in — the same shape as the x.ai
-   device flow.
+4. **Does the undocumented Codex device endpoint accept a dynamically issued
+   client id?** This is the only route to a headless ChatGPT sign-in.
+5. **Do chat-completions clients matter enough to justify Phase 5?** And if a
+   Chat Completions request has its `temperature` stripped, should we warn the
+   client in-band?
+6. **Should the ChatGPT provider be on by default?** With a supported path the
+   original argument for opt-in weakens, but the first release should still
+   not surprise anyone by reaching for OpenAI. My recommendation remains
+   opt-in via `grokproxy login --provider openai`.
