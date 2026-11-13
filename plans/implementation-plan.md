@@ -114,6 +114,10 @@ Deliberately excluded: `tokio`/`async`/`axum`/`reqwest`, `keyring`, `clap`.
    minimum never drop keys it does not understand.
 4. `args.rs`: hand-rolled parser for `--config`, `--verbose`, `--help`,
    `--version`, and the nine subcommands. Unknown flags → usage error, exit 1.
+   A tenth command, `host`, is added by Phase 1 of
+   [`plan-eggpass.md`](plan-eggpass.md), along with `--provider` and the
+   `EGGPASS_PROVIDER` / `EGGPASS_HOST` / `EGGPASS_PORT` environment
+   overrides.
 5. `logging.rs`: writes to the log file and stderr; levels per config;
    **redacts** any value that looks like a token.
 
@@ -364,7 +368,14 @@ This is the riskiest phase — it is the first thing that talks to x.ai.
 
 ## Phase 7 — Remaining commands
 
-**Files:** `src/cli/commands/{status,port,edit}.rs`
+**Files:** `src/cli/commands/{status,port,host,edit}.rs`
+
+> **Update (2026-11-13).** `port` was built as described below — config-only,
+> no implicit restart — and `host` did not exist. Both are **superseded** by
+> the design in [Part 3.8.1 of `plan-eggpass.md`](plan-eggpass.md#381-the-address-commands),
+> which is Phase 1 of that plan. The text below is kept as the record of what
+> was originally specified and what shipped; the superseded behaviour is the
+> "never restart implicitly" rule, which the new `port`/`host` replace.
 
 **Work**
 
@@ -458,7 +469,8 @@ to go smoothly, so they come after the risky unknowns are retired.
 
 ## Definition of done
 
-- All nine commands behave exactly as `cli-spec.md` describes.
+- All nine commands behave exactly as `cli-spec.md` describes — and the tenth,
+  `host`, once Phase 1 of [`plan-eggpass.md`](plan-eggpass.md) lands.
 - `eggpass login && eggpass run` yields a working OpenAI-compatible
   endpoint serving `grok-4.7` / `grok-4.6`.
 - `eggpass croncheck` is safe as a 5-minute crontab entry.
@@ -495,7 +507,7 @@ transparently on the first request, keeping the refresh token.
 | `src/auth/store.rs` holds the credential format | Unchanged | — |
 | A separate `src/timeutil.rs` module | Added | The plan had no home for RFC 3339 conversion, which is needed to read `expires_at` out of the official Grok CLI's credential file. |
 | The config file has four keys | Five — `allow_privileged_port` was added | Phase 8 requires refusing to bind a privileged port "unless explicitly overridden", which needs a key to override it with. |
-| The pid file holds a pid | It holds a pid **and** the port the daemon is serving | Without it, `status` and `port` cannot report the port that is live right now, which differs from the configured port after a `eggpass port` change. |
+| The pid file holds a pid | It holds a pid **and** the port the daemon is serving | Without it, `status` and `port` cannot report the port that is live right now, which differs from the configured port after an `eggpass port` change. A third line, the bound host, is added by Phase 1 of `plan-eggpass.md`, so that `host` can tell what is actually being served. |
 
 ### The dependency list, as built
 

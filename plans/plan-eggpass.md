@@ -13,13 +13,26 @@ ecosystem.
 | --- | --- |
 | [1](#part-1--the-blocking-question-answered-with-measurements) | The blocking question, answered with measurements |
 | [2](#part-2--dropping-the-static-model-half) | Dropping the static model half |
-| [3](#part-3--the-combined-proxy-design) | The multi-provider design |
+| [3](#part-3--the-combined-proxy-design) | The multi-provider design — providers, credentials, routing, SIWC auth, inference, the CLI surface and the configuration |
 | [4](#part-4--phasing) | Phasing |
 | [5](#part-5--risks-and-open-questions) | Risks and open questions |
 | [6](#part-6--the-rename) | **The rename** |
 | [7](#part-7--the-interactive-provider-picker) | **The interactive provider picker** |
 | [8](#part-8--packaging-and-updates-eggpack--eggup) | **Packaging and updates: eggpack / eggup** |
 | [9](#part-9--relationship-to-eggpool) | **Relationship to eggpool** |
+
+### Decisions settled
+
+Everything below is decided. It is recorded here so the rest of the document
+can be read as settled rather than tentative.
+
+| Question | Decision | Where |
+| --- | --- | --- |
+| eggpool overlap | **Keep eggpass separate.** It is built and maintained on its own; eggpool ingests its OAuth layer downstream. | [9.3](#93-the-decision--keep-them-separate) |
+| MSRV | **Raise 1.85 → 1.89** and adopt `eggup`. No bespoke updater. | [8.5](#85-the-msrv-cost) |
+| Picker dependency | **`crossterm`**, with the numbered-list fallback always available. | [7.3](#73-how-to-read-keys-without-an-async-runtime) |
+| Config-directory migration | **Confirmed** — the directory moves; the old one is left in place with a marker, not deleted. | [6.3](#63-why-the-config-directory-moves) |
+| `port` / `host` | **`port` becomes apply-and-restart**, and **`host` is added**, with the same rules for both. | [3.8.1](#381-the-address-commands) |
 
 ---
 
@@ -758,8 +771,8 @@ needs its own state machine.
 Note that the aggregator is needed even under (b) — a client asking for a
 *non-streaming* `/v1/responses` still needs the upstream stream collapsed into
 one body. That aggregator is the unavoidable piece of work and belongs in
-Phase 4. The Chat Completions translation layered on top of it is the
-optional Phase 5.
+Phase 5. The Chat Completions translation layered on top of it is the
+optional Phase 6.
 
 ### 3.6 Merged `/v1/models`
 
@@ -838,23 +851,83 @@ that cannot.
 
 ### 3.8 CLI surface
 
-The nine commands stay. The changes are:
+There are now **ten** commands. The changes are:
 
 | Command | Change |
 | --- | --- |
 | `login` | `--provider xai\|openai` (default `xai`). `--device` is x.ai-only — SIWC has no documented device flow. |
 | `logout` | `--provider xai\|openai` (default `xai`). Revokes the SIWC refresh token before clearing. |
-| `status` | Show both providers' account state; show the routing table; show whether ChatGPT plan usage is enabled. |
-| `run` / `stop` / `restart` / `croncheck` / `port` / `edit` | Unchanged. |
+| `status` | Show both providers' account state; show the routing table; show whether ChatGPT plan usage is enabled; show the host and port actually being served. |
+| `port` | **Changes meaning** — applies the change and restarts the daemon, rather than only writing the config. See 3.8.1. |
+| `host` | **New** — the bind address, with the same apply-and-restart behaviour as `port`. See 3.8.1. |
+| `run` / `stop` / `restart` / `croncheck` / `edit` | Unchanged. |
 
 `status` is where the value is clearest — one screen showing which providers
 are logged in, their plan/tier, their token lifetime, whether ChatGPT plan
 usage is actually granted (`chatgpt.tokens.use.direct` in the granted scopes),
 and which models route where.
 
+### 3.8.1 The address commands
+
+`port` and `host` are the two commands that change where the server listens.
+They are deliberately identical in shape, because the failure modes are the
+same, and the user should not have to learn two different rules.
+
+**The old rule was wrong for the common case.** `port 9000` used to write the
+config and print `run 'eggpass restart' to apply`. That is a trap: the obvious
+intent of typing a new port is to move the server there, and the old behaviour
+silently did not. It also left the config and the live server disagreeing,
+which is why `status` had to report two different ports.
+
+**The new rule.** Each command validates, applies, and restarts in one step:
+
+1. **Validate first.** An invalid port or host is refused before anything is
+   written or stopped. Nothing changes, and the command says why. The port
+   rule is `1..=65535`, with the existing privileged-port rule intact: below
+   `1024` needs `allow_privileged_port = true`. The host rule is an IPv4/IPv6
+   literal, or `localhost`/`local`/`loopback`, which all mean `127.0.0.1`. A
+   name outside that list is refused rather than resolved — a bind address has
+   to name a local interface, and resolving one would make the result depend
+   on DNS.
+2. **Restart only if it would actually change something.** The comparison is
+   against the address the daemon is **actually serving**, read from the pid
+   file, not against the config file. Asking for the port that is already
+   being served does not restart anything — the point of the rule is that a
+   no-op change must not bounce live connections.
+3. **Check the port is free before restarting.** If the requested port is
+   taken, the command prints `port <port> is taken` and changes nothing: no
+   config write, no stop, no restart. The user can immediately try another
+   port without having to undo anything. The check happens **before** the
+   daemon is stopped, so a taken port never causes an outage.
+4. **Apply, and be able to undo.** Stop, write the config, start, wait for
+   `/health`. If the start fails, the previous config is restored and the
+   daemon comes back up on the old address. A failed change must never leave
+   the user with a stopped proxy.
+
+**The safety rule on `host`.** The project's posture is loopback-only, and
+`host` is the one command that can break it. Binding to anything other than
+`127.0.0.1`/`::1` puts the proxy — and through it the user's x.ai and ChatGPT
+subscriptions — on the network. So a non-loopback host is **refused unless
+`api_key` is configured**; with an `api_key` it is allowed, and the command
+warns that the proxy is now reachable from the network. An empty `api_key`
+means "accept any key", which on a non-loopback bind is an open proxy on the
+user's subscription.
+
+`host` changes only the bind address. It leaves the port exactly as it is.
+
+**What the pid file needs.** "Only restart if the value actually changed"
+requires knowing what the daemon is serving, so the pid file gains a third
+line: the host it bound. The line is optional when reading, so a pid file
+written by an older build still parses and the daemon still starts.
+
+**Config writing stays surgical.** `config::set_port` edits the file in place
+so comments and unknown keys survive; `set_host` is its sibling with the same
+behaviour. Neither rewrites the file wholesale.
+
 ### 3.9 Configuration
 
 ```toml
+host = "127.0.0.1"   # the bind address; "localhost"/"local"/"loopback" mean 127.0.0.1
 port = 8484
 api_key = ""
 
@@ -899,7 +972,8 @@ also keeps the OpenAI constants overridable — the same mitigation that was
 applied for x.ai's risk register.
 
 Note the existing config surgery: `eggpass port` performs a surgical text
-edit so comments and unknown keys survive. Adding tables must not break that.
+edit so comments and unknown keys survive. Adding tables must not break that,
+and `eggpass host` must use the same technique (Part 3.8.1).
 
 ---
 
@@ -922,7 +996,33 @@ Each phase is independently shippable and independently testable.
 survives `SIGTERM` up to the grace window; a client cannot inject
 provider-owned headers.
 
-### Phase 1 — Decide the model catalogue (independent)
+### Phase 1 — Address commands: `port` and `host` (independent)
+
+The `port` command stops being a config edit and becomes an apply-and-restart
+command, and `host` joins it. This phase is independent of everything else:
+it touches the CLI, the config writer, the daemon lifecycle and the pid file,
+and it can ship on its own.
+
+- `port <n>` validates, checks the port is free, writes the config, restarts
+  the daemon, and waits for `/health`.
+- `host <addr>` does the same for the bind address, and refuses a non-loopback
+  address unless `api_key` is configured.
+- Both restart **only** when the requested value differs from what the daemon
+  is actually serving, which is read from the pid file.
+- The pid file gains a third line: the host the daemon bound. The line is
+  optional when reading, so an old pid file still parses.
+- `config::set_port` grows a `set_host` sibling with the same surgical
+  text-edit behaviour, so comments and unknown keys survive.
+- A failed restart restores the previous config and brings the daemon back up
+  on the old address.
+
+*Acceptance:* `port 9000` on a free port restarts the daemon and `/health`
+answers on 9000; `port <taken>` prints `port <port> is taken` and changes
+nothing; `port <current>` does not restart; `host 0.0.0.0` without an
+`api_key` is refused; `host 127.0.0.1` on an already-loopback daemon does not
+restart.
+
+### Phase 2 — Decide the model catalogue (independent)
 
 Either drop `KNOWN_MODELS` and the synthetic `200` (option c), or move the
 list into `config.toml` as `known_models` (the configurable middle ground).
@@ -930,7 +1030,7 @@ list into `config.toml` as `known_models` (the configurable middle ground).
 *Acceptance:* `/v1/models` reflects the upstream; unknown ids `404`; no
 compiled-in model names remain in the source.
 
-### Phase 2 — Generalise the provider layer (no behaviour change yet)
+### Phase 3 — Generalise the provider layer (no behaviour change yet)
 
 - `Provider`, `PathStyle`, `HeaderPolicy`, `RequestPolicy`.
 - Per-provider credential files under `credentials/`, with the `auth.json`
@@ -943,7 +1043,7 @@ compiled-in model names remain in the source.
 byte-for-byte unchanged; the test suite still passes with the new
 indirection.
 
-### Phase 3 — ChatGPT authentication via Sign in with ChatGPT
+### Phase 4 — ChatGPT authentication via Sign in with ChatGPT
 
 > **Update (2026-11-13).** Rewritten. Dynamic registration via SIWC replaces
 > the Codex-CLI-client approach. No device-code flow exists on this path.
@@ -972,7 +1072,7 @@ alongside the tokens; the token refreshes across rotation; `status` reports
 the granted scopes and whether plan usage is enabled; a re-login reuses the
 issued client id rather than registering again.
 
-### Phase 4 — ChatGPT inference on the public Responses API
+### Phase 5 — ChatGPT inference on the public Responses API
 
 > **Update (2026-11-13).** Rewritten for the public API, not WHAM.
 
@@ -992,13 +1092,13 @@ issued client id rather than registering again.
 merged catalogue lists both providers' models; a Grok request still routes to
 x.ai; a rejected field (`temperature`) is stripped rather than erroring.
 
-### Phase 5 — Chat Completions translation for ChatGPT (optional)
+### Phase 6 — Chat Completions translation for ChatGPT (optional)
 
 Only if there is demand. Chat → Responses request, Responses → Chat
 response, including the streaming event mapping — on top of the aggregator
-built in Phase 4.
+built in Phase 5.
 
-### Phase 6 — Usage and limits
+### Phase 7 — Usage and limits
 
 - Forward upstream headers on the streaming path.
 - Optionally, `GET /v1/usage` dispatching per provider.
@@ -1022,11 +1122,13 @@ built in Phase 4.
 | R4 | Our x.ai path is metered on the **standard API tier** (tier 1), not the SuperGrok consumer pool — it is billed like API usage. | Medium | Document it clearly in the README. It is not a defect, but it is surprising. |
 | R5 | **No headless sign-in.** SIWC documents only the browser loopback flow, so `eggpass login --provider openai` needs a browser and a reachable loopback port. Our x.ai `--device` option has no equivalent. | Medium | Accept it for now; investigate whether the undocumented Codex device endpoint accepts a dynamically issued client id. Otherwise a user on a headless box cannot sign in. |
 | R6 | **Silent parameter loss.** The route rejects `temperature`, `top_p`, `max_output_tokens` and a dozen other fields. A Chat Completions client that sends `temperature: 0.7` will have it stripped rather than honoured — the request succeeds but behaves differently. | Medium | Strip deliberately, and surface it in the response (a header or a note) rather than silently dropping it. This is a fidelity trade-off, not a bug. |
-| R7 | **`stream: true` is mandatory**, so every ChatGPT request is a stream upstream. The aggregator that collapses it for non-streaming clients is required work, and it is where bugs will live. | Medium | Build it in Phase 4 with a proper event-parsing test suite; treat `response.completed` as the only success signal. |
+| R7 | **`stream: true` is mandatory**, so every ChatGPT request is a stream upstream. The aggregator that collapses it for non-streaming clients is required work, and it is where bugs will live. | Medium | Build it in Phase 5 with a proper event-parsing test suite; treat `response.completed` as the only success signal. |
 | R8 | SIWC is labelled a **preview**. Field lists, error codes and the registration flow can change. | Medium | Keep the provider's constants in one place and make them config-overridable so a change is a config edit, not a release. |
 | R9 | Two providers double the credential-handling and refresh surface. | Medium | The `TokenProvider` seam already exists; the per-provider `TokenManager` is a small delta. |
 | R10 | The issued client id is bound to **one user and one workspace**. A user with several ChatGPT accounts needs several registrations, each with its own credential record. | Low | SIWC's "Accounts and sessions" guidance describes exactly this; store one record per registration and allow switching. |
 | R11 | Usage-limit errors can arrive **mid-stream**, after the response has begun. A naive client sees a truncated body rather than a clean error. | Low | Propagate the upstream error shape; document `subscription_sharing_usage_limit_exceeded` and `subscription_sharing_usage_unavailable` in the README. |
+| R12 | **`host` can expose the proxy to the network.** The project's posture is loopback-only, and a non-loopback bind puts an OpenAI-compatible endpoint — backed by the user's x.ai and ChatGPT subscriptions — on the LAN. With an empty `api_key` ("accept any key") that is an open proxy on someone's paid plan. | **High** | Refuse a non-loopback host unless `api_key` is configured; warn loudly when it is allowed; keep loopback as the default; document the exposure in the README and in the command's own output. |
+| R13 | **The auto-restart in `port`/`host` truncates live streams.** Restarting means `SIGTERM`, which today cuts in-flight SSE responses (Part 1) — so a user changing the port mid-answer loses the answer. | Medium | The restart is the user's explicit intent, so truncation is acceptable *if* it is announced. Phase 0's H1 fix makes the grace window real, and the command says it is restarting before it does. A no-op change restarts nothing, which is the common case. |
 
 ### Open questions to resolve during implementation
 
@@ -1041,7 +1143,7 @@ built in Phase 4.
    dropping `KNOWN_MODELS` costs anything.
 4. **Does the undocumented Codex device endpoint accept a dynamically issued
    client id?** This is the only route to a headless ChatGPT sign-in.
-5. **Do chat-completions clients matter enough to justify Phase 5?** And if a
+5. **Do chat-completions clients matter enough to justify Phase 6?** And if a
    Chat Completions request has its `temperature` stripped, should we warn the
    client in-band?
 6. **Should the ChatGPT provider be on by default?** With a supported path the
@@ -1099,6 +1201,10 @@ with defaults.
 
 The migration is one-time, idempotent, and never overwrites an existing
 `~/.config/eggpass/`.
+
+> **Decision (2026-11-13): the migration is confirmed** as specified — the
+> directory moves, and the old one is left in place with a marker rather than
+> deleted.
 
 ### 6.4 How the rename is executed
 
@@ -1211,9 +1317,9 @@ and solves them on the platforms where they actually bite.
 that is unpleasant to write twice, and it buys the ecosystem consistency the
 project wants anyway.
 
-If the dependency budget is judged too tight, the fallback is to ship the
-numbered-list picker first (no new dependency, works everywhere) and add the
-raw-mode picker in a later phase.
+> **Decision (2026-11-13): use crossterm.** The raw-mode picker ships as
+> specified, with the numbered-list fallback always available. The
+> "ship the fallback first" option is not taken.
 
 ### 7.4 Drawing the picker
 
@@ -1409,8 +1515,16 @@ If staying on 1.85 matters more than the shared update ecosystem, the fallback
 is to implement `eggpass update` directly on `ureq` + `sha2` (both already
 dependencies) and skip eggup. That is a few hundred lines, and it would make
 `eggpass` the one eggstack tool with a bespoke updater — which is exactly the
-uniformity this decision is trying to buy. **Recommendation: raise the MSRV
-to 1.89 and adopt eggup.**
+uniformity this decision is trying to buy.
+
+> **Decision (2026-11-13): raise the MSRV to 1.89 and adopt eggup.** The
+> fallback is not taken. `rust-version = "1.89"` in `Cargo.toml`, the CI MSRV
+> job moves to 1.89, and the README's requirements line moves with it. The
+> bespoke-updater path is dropped, so eggpass ships the same verified-update
+> mechanism as the rest of the family.
+
+This is the one place the project constraint moves rather than being
+protected, and it is worth a line in the release notes when it happens.
 
 ### 8.6 The `eggpass update` command
 
@@ -1449,9 +1563,9 @@ its plan.
 
 ## Part 9 — Relationship to eggpool
 
-> **Update (2026-11-13).** New. This is the most consequential discovery in
-> the whole review, and it needs to be settled before the ChatGPT provider is
-> built.
+> **Update (2026-11-13).** New. This was the most consequential discovery in
+> the whole review. **It is now settled** — see 9.3: eggpass is built and
+> maintained separately, and eggpool ingests its OAuth layer downstream.
 
 ### 9.1 What eggpool already is
 
@@ -1497,39 +1611,66 @@ API keys and provider accounts; the OAuth-flavoured, subscription-credential
 flow is not what it is for.
 
 So eggpass is the **minimal, single-user, OAuth-first sibling** — not a
-duplicate.
+duplicate. This was confirmed as the operating model in 9.3: eggpass is
+maintained on its own, and eggpool is the place where a multi-user,
+LAN-hosted, database-backed version of the idea would live.
 
-### 9.3 The decision to make
+### 9.3 The decision — keep them separate
 
-There are three honest positions:
+> **Update (2026-11-13).** **Decided: option 1. `eggpass` is built and
+> maintained as its own project.** The two are separate binaries, separate
+> repos, separate releases, separate configs, separate ports. eggpass does
+> not become a feature of eggpool, and eggpool does not absorb eggpass.
 
-1. **Build eggpass as planned.** It stays small, single-binary, single-user,
-   OAuth-first. Accept that some capabilities — model enrichment, quota
-   awareness across accounts, a dashboard, multi-user budgets — are not
-   reimplemented, and say so plainly.
-2. **Fold eggpass into eggpool** as an OAuth credential source. Much less code,
-   but eggpool's deployment shape (LAN, SQLite, dashboard, multi-user) is not
-   what this project wants, and the daemon model, the config layout and the
-   CLI surface are all different.
-3. **Do nothing and use eggpool.** Viable if the subscription-OAuth angle
-   turns out not to matter.
+The reasoning, in the owner's words: eggpass exists to be a **small,
+lightweight OAuth-to-proxy** that puts Grok and ChatGPT behind an
+OpenAI-compatible endpoint, for tools that speak OpenAI but do not support
+Grok — mcode being the concrete case. It is a single-user, local tool, and it
+stays that way.
 
-**Recommendation: option 1**, with an explicit statement of what eggpass
-deliberately does *not* do, and a pointer to eggpool for anyone who wants the
-heavier version. The two can coexist: they are separate binaries on separate
-ports with separate configs.
+That use case is genuinely different from eggpool's. eggpool is LAN-hosted,
+multi-user and database-backed; eggpass is loopback-only, single-user and
+file-backed. The two are not competing implementations of the same thing.
 
-**But this should be confirmed before the ChatGPT provider is built**, because
-if the answer is "eggpool already does this and we should just use it", the
-ChatGPT provider work in Part 4 Phase 4 is largely redundant — and that is a
-cheaper thing to discover now than after building it.
+**What this settles.**
 
-Two things worth checking either way:
+- The ChatGPT provider work in Part 4 Phase 5 is **not** redundant. eggpass
+  needs it.
+- eggpass stays small. The dashboard, the SQLite store, multi-user personal
+  tokens, per-user budgets, quota-aware routing across accounts and model
+  enrichment are **not** reimplemented here, and eggpass should say so plainly
+  rather than growing toward eggpool's shape.
+- The feature boundary is drawn around the OAuth layer, not around the proxy.
+  eggpass's distinctive part is **subscription OAuth** — signing in with a
+  ChatGPT Plus account or an X Premium subscription and spending that plan's
+  allowance through an OpenAI-compatible API. eggpool's `connect` flow is
+  built around provider accounts and API keys, which is a different problem.
 
-- **Does eggpool already support ChatGPT subscription OAuth?** If its
-  `connect` flow already handles SIWC, the gap is much smaller than it looks.
-- **Does eggpool's `model/provider` pinning give us the routing we designed?**
-  It looks close to the prefix-map routing in Part 3.3.
+**The downstream direction.** The plan further down the line is to give
+eggpool an OAuth capability, and for eggpool to **ingest eggpass's** OAuth
+work rather than reimplement it. eggpass remains maintained separately and
+released on its own; eggpool consumes it downstream.
+
+That downstream relationship is a *reason* to keep eggpass's OAuth layer
+clean and separable, not a reason to build eggpool's features here. Concretely
+it means:
+
+- the OAuth provider layer is a distinct module with no eggpool-specific
+  assumptions in it;
+- the credential storage, refresh and revocation logic is written to be
+  reusable, not to be exactly what eggpass happens to need today;
+- nothing in eggpass assumes it is the only consumer of that module.
+
+It also means the two projects' release cycles stay independent — eggpass can
+ship a ChatGPT fix without an eggpool release, and eggpool can take the OAuth
+capability when it is ready to.
+
+**One thing still worth checking**, because it costs an hour and could change
+the downstream plan: does eggpool's existing `connect`/`onboard` flow already
+handle ChatGPT subscription OAuth in some form? If it does, the downstream
+work is smaller than it looks; if it does not, the OAuth layer eggpass
+builds is exactly what eggpool will want to ingest. Either answer supports
+building eggpass's OAuth layer on its own terms.
 
 ### 9.4 Other eggstack projects worth knowing about
 

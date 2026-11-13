@@ -21,7 +21,14 @@ Environment variables:
 ```
 EGGPASS_HOME       override the config directory
 EGGPASS_PROVIDER   same as --provider <id>, lower precedence than the flag
+EGGPASS_HOST       the address to bind, overriding the config's host
+EGGPASS_PORT       the port to listen on, overriding the config's port
 ```
+
+`EGGPASS_HOST` and `EGGPASS_PORT` are read by the **daemon** when it starts,
+not by the `host` and `port` commands — those commands change the config file,
+and the config file is what survives a restart. They exist so a supervised
+daemon can be pointed at a different address without editing the config.
 
 `--provider <id>` applies to the commands that talk to a provider (`login`,
 `logout`). It is the non-interactive path into every command: with it set, the
@@ -182,6 +189,8 @@ Accounts:
 Server:   running
   pid:       51234
   url:       http://127.0.0.1:8484
+  host:      127.0.0.1
+  port:      8484
   upstream:  api.x.ai
   models:    10 available
 ```
@@ -257,7 +266,9 @@ eggpass restart
 ```
 
 **Behaviour** — `stop` then `run`, in that order. Prints the new PID and URL.
-A restart is the point at which a changed `port` takes effect.
+A restart is the point at which a hand-edited `port` or `host` in the config
+file takes effect. The `port` and `host` commands do not need one — they
+restart the daemon themselves.
 
 **Exit codes:** `0` running · `1` failed to restart.
 
@@ -265,24 +276,113 @@ A restart is the point at which a changed `port` takes effect.
 
 ## `eggpass port`
 
-Show or change the listen port.
+Show or change the listen port. A change is applied **immediately** — the
+command restarts the daemon for you.
 
 ```
 eggpass port            # print the current port
-eggpass port 9000       # change it
+eggpass port 9000       # change it and restart
 ```
 
 **Behaviour**
 
-- With no argument, print the current port and the URL.
-- With an argument, validate it (integer, 1–65535, not a privileged port below
-  1024), write it to the config file, and report that it takes effect on the
-  next restart.
-- If the daemon is running and the port changed, print:
-  `port set to 9000 — run 'eggpass restart' to apply (currently serving 8484)`.
-- Changing the port **does not** restart the daemon.
+1. **No argument** — print the configured port, the port actually being served
+   (they differ only if the config was edited by hand), and the base URL.
+2. **With an argument** — validate it, then apply:
+   - **Valid** means an integer in `1..=65535`. A port below `1024` is refused
+     unless `allow_privileged_port = true` in the config, matching the rule
+     the server already applies at bind time.
+   - An invalid port is refused **before anything is written or restarted**.
+     Nothing changes and nothing is stopped.
+3. **Only restart when the requested port differs from the port being served.**
+   - If the daemon is running and already serving that port, it is **not**
+     restarted. The config file is corrected to the requested value, so a
+     later manual restart does not undo the change.
+   - If the daemon is not running, the config is written and the message says
+     the new port takes effect at the next start. There is nothing to restart.
+4. **Check the port is free before restarting.** If the requested port is
+   already taken, print `port <port> is taken` and change nothing — no config
+   write, no stop, no restart — so the user can immediately try another port.
+5. **Apply** — stop the daemon, write the config, start the daemon, wait for
+   `/health` to answer (up to ~10s), then print the new URL and PID.
+   If the start fails, the previous config is restored and the daemon is
+   restarted on the old port, so a failed change never leaves the user with a
+   stopped proxy.
 
-**Exit codes:** `0` ok · `1` invalid port.
+**Output**
+
+```
+$ eggpass port 9000
+port 9000 is taken
+```
+
+```
+$ eggpass port 9000
+restarting on port 9000…
+running on http://127.0.0.1:9000 (pid 51234)
+```
+
+```
+$ eggpass port 8484
+already serving port 8484
+```
+
+**Exit codes:** `0` ok, including "already serving" · `1` invalid port, port
+taken, or the restart failed.
+
+---
+
+## `eggpass host`
+
+Show or change the address the server binds to. A change is applied
+**immediately** — the command restarts the daemon for you.
+
+```
+eggpass host              # print the current bind address
+eggpass host 0.0.0.0      # bind every interface
+```
+
+**Behaviour**
+
+1. **No argument** — print the configured host and the host actually being
+   served.
+2. **With an argument** — validate it, then apply. Valid values are:
+   - an IPv4 or IPv6 literal — `127.0.0.1`, `::1`, `0.0.0.0`, `::`;
+   - `localhost`, `local` or `loopback`, which all mean `127.0.0.1`.
+
+   Anything else is refused **before anything is written or restarted**. A name
+   outside that list is refused rather than resolved: a bind address has to
+   name a local interface, and resolving one would make the result depend on
+   DNS.
+3. **Only restart when the requested host differs from the host being served** —
+   the same rule as `port`.
+4. **The port is not touched.** `host` changes only the bind address; the
+   configured port is left exactly as it is and the restarted daemon keeps
+   serving the same port.
+5. **A non-loopback host needs authentication.** Binding anywhere other than
+   `127.0.0.1`/`::1` puts the proxy — and through it the user's x.ai and
+   ChatGPT subscriptions — on the network. So:
+   - if `api_key` is empty, the change is refused, naming the setting that has
+     to be configured first;
+   - if `api_key` is set, the change is allowed and the command warns that the
+     proxy is now reachable from the network.
+6. **Check the address is bindable before restarting.** If `host:port` cannot
+   be bound, print `host <host> is not bindable` and change nothing.
+7. **Apply** — stop, write the config, start, wait for `/health`, print the new
+   URL. On failure, restore the previous config and restart on the old
+   address.
+
+**Output**
+
+```
+$ eggpass host 0.0.0.0
+warning: the proxy is now reachable from the network
+running on http://0.0.0.0:8484 (pid 51234)
+```
+
+**Exit codes:** `0` ok, including "already serving" · `1` invalid host, host
+not bindable, no `api_key` configured for a non-loopback host, or the restart
+failed.
 
 ---
 
@@ -342,8 +442,13 @@ eggpass croncheck
 | `~/.config/eggpass/config.toml` | User-editable config | `0644` |
 | `~/.config/eggpass/credentials/xai.json` | x.ai OAuth tokens | `0600` (dir `0700`) |
 | `~/.config/eggpass/credentials/openai.json` | ChatGPT OAuth tokens, issued client id, host id | `0600` (dir `0700`) |
-| `~/.config/eggpass/eggpass.pid` | Daemon PID | `0644` |
+| `~/.config/eggpass/eggpass.pid` | Daemon PID, the host it bound and the port it is serving | `0644` |
 | `~/.config/eggpass/eggpass.log` | Daemon + cron log | `0644` |
+
+The pid file records **what the daemon is actually serving**, not what the
+config file says. `status`, `port` and `host` all compare against it, which is
+how "only restart if the value actually changed" is decided. The host line is
+optional when reading, so a pid file written by an older build still parses.
 
 `~/.grok/auth.json` (written by the official Grok Build CLI) is read as an
 **import source** when `~/.config/eggpass/credentials/xai.json` is absent, so a
@@ -355,11 +460,16 @@ again.
 ```toml
 # ~/.config/eggpass/config.toml
 
+host = "127.0.0.1"  # the address to bind; "localhost"/"local"/"loopback" mean 127.0.0.1
 port = 8484
 upstream = "api"      # "api" = api.x.ai  |  "build" = cli-chat-proxy.grok.com
-api_key = ""          # empty = accept any key (the server binds loopback only)
+api_key = ""          # empty = accept any key (safe only while the host is loopback)
 log_level = "info"    # error | warn | info | debug
 ```
+
+`host` and `port` are the two addresses the server listens on, and they are
+changed with the `host` and `port` commands rather than by hand-editing this
+file — both commands validate, apply and restart in one step.
 
 ## Upstream behaviour
 

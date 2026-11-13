@@ -8,9 +8,10 @@ client — OpenCode, Cline, Continue, the OpenAI SDK, a shell script — can tal
 to Grok models such as `grok-4.7` and `grok-4.6` without an x.ai API key.
 
 > **Status.** The proxy works today against x.ai. The rename to `eggpass`, the
-> interactive provider picker, the ChatGPT provider and the eggpack/eggup
-> packaging pipeline are designed and written up, but **not yet implemented** —
-> see [`plans/plan-eggpass.md`](plans/plan-eggpass.md).
+> interactive provider picker, the `port`/`host` address commands, the ChatGPT
+> provider and the eggpack/eggup packaging pipeline are designed and written
+> up, but **not yet implemented** — see
+> [`plans/plan-eggpass.md`](plans/plan-eggpass.md).
 
 ```
 ┌──────────────┐   OpenAI API    ┌────────────┐   OAuth bearer   ┌──────────────┐
@@ -21,7 +22,7 @@ to Grok models such as `grok-4.7` and `grok-4.6` without an x.ai API key.
 
 ## Requirements
 
-- Rust 1.85 or newer, to build it
+- Rust 1.85 or newer, to build it (1.89 once the eggup updater lands)
 - A Grok subscription account
 
 ## Install
@@ -64,7 +65,8 @@ automatically — `eggpass status` will show you as logged in.
 | `eggpass run` | Start the server as a background daemon. `--foreground` to stay in the terminal. |
 | `eggpass stop` | Stop the daemon. |
 | `eggpass restart` | Stop the daemon, then start it again. |
-| `eggpass port` | Show the listen port, or change it. A change takes effect at the next `restart`. |
+| `eggpass port` | Show the listen port, or change it. A change is applied and the server is restarted for you. |
+| `eggpass host` | Show the bind address, or change it. Same behaviour as `port` — loopback only unless you set an API key. |
 | `eggpass edit` | Open the config file in `$EDITOR`. |
 | `eggpass croncheck` | Start the daemon only if it is not already running. Prints nothing. |
 
@@ -110,7 +112,12 @@ target x.ai only. See
 `~/.config/eggpass/config.toml`:
 
 ```toml
-# TCP port the local API listens on. Takes effect after `eggpass restart`.
+# The address the local API binds to. Loopback by default.
+# Change it with `eggpass host`, not by editing this file.
+host = "127.0.0.1"
+
+# TCP port the local API listens on.
+# Change it with `eggpass port`, not by editing this file.
 port = 8484
 
 # Upstream that serves model requests.
@@ -260,7 +267,8 @@ sending the wrong key. Check `eggpass status`, and check `api_key` in the
 config.
 
 **`address already in use`** — something else is on the port. Pick another one
-with `eggpass port 9000` and then `eggpass restart`.
+with `eggpass port 9000`; the command checks the port is free before it
+restarts anything, and tells you so if it is not.
 
 **The server says it is running but nothing answers** — the daemon is running
 but its port has changed. `eggpass status` prints the port it is actually
@@ -297,6 +305,25 @@ needs a human to approve the device-code login, and it spends a few tokens.
   the obvious choice (`tiny_http`) buffers responses in a one-kilobyte
   `BufWriter`, which would hold back the first token of every streamed
   answer.
+
+### Changing where it listens
+
+`eggpass port` and `eggpass host` change the address the server listens on and
+restart it in one step:
+
+```sh
+eggpass port 9000       # move to port 9000 and restart
+eggpass host 0.0.0.0    # listen on every interface and restart
+```
+
+Both commands only restart when the value actually differs from what is being
+served, and both refuse to change anything if the new address is unusable —
+a taken port prints `port <port> is taken` and leaves the server alone.
+
+`host` defaults to loopback, and that default is the safe one: binding
+elsewhere puts the proxy, and through it your paid subscriptions, on the
+network. A non-loopback host is refused unless you set an `api_key`, and warns
+when it is allowed.
 
 ## Documentation
 
