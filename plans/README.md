@@ -9,6 +9,7 @@ Nothing in this directory ships with the binary.
 | [`cli-spec.md`](cli-spec.md) | The command-by-command contract for `login`, `logout`, `status`, `run`, `stop`, `restart`, `port`, `edit` and `croncheck`: behaviour, exit codes, side effects, file paths and config schema. | Current — 2026-11-13 |
 | [`implementation-plan.md`](implementation-plan.md) | Phased build order, module layout, dependency set, per-phase acceptance criteria, test strategy and the risk-to-phase mapping. Ends with **what shipped**, including the deviations from the plan and why. | Current — 2026-11-13 |
 | [`research-model-refresh-codex-eggserve-limits.md`](research-model-refresh-codex-eggserve-limits.md) | Follow-up research: how the model catalogue is refreshed today, what adding a ChatGPT/Codex OAuth path would take, whether `eggserve` should replace the handrolled HTTP server, and what plan/usage limits x.ai and OpenAI actually expose. | Current — 2026-11-13 |
+| [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md) | The plan for turning `grokproxy` into a combined Grok + Codex proxy: the streaming-concurrency findings, whether to drop the static model catalogue, the provider/routing/credential design, and the phase breakdown. | Current — 2026-11-13 |
 
 ## Reading order
 
@@ -21,6 +22,8 @@ Nothing in this directory ships with the binary.
 4. [`research-model-refresh-codex-eggserve-limits.md`](research-model-refresh-codex-eggserve-limits.md)
    — the follow-up questions: catalogue refresh, a Codex auth path, HTTP
    server choice, and plan limits.
+5. [`plan-combined-grok-codex-proxy.md`](plan-combined-grok-codex-proxy.md)
+   — the design and phasing for the combined Grok + Codex proxy.
 
 ## Key decisions
 
