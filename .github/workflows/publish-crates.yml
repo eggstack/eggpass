@@ -1,0 +1,61 @@
+name: Publish to crates.io
+
+# Publishing to crates.io is triggered by the GitHub release being PUBLISHED —
+# not by the draft being staged. The release workflow never publishes, so this
+# workflow only runs after a human has reviewed the draft and published it.
+#
+# The token is a repository secret: `CARGO_REGISTRY_TOKEN`, an API token from
+# https://crates.io/settings/tokens with the `publish` scope for this crate.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify the package without publishing it"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The crate that ships is the crate the release was cut from.
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the version matches the release
+        if: ${{ github.event_name == 'release' }}
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          tag="${TAG#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Cargo.toml says $version but the release tag says $tag"
+            exit 1
+          fi
+
+      - name: Verify the package
+        run: cargo package --locked --allow-dirty
+
+      - name: Publish the crate
+        if: ${{ github.event_name == 'release' && !(inputs.dry_run == true) }}
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

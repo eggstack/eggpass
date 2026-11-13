@@ -3,11 +3,24 @@ name = "eggpass"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A lightweight, local, OpenAI-compatible proxy for Grok and ChatGPT using OAuth"
+description = "A lightweight, local, OpenAI-compatible proxy for Grok and ChatGPT, authenticated with your own subscription over OAuth"
 license = "MIT"
 readme = "README.md"
-keywords = ["grok", "xai", "openai", "proxy", "oauth"]
-categories = ["command-line-utilities"]
+homepage = "https://github.com/eggstack/eggpass"
+repository = "https://github.com/eggstack/eggpass"
+documentation = "https://docs.rs/eggpass"
+keywords = ["grok", "chatgpt", "openai", "proxy", "oauth"]
+categories = ["command-line-utilities", "api-bindings"]
+
+# The published crate carries the source and the documentation, and nothing
+# else: no CI definitions, no live-verification script, no build output.
+include = [
+    "/src",
+    "/docs",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 
 [dependencies]
 base64 = "0.23.1"

@@ -1,0 +1,294 @@
+name: Release
+
+# A release is cut from a tag. The workflow builds the binaries, writes the
+# release manifest, and stages a DRAFT GitHub release with everything attached.
+#
+# It never publishes. Publication is a separate human action, which is what
+# keeps an unreviewed set of bytes from becoming "the latest release" that
+# every installed `eggpass` then pulls. The crates.io publish is a separate
+# workflow, triggered by the release actually being published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.1.0). The tag v<version> must already exist."
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PRODUCT: eggpass
+
+jobs:
+  identity:
+    name: resolve the release identity
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      revision: ${{ steps.identity.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tags have to be here for the identity check to see them.
+          fetch-depth: 0
+
+      - id: identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="$REF_NAME"
+          fi
+          version="${version#v}"
+
+          # The manifest release id is a plain X.Y.Z. A 'v' prefix here would
+          # make `eggpass update` refuse to compare the published release with
+          # the running one.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$version' is not a plain MAJOR.MINOR.PATCH version"
+            exit 1
+          fi
+
+          tag="v$version"
+
+          # The tag must already exist, and the release must be built from the
+          # commit the tag points at. The workflow does not create tags.
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::the tag $tag does not exist; tag the release commit first"
+            exit 1
+          fi
+          revision="$(git rev-parse "${tag}^{commit}")"
+
+          manifest_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$manifest_version" != "$version" ]; then
+            echo "::error::Cargo.toml says $manifest_version but the release says $version"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: verify
+    needs: identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release is built from the tagged commit, so the tree that is
+          # checked here is the tree that ships.
+          ref: ${{ needs.identity.outputs.tag }}
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup component add rustfmt clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run the tests
+        run: cargo test --all-targets
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [identity, verify]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identity.outputs.tag }}
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build the release binary
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
+
+      - name: Name the asset
+        shell: bash
+        env:
+          PRODUCT: eggpass
+          RUST_TARGET: ${{ matrix.rust_target }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          source="target/$RUST_TARGET/release/eggpass"
+          suffix=""
+          if [ -f "${source}.exe" ]; then
+            source="${source}.exe"
+            suffix=".exe"
+          fi
+          if [ ! -f "$source" ]; then
+            echo "::error::no binary was produced at $source"
+            exit 1
+          fi
+          # The asset name carries no version, so that
+          # releases/latest/download/<name> keeps working across releases.
+          cp "$source" "dist/${PRODUCT}-${TARGET}${suffix}"
+          ls -l dist
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  manifest:
+    name: write the release manifest
+    needs: [identity, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identity.outputs.tag }}
+
+      - name: Collect the binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write the manifest
+        id: write
+        env:
+          PRODUCT: eggpass
+          VERSION: ${{ needs.identity.outputs.version }}
+          REVISION: ${{ needs.identity.outputs.revision }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, sys
+
+          product = os.environ["PRODUCT"]
+          version = os.environ["VERSION"]
+          revision = os.environ["REVISION"]
+          dist = pathlib.Path("dist")
+
+          targets = []
+          for path in sorted(dist.iterdir()):
+              if not path.is_file():
+                  continue
+              name = path.name
+              if not name.startswith(product + "-"):
+                  raise SystemExit(f"unexpected asset name: {name}")
+              target = name[len(product) + 1:]
+              if target.endswith(".exe"):
+                  target = target[: -len(".exe")]
+              data = path.read_bytes()
+              targets.append({
+                  "target": target,
+                  "form": {
+                      "kind": "direct",
+                      "artifact": {
+                          "name": name,
+                          "size": len(data),
+                          "sha256": hashlib.sha256(data).hexdigest(),
+                      },
+                      "install": product,
+                  },
+              })
+
+          if not targets:
+              raise SystemExit("no binaries were collected")
+
+          targets.sort(key=lambda t: t["target"])
+
+          manifest = {
+              "schema_version": 1,
+              "product_id": product,
+              "release_id": version,
+              "source_revision": revision,
+              "targets": targets,
+          }
+
+          encoded = json.dumps(manifest, indent=2) + "\n"
+          pathlib.Path("eggpass-release-manifest.json").write_text(encoded)
+          # The document goes to the log, not to the output file.
+          print(encoded, file=sys.stderr)
+          PY
+
+      - name: Upload the manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: eggpass-release-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: stage the draft release
+    needs: [identity, manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the assets
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.identity.outputs.tag }}
+          VERSION: ${{ needs.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l assets
+          gh release create "$TAG" \
+            --draft \
+            --title "eggpass $VERSION" \
+            --generate-notes \
+            assets/*
+          echo "::notice::draft release $TAG staged; review it, then publish it"
