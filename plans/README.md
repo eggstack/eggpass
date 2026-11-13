@@ -44,9 +44,10 @@ Nothing in this directory ships with the binary.
 | Bind address | `host` + `port`, both applied and restarted by their own commands; loopback by default |
 | ChatGPT auth | Sign in with ChatGPT for Open Source — dynamic registration, no client secret, public `https://api.openai.com/v1` |
 | ChatGPT callback port | Random ephemeral loopback, path `/auth/callback`, host `127.0.0.1` — SIWC permits a variable port |
-| Provider selection | Interactive picker — `↑`/`↓` or `j`/`k`, `Enter` selects, `Esc` cancels; numbered-list fallback when stdin is not a TTY |
+| Provider selection | Interactive picker — `j`/`k` or `↑`/`↓` to move, `Enter` selects, `q`/`Esc` cancels; numbered-list fallback when stdin is not a TTY |
 | Re-login | Replaces the stored credential atomically; there is no `--force` flag and no "already logged in" refusal |
 | Logout | Revokes at the provider, then deletes the local credential; best-effort revocation, never a hard failure |
+| Picker implementation | `nix`'s termios, following the family's own terminal selector — originally `crossterm`, reversed when the crossterm picker was found to render the menu as a staircase |
 | Project name | `eggpass` — the rename map is Part 6.2 of [`plan-eggpass.md`](plan-eggpass.md) |
 | HTTP server | Handrolled, kept — `eggserve` requires tokio and we have no async runtime |
 | Model catalogue | Live. `GET /v1/models` is a round trip; an unknown model id is a `404`. No static list. |

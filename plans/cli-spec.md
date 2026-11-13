@@ -59,15 +59,27 @@ eggpass login --device     # x.ai only: device-code flow, for headless / SSH
 
      Select a provider to sign in with:
 
-       ❯ x.ai
-         ChatGPT
+     Use j/k or ↑/↓ to navigate, Enter to select, q/Esc to quit
 
-     ↑/↓ or j/k to move · Enter to select · Esc to cancel
+       > x.ai
+           Grok models, on your x.ai subscription
+         ChatGPT
+           ChatGPT models, on your ChatGPT plan
+
    ```
 
-   - `↑`/`↓` **and** `j`/`k` both move the cursor; `Enter` selects; `Esc` and
-     `Ctrl-C` cancel.
+   - `↑`/`↓` **and** `j`/`k` both move the cursor. The cursor **stops at the
+     ends** of the list rather than wrapping around.
+   - `Enter` selects; `q` and `Esc` cancel.
+   - `Ctrl-C` **interrupts** the command: the terminal is restored and the
+     command exits non-zero. That is deliberately not the same as cancelling,
+     which is a choice and exits `0`.
+   - The screen is **cleared and the menu redrawn from the top** on every
+     keystroke, so the menu never scrolls a second copy of itself.
    - Cancelling exits `0` and changes nothing.
+   - The interactive picker needs **both** stdin and stdout to be terminals. A
+     terminal on stdin with a pipe on stdout would put cursor-control
+     sequences into the pipe, so that combination uses the fallback too.
    - When stdin is **not** a terminal (piped input, CI, cron), the picker
      falls back to a numbered list and reads one line:
 
@@ -135,9 +147,10 @@ eggpass logout --provider xai   # pick the provider directly, no picker
 
      Select a provider to sign out of:
 
-       ❯ x.ai
+     Use j/k or ↑/↓ to navigate, Enter to select, q/Esc to quit
 
-     ↑/↓ or j/k to move · Enter to select · Esc to cancel
+       > x.ai
+
    ```
 
    With no provider logged in anywhere, print "not logged in" and exit `0`

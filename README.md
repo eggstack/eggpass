@@ -77,10 +77,13 @@ $ eggpass login
 
   Select a provider to sign in with:
 
-    ❯ x.ai — Grok models, on your x.ai subscription
-      ChatGPT — ChatGPT models, on your ChatGPT plan
+  Use j/k or ↑/↓ to navigate, Enter to select, q/Esc to quit
 
-  ↑/↓ or j/k to move · Enter to select · Esc to cancel
+    > x.ai
+        Grok models, on your x.ai subscription
+      ChatGPT
+        ChatGPT models, on your ChatGPT plan
+
 ```
 
 `login` lists every provider the build knows about; `logout` lists only the
@@ -88,6 +91,12 @@ ones you are actually signed in to. Signing in to a provider you are already
 signed in to simply **replaces** the stored credential — there is no `--force`
 flag. When stdin is not a terminal the picker falls back to a numbered list,
 and `--provider <id>` skips it entirely.
+
+The picker runs in raw mode through `nix`, matching the family's own terminal
+selector: the screen is cleared and the menu redrawn from the top on every
+keystroke. `j`/`k` and the arrow keys both move the cursor, and the cursor
+stops at the ends rather than wrapping. `q` or `Esc` cancels, and `Ctrl-C`
+interrupts the command.
 
 ### Keeping it alive with cron
 

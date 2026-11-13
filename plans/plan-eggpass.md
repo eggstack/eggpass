@@ -37,7 +37,7 @@ can be read as settled rather than tentative.
 | --- | --- | --- |
 | eggpool overlap | **Keep eggpass separate.** It is built and maintained on its own; eggpool ingests its OAuth layer downstream. | [9.3](#93-the-decision--keep-them-separate) |
 | MSRV | **Raise 1.85 → 1.89** and adopt `eggup`. No bespoke updater. | [8.5](#85-the-msrv-cost) |
-| Picker dependency | **`crossterm`**, with the numbered-list fallback always available. | [7.3](#73-how-to-read-keys-without-an-async-runtime) |
+| Picker dependency | **`nix`'s termios**, following the family's own terminal selector; the numbered-list fallback always available. *(Originally `crossterm` — reversed after the crossterm picker was found to render the menu as a staircase.)* | [7.3](#73-how-to-read-keys-without-an-async-runtime) |
 | Config-directory migration | **Confirmed** — the directory moves; the old one is left in place with a marker, not deleted. | [6.3](#63-why-the-config-directory-moves) |
 | `port` / `host` | **`port` becomes apply-and-restart**, and **`host` is added**, with the same rules for both. | [3.8.1](#381-the-address-commands) |
 
@@ -1259,10 +1259,13 @@ $ eggpass login
 
   Select a provider to sign in with:
 
-    ❯ x.ai
-      ChatGPT
+  Use j/k or ↑/↓ to navigate, Enter to select, q/Esc to quit
 
-  ↑/↓ or j/k to move · Enter to select · Esc to cancel
+    > x.ai
+        Grok models, on your x.ai subscription
+      ChatGPT
+        ChatGPT models, on your ChatGPT plan
+
 ```
 
 `eggpass logout` uses the same picker but lists **only the providers that are
@@ -1276,10 +1279,10 @@ or over a pipe. A picker that hangs on a non-terminal stdin would be a trap.
 
 So the picker has two modes:
 
-- **Interactive** — stdin is a TTY. Raw-mode key handling, arrow keys, `j`/`k`,
-  `Enter`, `Esc`, `Ctrl-C`.
-- **Fallback** — stdin is a pipe or a file. Print a numbered list and read one
-  line:
+- **Interactive** — stdin *and* stdout are terminals. Raw-mode key handling,
+  arrow keys, `j`/`k`, `Enter`, `q`, `Esc`, `Ctrl-C`.
+- **Fallback** — stdin or stdout is a pipe or a file. Print a numbered list
+  and read one line:
 
   ```
   Select a provider to sign in with:
@@ -1328,6 +1331,33 @@ and solves them on the platforms where they actually bite.
 that is unpleasant to write twice, and it buys the ecosystem consistency the
 project wants anyway.
 
+> **Update (2026-11-13) — reversed, and shipped on `nix`.** The crossterm
+> picker was built first and **rendered the menu as a staircase**: crossterm's
+> `enable_raw_mode` calls `cfmakeraw`, which clears `OPOST`, so a bare `\n`
+> steps down a line without returning the cursor to the first column. The
+> rewrite follows the family's **own terminal selector** — the one eggpool's
+> `connect` command uses — on `nix`'s termios, and the dependency list got
+> *smaller* rather than bigger.
+>
+> What the rewrite added:
+>
+> - the screen is **cleared and the menu redrawn from the top** on every
+>   keystroke, rather than scrolled and patched;
+> - every line ends with an explicit `\r\n`, because raw mode turns off the
+>   kernel's newline translation;
+> - the interactive path needs **both** stdin and stdout to be terminals, so a
+>   terminal on stdin with a pipe on stdout never writes cursor-control
+>   sequences into the pipe;
+> - the cursor **stops at the ends** instead of wrapping;
+> - `q` cancels as well as `Esc`, and `Ctrl-C` is an **interruption** rather
+>   than a cancellation;
+> - control bytes in a label are neutralised;
+> - **pseudoterminal tests** drive the selector over a real PTY, so this class
+>   of bug cannot come back unnoticed.
+>
+> The full account is in
+> [`shipped-2026-11-13.md`](shipped-2026-11-13.md#the-picker-was-rendered-wrongly).
+
 > **Decision (2026-11-13): use crossterm.** The raw-mode picker ships as
 > specified, with the numbered-list fallback always available. The
 > "ship the fallback first" option is not taken.
@@ -1346,9 +1376,15 @@ for two to five providers, redraw-in-place is the right size of solution.
 
 ### 7.5 Failure modes to handle
 
-- **Ctrl-C during the picker** — restore the terminal, exit `130`. The
+- **Ctrl-C during the picker** — restore the terminal and exit non-zero. The
   terminal must be restored on *every* exit path, including panic: use a
   guard object whose `Drop` restores the terminal mode.
+
+  > **As shipped.** `Ctrl-C` is reported as an **interruption**, not a
+  > cancellation, so it exits `1` with a message while cancelling (`q` or
+  > `Esc`) exits `0` and changes nothing. That distinction is the reference
+  > implementation's, and it is the right one: cancelling is a choice,
+  > interrupting is the user giving up on the whole command.
 - **EOF on stdin** in the fallback — treat it as "no selection", exit `0`.
 - **Terminal width** — truncate long provider descriptions rather than
   wrapping them, so the redraw arithmetic stays correct.
@@ -1736,7 +1772,7 @@ and the delta.
 | 6 — Chat Completions translation | Shipped | `src/server/translate.rs`. |
 | 7 — Usage and limits | **Partly shipped** | Upstream headers reach streaming clients. `GET /v1/usage` was **not** implemented — optional in the plan, and the upstream contract could not be verified. |
 | 6.2 — The rename | Shipped | The crate, the binary, `EGGPASS_HOME`, the pid file, the log file, and the config directory. |
-| 7 — The picker | Shipped | `crossterm`, with the numbered-list fallback. |
+| 7 — The picker | Shipped | On `nix`'s termios, following the family's own terminal selector, with the numbered-list fallback and pseudoterminal tests. |
 | 8 — Packaging and updates | Shipped | The updater's **policy** is ours; the mechanics are `eggup`'s. |
 
 ### The delta from the plan

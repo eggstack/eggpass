@@ -37,7 +37,7 @@ src/
 ├── cli/
 │   ├── mod.rs           # subcommand dispatch, shared output helpers
 │   ├── args.rs          # hand-rolled parser (no clap)
-│   ├── prompt.rs        # the interactive provider picker (crossterm)
+│   ├── prompt.rs        # the interactive provider picker (raw mode via nix)
 │   └── commands/
 │       ├── mod.rs
 │       ├── login.rs     # login / logout
@@ -92,10 +92,9 @@ src/
 | `rand` | Randomness | `state`, `nonce`, PKCE verifier |
 | `daemonize` | Daemonization | double-fork, `setsid`, PID file |
 | `signal-hook` | Signals | graceful `SIGTERM` |
-| `nix` | Process control | `kill(pid, 0)` liveness, signal sending |
+| `nix` | Process control and the picker | `kill(pid, 0)` liveness, signal sending, and raw-mode termios for the picker (the `term` feature) |
 | `dirs` | Paths | config directory resolution |
 | `webbrowser` | OAuth | open the authorize URL |
-| `crossterm` | The picker | raw mode, arrow/j/k keys; the family precedent |
 | `eggup-core` | Updater | the transaction, the ownership verifier, the validators |
 | `eggup-acquisition` | Updater | fetching the manifest and the artifact |
 | `eggup-eggpack` | Updater | projecting a release manifest for a target |
@@ -105,7 +104,11 @@ Dev-dependencies: `tempfile` (credential-store tests). The stub upstream is
 written directly against a socket in `src/server/tests.rs`.
 
 Deliberately excluded: `tokio`/`async`/`axum`/`reqwest`, `keyring`, `clap`,
-`tiny_http`, `httptest`, `wiremock`.
+`tiny_http`, `httptest`, `wiremock`, `crossterm`.
+
+`crossterm` was in the dependency list for the interactive picker, and was
+dropped when the picker was rewritten on `nix`'s termios — see
+[`shipped-2026-11-13.md`](shipped-2026-11-13.md#the-picker-was-rendered-wrongly).
 
 ---
 
@@ -550,9 +553,9 @@ Development: `tempfile`.
 
 That is the plan's table minus `tiny_http`, with nothing added.
 
-*As of the multi-provider phase the runtime list also carries `crossterm` (the
-picker) and the four `eggup` crates (the updater's mechanics). The full list
-is in [`shipped-2026-11-13.md`](shipped-2026-11-13.md).*
+*As of the multi-provider phase the runtime list also carries the four `eggup`
+crates (the updater's mechanics). The full list is in
+[`shipped-2026-11-13.md`](shipped-2026-11-13.md).*
 
 ### Verification
 
