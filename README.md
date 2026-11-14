@@ -95,7 +95,10 @@ eggpass key revoke 2            # take one away
 
 A new key works on the **next request** — no restart. The server will not
 start while no key exists, and a running server refuses every request if its
-last key is revoked; `eggpass key add` is the way back.
+last key is revoked; `eggpass key add` is the way back. The two exceptions are
+`GET /health` and `GET /v1/last-inference`: they answer without a key because
+they carry nothing but a version string and a status code, and `eggpass usage`
+reads the latter without holding any key material.
 
 The key is shown once and only its salted hash is stored, so a lost key is a
 new key. If you would rather have one you can read back, set `api_key` in the
@@ -146,6 +149,7 @@ Every command is idempotent and safe to script from cron.
 | `POST /v1/responses` | The OpenAI Responses API |
 | `GET /v1/models` | The model catalogue |
 | `GET /v1/models/{id}` | One model |
+| `GET /v1/last-inference` | The HTTP status of the last inference to each provider, for `eggpass usage` |
 | `GET /health` | Liveness probe, never authenticated |
 
 Both `/v1/chat/completions` and `/chat/completions` work, so it does not matter

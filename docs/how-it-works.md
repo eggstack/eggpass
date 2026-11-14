@@ -45,7 +45,9 @@ client ──OpenAI API──► eggpass ──OAuth bearer──► api.x.ai / 
   server re-reads the store whenever it changes, so a key can be added or
   revoked without a restart. `eggpass run`, `restart` and `croncheck` refuse
   to start without one, and a running server refuses every request if its
-  last key is revoked. Loopback was never the boundary: a web page can reach
+  last key is revoked — except `GET /health` and `GET /v1/last-inference`,
+  which answer without a key because they carry nothing but a version string
+  and a status code. Loopback was never the boundary: a web page can reach
   `127.0.0.1`, so "no key" meant "open to any page the user visits".
 - **The authority is checked even with a key.** On a loopback bind the `Host`
   header must be `127.0.0.1`, `localhost`, `[::1]`, a `*.localhost` name, or
@@ -177,6 +179,15 @@ The rules are decided by the **live host**, not by the config file:
 So `eggpass` can never be an open proxy for the network. On loopback, "open"
 means open *to this machine only*, which is why it is the default.
 
+"Refused" means every endpoint that does any work. Two routes are exempt on
+every bind, because they carry nothing worth protecting: `GET /health` returns
+the version string that `status` and `croncheck` probe, and
+`GET /v1/last-inference` returns the status of the last inference to each
+provider so that `eggpass usage` can report it. Neither accepts input, neither
+touches a credential, and neither says anything about a prompt or an answer.
+The authority guard still runs on both, so a rebound request is refused with
+`421`.
+
 A server bound outside loopback with no key at all logs an error at startup
 and refuses every request, rather than quietly serving the world.
 
@@ -195,6 +206,12 @@ and refuses every request, rather than quietly serving the world.
 - The provider picker runs in raw mode through `nix`, matching the family's
   own terminal selector. `crossterm` was tried first and reversed: it
   rendered the menu as a staircase.
+- **The daemon keeps no history of requests.** The only thing it remembers
+  between requests is the HTTP status of the last inference to each provider,
+  and it holds that in memory — no file, no log, no timestamps. It is there
+  so `eggpass usage` can say something about a provider that publishes no
+  quota, and it is gone when the daemon stops. A record that outlived the
+  process would be a history of what the user asked the model.
 
 ## Changing where it listens
 

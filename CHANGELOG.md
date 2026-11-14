@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history of what the user asked for. `eggpass usage` asks the running daemon
   for it over the loopback socket, and prints the row when there is one.
 
+  That adds one endpoint, `GET /v1/last-inference`, which answers
+  `{"providers":{"openai":429}}`. It needs no key, like `/health`: it returns a
+  status code and nothing else, accepts no input, and touches no credential.
+  The authority guard still applies, so a rebound request is refused with
+  `421`.
+
 ### Security
 
 - **A client key is required to run.** `eggpass run`, `restart` and

@@ -134,6 +134,67 @@ auth: 1 key(s), the key from the configuration file
 
 ---
 
+## `eggpass usage`
+
+Show how much of the subscription allowance is used.
+
+```sh
+eggpass usage                  # every provider you are signed in to
+eggpass usage --provider xai   # one provider
+eggpass usage --json           # the report as JSON
+```
+
+**Exit codes:** `0` at least one provider produced a block · `1` every provider
+failed operationally · `2` no provider is signed in on this machine.
+
+Each provider gets one fresh read, on this run. There is no polling and no
+cache: a cached reading is a number that might be wrong, and this command
+exists to be right. It needs no daemon — the credential file is read and the
+provider is asked directly.
+
+```
+x.ai · SuperGrok
+  Weekly      ████░░░░░░░░░░░░░░░░  20% used
+  Resets      Nov 20, 03:07 (UTC)
+  Api             ██░░░░░░░░░░░░░░░░░░  10% used
+  Prepaid     $0.00
+  This is your Grok subscription. `eggpass` requests are billed separately against the xAI API tier.
+
+ChatGPT
+  Quota       unavailable — Sign in with ChatGPT does not expose a quota API
+  Inference   succeeded
+  Source      not exposed by OAuth
+  Limits      https://chatgpt.com/settings/usage
+  Signals     429 subscription_sharing_usage_limit_exceeded
+              503 subscription_sharing_usage_unavailable
+              403 subscription_sharing_user_not_eligible
+```
+
+The number is how much is **used**, never how much is left. A percentage the
+provider did not report reads `unavailable`, never `0% used`: the billing
+endpoint is proto3 JSON and omits zero-valued fields, so an absent number means
+the provider did not say. When the provider states a condition instead — not
+eligible, limit reached — that statement replaces the number.
+
+The caption under the x.ai block is not decoration. On the default `api`
+upstream the allowance reported there is your **consumer subscription**, and
+`eggpass`'s own requests are billed against the xAI API tier. The caption names
+the pool the number belongs to and changes with `providers.xai.upstream`.
+
+**ChatGPT has no quota to read.** Sign in with ChatGPT exposes no endpoint that
+returns an allowance, so the block says so, names where the quota would have
+come from, links OpenAI's own usage page, and lists the three error codes
+OpenAI does publish. It never guesses a number.
+
+The `Inference` row is the one fact left about such an account: the HTTP status
+the last inference to that provider was answered with, `succeeded` for a 2xx
+and `failed (429)` otherwise. The daemon keeps that in memory and writes
+nothing — no file, no log, no history — so the row is absent when the daemon is
+not running or has not served an inference since it started, and it disappears
+when the daemon restarts.
+
+---
+
 ## `eggpass run`
 
 Start the server as a background daemon.
@@ -265,12 +326,15 @@ not be written.
 Key numbers are stable: they are never reused and never renumbered, so
 `revoke 2` always means the same key even after other keys have been revoked.
 
-Revoking the **last** key says what it did, and which way:
+Revoking the **last** key closes the endpoint and says so:
 
 ```
-That was the last key. The endpoint on 127.0.0.1 now accepts anything.
-That was the last key. The endpoint on 0.0.0.0 now refuses every request.
+That was the last key. Every request is now refused; run `eggpass key add` to issue another.
 ```
+
+The two probes that carry no data — `GET /health` and `GET /v1/last-inference`
+— still answer, which is how `eggpass status` and `eggpass usage` keep working
+while the proxy itself is shut. `eggpass key add` is the way back.
 
 A key takes effect on the **next request** — the server re-reads the store
 whenever it changes, so nothing has to be restarted.
