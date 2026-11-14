@@ -21,6 +21,13 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// The largest request body we accept.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+/// The largest chunk-size, trailer, or chunk-ending line we retain.
+///
+/// A client that never sends a newline would otherwise grow the line until
+/// allocation fails. The idle timeout is not this bound: it fires only when
+/// a read blocks.
+const MAX_LINE_BYTES: usize = 8 * 1024;
+
 /// How long in-flight requests are given to finish during shutdown.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -125,8 +132,17 @@ impl Response {
     }
 }
 
+/// What the gate decided from the request head, before the body is read.
+pub enum GateDecision {
+    /// The handler may run. `keep_body` is false for a probe that does not
+    /// read the body; the bytes are discarded in the fixed drain buffer.
+    Proceed { keep_body: bool },
+    /// Write this and do not run the handler.
+    Refuse(Response),
+}
+
 /// A hook that may refuse a request from its head, before the body is read.
-pub type Gate = Arc<dyn Fn(&Request) -> Option<Response> + Send + Sync + 'static>;
+pub type Gate = Arc<dyn Fn(&Request) -> GateDecision + Send + Sync + 'static>;
 
 /// The function that turns a request into a response.
 pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>;
@@ -335,15 +351,28 @@ impl SocketReader {
     }
 
     /// Read one line, without its line ending.
-    fn read_line(&mut self) -> std::io::Result<String> {
+    ///
+    /// The cap is applied before any byte is copied onto the line, including
+    /// a remainder `read_head` already buffered. A pending slice with no
+    /// newline that would cross the cap is rejected without being copied.
+    /// The idle timeout does not bound this: it fires only when a read
+    /// blocks, and a client that keeps sending never blocks.
+    fn read_line(&mut self) -> Result<String, LineError> {
         let mut line = Vec::new();
         loop {
-            if let Some(index) = self.pending().iter().position(|byte| *byte == b'\n') {
+            let newline_at = self.pending().iter().position(|byte| *byte == b'\n');
+            if let Some(index) = newline_at {
+                if line.len().saturating_add(index) > MAX_LINE_BYTES {
+                    return Err(LineError::TooLong);
+                }
                 line.extend_from_slice(&self.pending()[..index + 1]);
                 self.position += index + 1;
                 break;
             }
             let rest = self.pending().len();
+            if line.len().saturating_add(rest) > MAX_LINE_BYTES {
+                return Err(LineError::TooLong);
+            }
             line.extend_from_slice(self.pending());
             self.position += rest;
             if self.position == self.buffer.len() {
@@ -354,13 +383,28 @@ impl SocketReader {
                 return Err(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "the connection ended in the middle of a line",
-                ));
+                )
+                .into());
             }
         }
         while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
             line.pop();
         }
         Ok(String::from_utf8_lossy(&line).to_string())
+    }
+}
+
+/// Why reading a chunked line failed.
+enum LineError {
+    /// The connection ended, or the read failed.
+    Io(std::io::Error),
+    /// The line would exceed [`MAX_LINE_BYTES`].
+    TooLong,
+}
+
+impl From<std::io::Error> for LineError {
+    fn from(err: std::io::Error) -> LineError {
+        LineError::Io(err)
     }
 }
 
@@ -392,6 +436,8 @@ enum BodyError {
     Io(std::io::Error),
     /// The body is larger than [`MAX_BODY_BYTES`].
     TooLarge,
+    /// A chunked line exceeded [`MAX_LINE_BYTES`].
+    Malformed,
 }
 
 impl From<std::io::Error> for BodyError {
@@ -405,13 +451,14 @@ impl From<std::io::Error> for BodyError {
 /// The head is parsed first and handed to the gate before a body byte is
 /// read or allocated. A refusal is written and the connection closed; the
 /// handler never runs. When the client is not waiting on `100 Continue`, the
-/// body is then drained into a fixed buffer, because closing on a half-read
-/// body sends a reset that can discard the response before the client reads
-/// it.
+/// body is then drained, because closing on a half-read body sends a reset
+/// that can discard the response before the client reads it. An allow may
+/// still discard the body: a probe that does not read it proceeds with
+/// `keep_body: false`.
 fn read_request(
     reader: &mut SocketReader,
     writer: &mut TcpStream,
-    gate: &dyn Fn(&Request) -> Option<Response>,
+    gate: &dyn Fn(&Request) -> GateDecision,
 ) -> std::io::Result<Option<Request>> {
     let Some(head) = read_head(reader)? else {
         return Ok(None);
@@ -419,18 +466,25 @@ fn read_request(
 
     let request = parse_head(&head);
 
-    if let Some(refusal) = gate(&request) {
-        write_response(writer, refusal, false)?;
-        if !expects_continue(&request.headers) {
-            let _ = read_body(reader, writer, &request.headers, false);
+    let keep_body = match gate(&request) {
+        GateDecision::Refuse(refusal) => {
+            write_response(writer, refusal, false)?;
+            if !expects_continue(&request.headers) {
+                let _ = read_body(reader, writer, &request.headers, false);
+            }
+            return Ok(None);
         }
-        return Ok(None);
-    }
+        GateDecision::Proceed { keep_body } => keep_body,
+    };
 
-    match read_body(reader, writer, &request.headers, true) {
+    match read_body(reader, writer, &request.headers, keep_body) {
         Ok(body) => Ok(Some(Request { body, ..request })),
         Err(BodyError::TooLarge) => {
             write_response(writer, payload_too_large(), false)?;
+            Ok(None)
+        }
+        Err(BodyError::Malformed) => {
+            write_response(writer, malformed_body(), false)?;
             Ok(None)
         }
         Err(BodyError::Io(err)) => Err(err),
@@ -472,6 +526,14 @@ fn expects_continue(headers: &[(String, String)]) -> bool {
     headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
     })
+}
+
+/// The `400` body for a chunked line that exceeds [`MAX_LINE_BYTES`].
+fn malformed_body() -> Response {
+    Response::json(
+        400,
+        r#"{"error":{"message":"the request body is malformed","type":"invalid_request_error","code":"malformed_body"}}"#,
+    )
 }
 
 /// The `413` body for a request that is too large.
@@ -592,16 +654,21 @@ fn read_chunked_body(reader: &mut SocketReader, keep: bool) -> Result<Vec<u8>, B
     let mut body = Vec::new();
 
     loop {
-        let line = reader.read_line()?;
+        let line = read_chunk_line(reader)?;
         let size_text = line.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_text, 16)
             .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "malformed chunk size"))?;
 
         if size == 0 {
-            // Consume the trailer section.
-            while let Ok(trailer) = reader.read_line() {
-                if trailer.trim().is_empty() {
-                    break;
+            // Consume the trailer section. A client that closes after the
+            // last chunk used to end it; keep that. An overlong line is not
+            // a close.
+            loop {
+                match read_chunk_line(reader) {
+                    Ok(trailer) if trailer.trim().is_empty() => break,
+                    Ok(_) => {}
+                    Err(BodyError::Io(_)) => break,
+                    Err(err) => return Err(err),
                 }
             }
             return Ok(body);
@@ -624,7 +691,16 @@ fn read_chunked_body(reader: &mut SocketReader, keep: bool) -> Result<Vec<u8>, B
         }
 
         // The CRLF that closes the chunk.
-        reader.read_line()?;
+        read_chunk_line(reader)?;
+    }
+}
+
+/// Read one chunked line, mapping an overlong line to [`BodyError::Malformed`].
+fn read_chunk_line(reader: &mut SocketReader) -> Result<String, BodyError> {
+    match reader.read_line() {
+        Ok(line) => Ok(line),
+        Err(LineError::TooLong) => Err(BodyError::Malformed),
+        Err(LineError::Io(err)) => Err(err.into()),
     }
 }
 
@@ -777,7 +853,10 @@ mod integration_tests {
     use super::*;
 
     fn start(handler: Handler) -> u16 {
-        start_with_gate(Arc::new(|_: &Request| None), handler)
+        start_with_gate(
+            Arc::new(|_: &Request| GateDecision::Proceed { keep_body: true }),
+            handler,
+        )
     }
 
     /// Start a server with an explicit gate.
@@ -796,7 +875,8 @@ mod integration_tests {
         // A gate that refuses everything: the handler must never run, the
         // body must never be read, and the client must not be told to
         // continue.
-        let gate = Arc::new(|_: &Request| Some(Response::json(401, r#"{"error":"no"}"#)));
+        let gate =
+            Arc::new(|_: &Request| GateDecision::Refuse(Response::json(401, r#"{"error":"no"}"#)));
         let handler = Arc::new(|_: Request| -> Response { panic!("the handler must not run") });
         let port = start_with_gate(gate, handler);
 
@@ -821,7 +901,8 @@ mod integration_tests {
 
     #[test]
     fn a_refusal_survives_a_body_the_client_already_sent() {
-        let gate = Arc::new(|_: &Request| Some(Response::json(401, r#"{"error":"no"}"#)));
+        let gate =
+            Arc::new(|_: &Request| GateDecision::Refuse(Response::json(401, r#"{"error":"no"}"#)));
         let handler = Arc::new(|_: Request| -> Response { panic!("the handler must not run") });
         let port = start_with_gate(gate, handler);
 
@@ -908,5 +989,151 @@ mod integration_tests {
             .expect("the server answers");
         let body = response.into_body().read_to_string().unwrap();
         assert!(body.contains("\"len\":17"), "{body}");
+    }
+
+    /// Read whatever the server wrote, until it closes or the timeout fires.
+    fn read_response(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    fn probe_health(port: u16) -> u16 {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build();
+        let agent = ureq::Agent::new_with_config(config);
+        agent
+            .get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .expect("the server still answers")
+            .status()
+            .as_u16()
+    }
+
+    /// A chunk-size line of the cap plus one byte, and no newline.
+    fn overlong_chunk_line() -> Vec<u8> {
+        let mut line = Vec::with_capacity(MAX_LINE_BYTES + 1);
+        line.resize(MAX_LINE_BYTES + 1, b'A');
+        line
+    }
+
+    #[test]
+    fn an_overlong_chunk_line_does_not_abort() {
+        // Cap plus a small overshoot, and nothing more. Do not aim an
+        // unbounded line at the server.
+        let handler = Arc::new(|request: Request| {
+            assert_eq!(
+                request.path(),
+                "/health",
+                "the overlong request must not be handled"
+            );
+            Response::json(200, r#"{"status":"ok"}"#)
+        });
+        let port = start(handler);
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut request = b"POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        request.extend(overlong_chunk_line());
+        stream.write_all(&request).unwrap();
+
+        let response = read_response(&mut stream);
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("malformed_body"), "{response}");
+        assert_eq!(probe_health(port), 200);
+    }
+
+    #[test]
+    fn a_refused_chunk_line_still_returns_the_refusal() {
+        let gate = Arc::new(|request: &Request| {
+            if request.path() == "/health" {
+                GateDecision::Proceed { keep_body: false }
+            } else {
+                GateDecision::Refuse(Response::json(401, r#"{"error":"no"}"#))
+            }
+        });
+        let handler = Arc::new(|request: Request| {
+            assert_eq!(request.path(), "/health");
+            Response::json(200, r#"{"status":"ok"}"#)
+        });
+        let port = start_with_gate(gate, handler);
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut request = b"POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        request.extend(overlong_chunk_line());
+        stream.write_all(&request).unwrap();
+
+        let response = read_response(&mut stream);
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(!response.contains("malformed_body"), "{response}");
+        assert_eq!(probe_health(port), 200);
+    }
+
+    #[test]
+    fn a_short_chunked_body_still_arrives() {
+        let port = start(Arc::new(|request: Request| {
+            Response::bytes(200, Vec::new(), request.body)
+        }));
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Transfer-Encoding: chunked\r\n\r\n\
+             5\r\nhello\r\n0\r\n\r\n"
+        )
+        .unwrap();
+
+        let response = read_response(&mut stream);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("hello"), "{response}");
+    }
+
+    #[test]
+    fn a_health_request_does_not_keep_its_body() {
+        let gate = Arc::new(|request: &Request| GateDecision::Proceed {
+            keep_body: request.path() != "/health" && request.path() != "/healthz",
+        });
+        let handler = Arc::new(|request: Request| {
+            assert!(
+                request.body.is_empty(),
+                "{} retained {} body bytes",
+                request.path(),
+                request.body.len()
+            );
+            crate::server::health::handle()
+        });
+        let port = start_with_gate(gate, handler);
+
+        for path in ["/health", "/healthz"] {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\n\
+                 Host: 127.0.0.1\r\n\
+                 Content-Length: 5\r\n\
+                 Connection: close\r\n\r\n\
+                 hello"
+            )
+            .unwrap();
+            let response = read_response(&mut stream);
+            assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+            assert!(response.contains(r#""status":"ok""#), "{path}: {response}");
+            assert!(
+                response.contains(r#""service":"eggpass""#),
+                "{path}: {response}"
+            );
+        }
     }
 }

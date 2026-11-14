@@ -29,12 +29,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A malformed chunked body no longer aborts the daemon.** A chunk size of
-  `ffffffffffffffff` wrapped a bounds check and killed the process with a
-  capacity-overflow panic. Oversized bodies now answer `413`.
+  `ffffffffffffffff` is refused with `413`. A chunk-size, trailer, or
+  chunk-ending line is capped at 8 KiB; a longer line is malformed framing
+  and answers `400`, instead of growing until allocation fails and the
+  process aborts.
 
-- **The request body is read only after authentication.** An unauthenticated
-  client can no longer make the daemon buffer up to 32 MB per connection: the
-  key is checked on the request head, before the body is read.
+- **An unkeyed client can no longer make the daemon retain a body.** The key
+  is checked on the request head before a body is kept. `/health` and
+  `/healthz` stay unauthenticated — `status` and `croncheck` use them — and
+  no longer retain a body; the bytes are discarded.
+
+- **A callback without this login's `state` no longer cancels the login.**
+  The ephemeral listener keeps waiting until a callback carries the state it
+  issued, a code is pasted, or the deadline passes. A local process that does
+  not have the state cannot end the wait.
+
+- **A device-flow verification URL is checked the way a browser parses it.**
+  The old check did not treat a backslash as a delimiter, so a URL a browser
+  would open on a different host was accepted. The check is now a WHATWG
+  parse: `https` only, no userinfo, and an exact host match. A raw backslash,
+  ASCII whitespace, or a control character is refused even when that parse
+  would land on a trusted host. The refusal names the host, or says the URL
+  could not be parsed; it does not repeat the URL.
 
 - **`config.toml` is written `0600`.** It can hold a client key and was
   written with the process umask. An existing file is tightened on the next

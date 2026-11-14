@@ -4,6 +4,14 @@ The work order for the authentication review of `4f1f381`. Decisions are
 settled and the implementation is in place; the phase-5 verification record
 follows the code.
 
+A follow-up review of that implementation (`b4a55ff`) found four remaining
+defects. They are written up in
+[`security-followup-2026-11-14.md`](security-followup-2026-11-14.md), which
+is implemented. Two claims in §5.3 — that the drain is bounded by
+`MAX_BODY_BYTES`, and that an unauthenticated client never reaches
+`read_body` — are corrected there. This document is otherwise the record of
+what this pass decided.
+
 | | |
 | --- | --- |
 | Scope | The client-key gate, the two OAuth flows, credential storage, and every path a secret crosses |

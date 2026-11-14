@@ -15,6 +15,8 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use url::Url;
+
 use super::client::{AuthError, DevicePoll, OAuthClient, TokenSet, UserInfo};
 use super::pkce;
 use super::store::StoredAuth;
@@ -29,6 +31,11 @@ pub enum FlowError {
     /// The user did not finish within the time limit.
     Timeout,
     /// The callback carried a `state` we did not issue.
+    ///
+    /// Retained so the error type does not churn. A foreign callback no
+    /// longer produces this: the wait continues until a callback carries the
+    /// state we issued.
+    #[allow(dead_code)]
     StateMismatch,
     /// The callback carried an error from the provider.
     Provider {
@@ -38,7 +45,11 @@ pub enum FlowError {
     /// The callback did not carry an authorization code.
     NoCode,
     /// The provider asked us to visit a host we do not trust.
-    UntrustedUrl(String),
+    ///
+    /// `host` is the host a WHATWG parse produced, when the string parsed.
+    /// The raw URL is never stored: a hostile device response must not be
+    /// written to the terminal.
+    UntrustedUrl { host: Option<String> },
     /// The provider does not support the requested flow.
     Unsupported(&'static str),
     /// The provider does not publish a device-code endpoint.
@@ -70,8 +81,11 @@ impl std::fmt::Display for FlowError {
                 None => write!(f, "the provider refused the login: {error}"),
             },
             FlowError::NoCode => write!(f, "the callback did not carry an authorization code"),
-            FlowError::UntrustedUrl(url) => {
-                write!(f, "refusing to open `{url}`: it is not a verification page")
+            FlowError::UntrustedUrl { host: Some(host) } => {
+                write!(f, "refusing to open a verification page on {host}")
+            }
+            FlowError::UntrustedUrl { host: None } => {
+                write!(f, "the verification URL could not be parsed")
             }
             FlowError::Unsupported(what) => {
                 write!(f, "{what} is not supported for this provider")
@@ -225,13 +239,9 @@ pub fn login_device(spec: &ProviderSpec, client: &OAuthClient) -> Result<LoginOu
         Err(err) => return Err(err.into()),
     };
 
-    if !is_trusted_verification_url(&device.verification_uri, spec.trusted_device_hosts) {
-        return Err(FlowError::UntrustedUrl(device.verification_uri));
-    }
-    if let Some(complete) = &device.verification_uri_complete
-        && !is_trusted_verification_url(complete, spec.trusted_device_hosts)
-    {
-        return Err(FlowError::UntrustedUrl(complete.clone()));
+    require_trusted_verification_url(&device.verification_uri, spec.trusted_device_hosts)?;
+    if let Some(complete) = &device.verification_uri_complete {
+        require_trusted_verification_url(complete, spec.trusted_device_hosts)?;
     }
 
     let open_url = device
@@ -409,6 +419,20 @@ fn wait_for_callback(
 
                 let params = parse_query(&query);
 
+                // A connection is this login's result only when it carries
+                // the state we issued. Anything else is a local process
+                // poking the listener: answer and keep waiting. The page
+                // does not echo the query or the expected state.
+                if params.get("state").map(String::as_str) != Some(state) {
+                    respond(
+                        &mut stream,
+                        400,
+                        "Login failed",
+                        "The login could not be verified. You can close this window.",
+                    )?;
+                    continue;
+                }
+
                 if let Some(error) = params.get("error") {
                     let description = params.get("error_description").cloned();
                     respond(
@@ -421,17 +445,6 @@ fn wait_for_callback(
                         error: error.clone(),
                         description,
                     });
-                }
-
-                let returned_state = params.get("state");
-                if returned_state.map(String::as_str) != Some(state) {
-                    respond(
-                        &mut stream,
-                        400,
-                        "Login failed",
-                        "The login could not be verified. You can close this window.",
-                    )?;
-                    return Err(FlowError::StateMismatch);
                 }
 
                 let Some(code) = params.get("code") else {
@@ -636,35 +649,83 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
+/// How a verification URL was judged.
+enum UrlTrust {
+    Trusted,
+    /// `host` is set only when a WHATWG parse produced one. A raw refusal
+    /// does not parse, so it has none.
+    Refused {
+        host: Option<String>,
+    },
+}
+
 /// Whether a URL points at a page we are willing to send the user to.
+///
+/// The host is the one a WHATWG parser produces, which is the host the
+/// browser will open. A raw backslash, ASCII whitespace, or a byte below
+/// `0x20` is refused before that parse: a trusted device URL does not contain
+/// them, and a backslash the parser would treat as a delimiter must not be
+/// able to aim the page elsewhere. The same refuse also rejects a backslash
+/// the parser would land on a trusted host — fail closed.
 pub fn is_trusted_verification_url(url: &str, trusted_hosts: &[&str]) -> bool {
-    if trusted_hosts.is_empty() {
-        return false;
+    matches!(
+        classify_verification_url(url, trusted_hosts),
+        UrlTrust::Trusted
+    )
+}
+
+/// Refuse `url`, or `Ok(())` when it is a page we will open.
+///
+/// The refusal names the parsed host when there is one, and otherwise says
+/// the URL could not be parsed. It does not carry the raw string.
+fn require_trusted_verification_url(url: &str, trusted_hosts: &[&str]) -> Result<(), FlowError> {
+    if is_trusted_verification_url(url, trusted_hosts) {
+        return Ok(());
     }
-    let Some(after_scheme) = url.split_once("://") else {
-        return false;
+    let host = match classify_verification_url(url, trusted_hosts) {
+        UrlTrust::Refused { host } => host,
+        UrlTrust::Trusted => None,
     };
-    let (scheme, rest) = after_scheme;
-    if !scheme.eq_ignore_ascii_case("https") {
-        return false;
+    Err(FlowError::UntrustedUrl { host })
+}
+
+fn classify_verification_url(url: &str, trusted_hosts: &[&str]) -> UrlTrust {
+    if trusted_hosts.is_empty() {
+        return UrlTrust::Refused { host: None };
+    }
+    if url
+        .bytes()
+        .any(|byte| byte == b'\\' || byte.is_ascii_whitespace() || byte < 0x20)
+    {
+        return UrlTrust::Refused { host: None };
     }
 
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let Ok(parsed) = Url::parse(url) else {
+        return UrlTrust::Refused { host: None };
+    };
+    let host = verification_host(&parsed);
+    if parsed.scheme() != "https" {
+        return UrlTrust::Refused { host };
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return UrlTrust::Refused { host };
+    }
+    match &host {
+        Some(host) if host_is_trusted(host, trusted_hosts) => UrlTrust::Trusted,
+        _ => UrlTrust::Refused { host },
+    }
+}
 
-    // Strip any userinfo and port.
-    let host = authority
-        .rsplit('@')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
+/// The host a browser will open, with one trailing dot removed.
+fn verification_host(parsed: &Url) -> Option<String> {
+    let host = parsed.host_str()?;
+    Some(host.strip_suffix('.').unwrap_or(host).to_string())
+}
 
-    trusted_hosts.contains(&host)
+fn host_is_trusted(host: &str, trusted_hosts: &[&str]) -> bool {
+    trusted_hosts
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(host))
 }
 
 #[cfg(test)]
@@ -687,6 +748,14 @@ mod tests {
             "https://auth.x.ai/oauth2/device",
             XAI_HOSTS
         ));
+        assert!(is_trusted_verification_url(
+            "https://Accounts.X.AI/oauth2/device",
+            XAI_HOSTS
+        ));
+        assert!(is_trusted_verification_url(
+            "https://accounts.x.ai:443/oauth2/device",
+            XAI_HOSTS
+        ));
     }
 
     #[test]
@@ -706,6 +775,14 @@ mod tests {
         assert!(!is_trusted_verification_url("accounts.x.ai", XAI_HOSTS));
         assert!(!is_trusted_verification_url(
             "javascript:alert(1)",
+            XAI_HOSTS
+        ));
+        assert!(!is_trusted_verification_url(
+            "https://accounts.x.ai/device path",
+            XAI_HOSTS
+        ));
+        assert!(!is_trusted_verification_url(
+            "https://accounts.x.ai/\u{1}device",
             XAI_HOSTS
         ));
     }
@@ -784,5 +861,180 @@ mod tests {
 
         let callback = wait_for_callback(listener, "state", "/callback", Some(receiver)).unwrap();
         assert_eq!(callback.code, "SplxlOBeZQQYbYS6WxSbIA");
+    }
+
+    fn exchange_callback(port: u16, target: &str) -> String {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|err| panic!("callback connect to {target} failed: {err}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    fn callback_result(target: &str, state: &str) -> Result<Callback, FlowError> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state_owned = state.to_string();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = wait_for_callback(listener, &state_owned, "/callback", None);
+            let _ = sender.send(result);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = exchange_callback(port, target);
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the callback wait finished")
+    }
+
+    #[test]
+    fn a_foreign_callback_does_not_cancel_the_login() {
+        let state = "issued-state-9f3c7a1e4b2d";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = state.to_string();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = wait_for_callback(listener, &expected, "/callback", None);
+            let _ = sender.send(result);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        for target in [
+            "/callback?error=access_denied",
+            "/callback?error=access_denied&state=wrong",
+            "/callback",
+            "/nope",
+        ] {
+            let response = exchange_callback(port, target);
+            assert!(
+                response.starts_with("HTTP/1.1 400") || response.starts_with("HTTP/1.1 404"),
+                "{target}: {response}"
+            );
+            assert!(!response.contains(state), "{target}: {response}");
+        }
+
+        let good = exchange_callback(port, &format!("/callback?code=goodcode12&state={state}"));
+        assert!(good.starts_with("HTTP/1.1 200"), "{good}");
+
+        let callback = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the login wait finished")
+            .expect("a later callback with the issued state finishes the login");
+        assert_eq!(callback.code, "goodcode12");
+    }
+
+    #[test]
+    fn a_matching_state_still_ends_the_login() {
+        match callback_result("/callback?error=access_denied&state=the-state", "the-state") {
+            Err(FlowError::Provider { error, .. }) => assert_eq!(error, "access_denied"),
+            other => panic!("expected a provider refusal, got {other:?}"),
+        }
+
+        match callback_result("/callback?state=the-state", "the-state") {
+            Err(FlowError::NoCode) => {}
+            other => panic!("expected no code, got {other:?}"),
+        }
+
+        let callback = callback_result("/callback?code=goodcode12&state=the-state", "the-state")
+            .expect("a code with the issued state finishes the login");
+        assert_eq!(callback.code, "goodcode12");
+    }
+
+    #[test]
+    fn an_ignored_callback_does_not_echo_the_state() {
+        let state = "issued-state-9f3c7a1e4b2d";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = state.to_string();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = wait_for_callback(listener, &expected, "/callback", None);
+            let _ = sender.send(result);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        // The issued state is in the query, so an echo would show it.
+        let response = exchange_callback(port, &format!("/callback?extra={state}&error=nope"));
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(!response.contains(state), "{response}");
+
+        let _ = exchange_callback(port, &format!("/callback?code=goodcode12&state={state}"));
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the login wait finished")
+            .expect("the issued callback still finishes the login");
+    }
+
+    #[test]
+    fn a_backslash_host_is_not_trusted() {
+        for url in [
+            r"https://evil.example\@accounts.x.ai/oauth2/device",
+            r"https://evil.example\@auth.x.ai/oauth2/device",
+            r"https://evil.example\@x.ai/oauth2/device",
+        ] {
+            assert!(
+                !is_trusted_verification_url(url, XAI_HOSTS),
+                "{url} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_backslash_is_refused() {
+        assert!(!is_trusted_verification_url(
+            r"https://accounts.x.ai\@evil.example/oauth2/device",
+            XAI_HOSTS
+        ));
+    }
+
+    #[test]
+    fn userinfo_is_refused() {
+        assert!(!is_trusted_verification_url(
+            "https://user@accounts.x.ai/oauth2/device",
+            XAI_HOSTS
+        ));
+        assert!(!is_trusted_verification_url(
+            "https://evil.example%5C@accounts.x.ai/device",
+            XAI_HOSTS
+        ));
+    }
+
+    #[test]
+    fn a_trailing_dot_on_a_trusted_host_is_accepted() {
+        assert!(is_trusted_verification_url(
+            "https://accounts.x.ai./device",
+            XAI_HOSTS
+        ));
+    }
+
+    #[test]
+    fn the_untrusted_url_error_does_not_echo_the_url() {
+        let raw = r"https://evil.example\@accounts.x.ai/oauth2/device?user_code=SECRET";
+        let text = require_trusted_verification_url(raw, XAI_HOSTS)
+            .expect_err("a backslash URL is refused")
+            .to_string();
+        assert!(!text.contains(raw), "{text}");
+        assert!(!text.contains("user_code"), "{text}");
+        assert!(!text.contains('\\'), "{text}");
+        assert!(!text.contains("evil.example"), "{text}");
+        assert!(text.contains("could not be parsed"), "{text}");
+
+        let parsed = "https://evil.example/oauth2/device?user_code=SECRET";
+        let text = require_trusted_verification_url(parsed, XAI_HOSTS)
+            .expect_err("an untrusted host is refused")
+            .to_string();
+        assert!(text.contains("evil.example"), "{text}");
+        assert!(!text.contains(parsed), "{text}");
+        assert!(!text.contains("user_code"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
     }
 }

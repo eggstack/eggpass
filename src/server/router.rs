@@ -57,6 +57,7 @@ mod tests {
             Route::Model("grok-4.7".into())
         );
         assert_eq!(route("/health"), Route::Health);
+        assert_eq!(route("/healthz"), Route::Health);
     }
 
     #[test]

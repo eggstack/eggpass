@@ -18,6 +18,19 @@ pub mod translate;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod keep_body_tests {
+    use super::keep_body_for;
+
+    #[test]
+    fn health_does_not_keep_a_body() {
+        assert!(!keep_body_for("/health"));
+        assert!(!keep_body_for("/healthz"));
+        assert!(keep_body_for("/v1/chat/completions"));
+        assert!(keep_body_for("/v1/models"));
+    }
+}
+
 pub use chat::forwarded_headers;
 pub use http::{HttpServer, Request, Response};
 
@@ -175,12 +188,14 @@ impl Server {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, flag.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
 
-        // The gate sees the request head before the body is read, so an
-        // unauthenticated client never gets its body buffered. The handler
-        // checks again: the gate is an early refusal, not the authority.
+        // The gate sees the request head before the body is read. A refusal
+        // is written without retaining the body. Health stays unauthenticated
+        // and does not retain one either: the probe does not read it.
+        // The handler checks again. The discard flag is not an auth decision,
+        // so a bug in it cannot skip the key check.
         let gate = {
             let context = Arc::clone(&context);
-            Arc::new(move |request: &Request| pre_authorize(request, &context)) as http::Gate
+            Arc::new(move |request: &Request| gate_decision(request, &context)) as http::Gate
         };
 
         let handler = {
@@ -194,12 +209,31 @@ impl Server {
     }
 }
 
+/// The gate's view of a request: refuse, or proceed and say whether to keep
+/// the body.
+///
+/// Health proceeds without a key and without retaining a body. The discard
+/// is not the auth decision — [`pre_authorize`] still runs in the handler,
+/// and [`handle_request`] calls it again.
+fn gate_decision(request: &Request, context: &ServerContext) -> http::GateDecision {
+    if let Some(refusal) = pre_authorize(request, context) {
+        return http::GateDecision::Refuse(refusal);
+    }
+    http::GateDecision::Proceed {
+        keep_body: keep_body_for(request.path()),
+    }
+}
+
+/// Whether the handler reads the body. Health does not.
+fn keep_body_for(path: &str) -> bool {
+    !matches!(router::route(path), router::Route::Health)
+}
+
 /// Decide whether a request may proceed, from its head and the context.
 ///
-/// Returns the refusal when it may not. This runs twice: once as the HTTP
-/// server's gate, before the body is read, and once at the top of
-/// [`handle_request`]. Both call this function, so the two checks cannot
-/// drift apart.
+/// Returns the refusal when it may not. The HTTP gate calls this before the
+/// body is read, and [`handle_request`] calls it again. The second call is
+/// the authority: the gate's discard flag is not an auth decision.
 fn pre_authorize(request: &Request, context: &ServerContext) -> Option<Response> {
     if let Some(refusal) = guard::check(request, &context.host, context.port) {
         return Some(refusal);

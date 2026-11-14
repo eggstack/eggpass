@@ -12,6 +12,7 @@ Nothing in this directory ships with the binary.
 | [`plan-eggpass.md`](plan-eggpass.md) | The plan for turning `eggpass` into a combined Grok + ChatGPT proxy: the streaming-concurrency findings, whether to drop the static model catalogue, the provider/routing/credential design, and the phase breakdown. Built on **Sign in with ChatGPT for Open Source**, not the Codex CLI's OAuth client. Also carries the rename map, the interactive provider picker, the `port`/`host` address commands, the eggpack/eggup packaging ecosystem, and the eggpool relationship. | Current — 2026-11-13 |
 | [`shipped-2026-11-13.md`](shipped-2026-11-13.md) | The record of what the eggpass implementation actually built: every phase, every deviation from the plan, the live verification evidence, and the two things that still need a human. | Current — 2026-11-13 |
 | [`security-pass-2026-11-14.md`](security-pass-2026-11-14.md) | The auth review: the five findings (unkeyed loopback reachable from a browser, the chunked-body abort, pre-auth body buffering, the `0644` config, the silent key-store fail-open), the evidence for each, the corrective design, and the decisions taken. | Implemented — 2026-11-14 |
+| [`security-followup-2026-11-14.md`](security-followup-2026-11-14.md) | The second pass, against `b4a55ff`: the unbounded chunk line, the health body that is still collected with no key, a callback that cancels login without the issued `state`, and a device-URL check that does not match the browser. | Implemented — 2026-11-14 |
 
 ## Reading order
 
@@ -77,5 +78,11 @@ published for it to install).
 The [security pass](security-pass-2026-11-14.md) is **built**. It records the
 five auth-surface findings from the 2026-11-14 review and the decisions taken:
 a client key is required to run, the authority is checked on every loopback
-request, the body is read only after the key is, and the file modes and the
-key-store warning are fixed. The release posture is still manual review only.
+request, and the file modes and the key-store warning are fixed. The release
+posture is still manual review only.
+
+The [follow-up](security-followup-2026-11-14.md) against that implementation
+is **built**. The chunk line is capped, `/health` no longer retains a body, a
+callback without the issued `state` does not cancel login, and a device URL
+is checked with a WHATWG parse. The release posture is still manual review
+only.

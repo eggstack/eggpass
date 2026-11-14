@@ -365,6 +365,7 @@ dependencies = [
  "tempfile",
  "toml",
  "ureq",
+ "url",
  "webbrowser",
 ]
 
