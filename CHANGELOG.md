@@ -69,6 +69,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A multi-byte character straddling a read boundary is no longer
+  corrupted.** A streamed ChatGPT answer is translated event by event, and the
+  buffer was a `String` decoded once per read. A read boundary falls wherever
+  the socket puts it, so a character split across two reads became two
+  `U+FFFD` replacement characters — `ééé` arrived as six of them. The buffer
+  is bytes now, decoded only up to a blank line, which is an ASCII boundary
+  and therefore a whole-character one. The same defect was in the path that
+  collapses a stream for a non-streaming client, where it corrupted the answer
+  body itself.
+
 - **A multi-byte character in a log message no longer panics.** The redactor
   walked a message a byte at a time and sliced the string at those offsets,
   which is not always a character boundary: an em dash near the start of a

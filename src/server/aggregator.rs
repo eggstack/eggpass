@@ -30,7 +30,13 @@ pub enum Aggregated {
 
 /// Collapse a Responses event stream into its final response object.
 pub fn aggregate_responses(body: impl Read) -> Result<Aggregated, String> {
-    let mut text = String::new();
+    // Bytes, not a `String`: a read boundary falls wherever the socket puts
+    // it, and a multi-byte character can straddle one. Decoding per read would
+    // replace half a character with `U+FFFD` — and this body is what a
+    // non-streaming client receives, so the corruption would reach the answer.
+    // The buffer is decoded only up to a blank line, which is an ASCII
+    // boundary and therefore a whole-character one.
+    let mut text: Vec<u8> = Vec::new();
     let mut reader = std::io::BufReader::new(body);
     let mut buffer = [0u8; 8192];
 
@@ -44,15 +50,15 @@ pub fn aggregate_responses(body: impl Read) -> Result<Aggregated, String> {
         if read == 0 {
             break;
         }
-        text.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        text.extend_from_slice(&buffer[..read]);
 
         // Everything up to the last blank line is complete; the rest is an
         // event that has not arrived in full yet, so it stays for the next
         // read.
-        let complete = match text.rfind("\n\n") {
+        let complete = match text.windows(2).rposition(|pair| pair == b"\n\n") {
             Some(index) => {
-                let complete = text[..index + 2].to_string();
-                text = text[index + 2..].to_string();
+                let complete = String::from_utf8_lossy(&text[..index + 2]).into_owned();
+                text.drain(..index + 2);
                 complete
             }
             None => String::new(),
@@ -72,7 +78,7 @@ pub fn aggregate_responses(body: impl Read) -> Result<Aggregated, String> {
     }
 
     // The last event may not have been separated by a blank line.
-    let rest = std::mem::take(&mut text);
+    let rest = String::from_utf8_lossy(&std::mem::take(&mut text)).into_owned();
     if !rest.trim().is_empty()
         && let Some(value) = parse_event(&rest)
         && let Some(result) = classify(&value)
@@ -178,6 +184,41 @@ fn parse_event(event: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader that hands back one byte at a time, so every multi-byte
+    /// character straddles a read boundary.
+    struct Trickle {
+        data: Vec<u8>,
+        at: usize,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_a_read_keeps_its_bytes() {
+        // The aggregated body is what a non-streaming client receives, so a
+        // character torn at a read boundary would corrupt the answer itself.
+        let stream = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output_text\":\"héllo wörld ✓\"}}\n\n";
+        let data = stream.as_bytes().to_vec();
+
+        let Aggregated::Completed(value) = aggregate_responses(Trickle { data, at: 0 }).unwrap()
+        else {
+            panic!("expected a completed response")
+        };
+
+        let text = value["output_text"].as_str().expect("a string");
+        assert_eq!(text, "héllo wörld ✓");
+        assert!(!text.contains('\u{FFFD}'), "{text}");
+    }
 
     #[test]
     fn a_completed_stream_collapses_into_the_response() {

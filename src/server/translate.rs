@@ -463,7 +463,14 @@ struct ToolCall {
 /// the whole answer has been received.
 pub struct ResponsesToChatStream<R> {
     source: R,
-    buffer: String,
+    /// Bytes that have arrived but do not yet form a complete event.
+    ///
+    /// A buffer of *bytes* rather than a `String`, because a read boundary
+    /// falls wherever the socket puts it and a multi-byte character can
+    /// straddle one. Decoding per read would replace half a character with
+    /// `U+FFFD`; the buffer is decoded only up to a blank line, which is an
+    /// ASCII boundary and therefore a whole-character one.
+    buffer: Vec<u8>,
     pending: Vec<u8>,
     finished: bool,
     id: String,
@@ -478,7 +485,7 @@ impl<R: Read> ResponsesToChatStream<R> {
     pub fn new(source: R) -> ResponsesToChatStream<R> {
         ResponsesToChatStream {
             source,
-            buffer: String::new(),
+            buffer: Vec::new(),
             pending: Vec::new(),
             finished: false,
             id: "chatcmpl-unknown".to_string(),
@@ -823,21 +830,18 @@ impl<R: Read> Read for ResponsesToChatStream<R> {
             let read = self.source.read(&mut chunk)?;
             if read == 0 {
                 self.finished = true;
-                // Flush whatever is left, in case it is a final event with no
-                // trailing blank line.
+                // Flush whatever is left: it is a final event that never got
+                // its trailing blank line. `split_events` yields it as one
+                // event, so it is translated exactly once.
                 let rest = std::mem::take(&mut self.buffer);
-                for event in split_events(&rest) {
-                    if let Some(value) = parse_event(&event) {
-                        let out = self.translate_event(&value);
-                        self.pending.extend_from_slice(&out);
+                if !rest.is_empty() {
+                    let text = String::from_utf8_lossy(&rest);
+                    for event in split_events(&text) {
+                        if let Some(value) = parse_event(&event) {
+                            let out = self.translate_event(&value);
+                            self.pending.extend_from_slice(&out);
+                        }
                     }
-                }
-                // A final event that never got its blank line.
-                if !rest.trim().is_empty()
-                    && let Some(value) = parse_event(&rest)
-                {
-                    let out = self.translate_event(&value);
-                    self.pending.extend_from_slice(&out);
                 }
                 if self.pending.is_empty() {
                     return Ok(0);
@@ -845,14 +849,13 @@ impl<R: Read> Read for ResponsesToChatStream<R> {
                 continue;
             }
 
-            self.buffer
-                .push_str(&String::from_utf8_lossy(&chunk[..read]));
+            self.buffer.extend_from_slice(&chunk[..read]);
 
             // Translate every complete event we have.
             let mut events: Vec<String> = Vec::new();
-            while let Some(index) = self.buffer.find("\n\n") {
-                let event: String = self.buffer.drain(..index + 2).collect();
-                events.push(event);
+            while let Some(index) = blank_line(&self.buffer) {
+                let event: Vec<u8> = self.buffer.drain(..index + 2).collect();
+                events.push(String::from_utf8_lossy(&event).into_owned());
             }
 
             for event in &events {
@@ -872,6 +875,15 @@ impl<R: Read> Read for ResponsesToChatStream<R> {
 /// Encode one event as a server-sent event.
 fn encode_event(value: &Value) -> Vec<u8> {
     format!("data: {value}\n\n").into_bytes()
+}
+
+/// The offset of the first blank line in a byte buffer.
+///
+/// A complete server-sent event ends with `\n\n`. Because `\n` cannot appear
+/// inside a multi-byte character, a region ending at one is whole UTF-8 and
+/// can be decoded without splitting a character.
+fn blank_line(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|pair| pair == b"\n\n")
 }
 
 /// Split a buffer into complete server-sent events.
@@ -907,6 +919,71 @@ fn parse_event(event: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader that hands back `size` bytes at a time, so the read boundary
+    /// falls wherever the test wants it.
+    struct Trickle {
+        data: Vec<u8>,
+        at: usize,
+        size: usize,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.data.len() - self.at;
+            let take = left.min(buf.len()).min(self.size);
+            buf[..take].copy_from_slice(&self.data[self.at..self.at + take]);
+            self.at += take;
+            Ok(take)
+        }
+    }
+
+    /// Run a stream through the translator and return what the client sees.
+    fn translate(stream: &str, read_size: usize) -> String {
+        let data = stream.as_bytes().to_vec();
+        let mut subject = ResponsesToChatStream::new(Trickle {
+            data,
+            at: 0,
+            size: read_size,
+        });
+        let mut out = Vec::new();
+        subject.read_to_end(&mut out).expect("the stream reads");
+        String::from_utf8(out).expect("the output is UTF-8")
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_a_read_keeps_its_bytes() {
+        // One byte per read puts the boundary between the two bytes of every
+        // `é`. Decoding each read on its own would replace each half with
+        // U+FFFD, which is what this test exists to prevent.
+        let stream = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ééé\"}\n\n";
+
+        for read_size in [1, 2, 3, 5, 7, 11] {
+            let text = translate(stream, read_size);
+            assert!(
+                !text.contains('\u{FFFD}'),
+                "read size {read_size} corrupted the text: {text}"
+            );
+            assert!(
+                text.contains("ééé"),
+                "read size {read_size} lost the text: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_final_event_without_a_blank_line_is_translated_once() {
+        // The stream ends without its trailing blank line. `split_events`
+        // yields the leftover as one event, so it must not be parsed twice.
+        let stream = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}";
+        let text = translate(stream, 4096);
+
+        assert_eq!(
+            text.matches("\"content\":\"hi\"").count(),
+            1,
+            "the tail was translated more than once: {text}"
+        );
+    }
 
     #[test]
     fn a_chat_request_becomes_a_responses_request() {
