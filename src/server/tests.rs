@@ -814,6 +814,60 @@ fn the_health_endpoint_needs_no_key() {
 }
 
 #[test]
+fn a_known_endpoint_with_the_wrong_method_answers_405() {
+    // `404` would say the endpoint does not exist, and send the user looking
+    // for a typo. It exists; it takes a different method.
+    let stub = Stub::start(|_| Reply::json(404, "{}"));
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    for path in ["/v1/models", "/health", "/v1/last-inference"] {
+        let response = agent()
+            .post(harness.url(path))
+            .header("Authorization", "Bearer secret-key")
+            .header("Content-Type", "application/json")
+            .send(json!({}).to_string())
+            .expect("the proxy answers");
+
+        assert_eq!(response.status().as_u16(), 405, "POST {path}");
+        // RFC 9110 requires the header on a 405, so a client can correct
+        // itself without being told twice.
+        assert_eq!(
+            response
+                .headers()
+                .get("allow")
+                .and_then(|value| value.to_str().ok()),
+            Some("GET"),
+            "POST {path} is missing `Allow: GET`"
+        );
+
+        let body = read_json_body(response);
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{path}");
+        assert_eq!(body["error"]["code"], "method_not_allowed", "{path}");
+    }
+}
+
+#[test]
+fn a_get_on_an_inference_endpoint_answers_405() {
+    let stub = Stub::start(|_| Reply::json(404, "{}"));
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    let response = agent()
+        .get(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .call()
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 405);
+    assert_eq!(
+        response
+            .headers()
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+}
+
+#[test]
 fn an_unknown_endpoint_answers_404_in_the_openai_shape() {
     let stub = Stub::start(|_| Reply::json(404, "{}"));
     let harness = harness(&stub, "secret-key", "grok-token");

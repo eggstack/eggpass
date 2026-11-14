@@ -301,21 +301,55 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
 
     let path = request.path().to_string();
     let route = router::route(&path);
+    let method = request.method.as_str();
 
-    match (request.method.as_str(), route) {
-        ("GET", router::Route::Health) => health::handle(),
-        ("GET", router::Route::LastInference) => inference::handle(context),
-        ("GET", router::Route::Models) => models::list(&request, context),
-        ("GET", router::Route::Model(id)) => models::single(&request, context, &id),
-        ("POST", router::Route::ChatCompletions) | ("POST", router::Route::Responses) => {
-            chat::complete(&request, context)
-        }
-        _ => openai_error(
+    // The method is matched *after* the route, so an endpoint that exists and
+    // takes a different method answers `405` rather than claiming not to
+    // exist. A `404` there sends the user looking for a typo in the path.
+    match route {
+        router::Route::Health => match method {
+            "GET" => health::handle(),
+            _ => method_not_allowed(method, "GET"),
+        },
+        router::Route::LastInference => match method {
+            "GET" => inference::handle(context),
+            _ => method_not_allowed(method, "GET"),
+        },
+        router::Route::Models => match method {
+            "GET" => models::list(&request, context),
+            _ => method_not_allowed(method, "GET"),
+        },
+        router::Route::Model(id) => match method {
+            "GET" => models::single(&request, context, &id),
+            _ => method_not_allowed(method, "GET"),
+        },
+        router::Route::ChatCompletions | router::Route::Responses => match method {
+            "POST" => chat::complete(&request, context),
+            _ => method_not_allowed(method, "POST"),
+        },
+        router::Route::NotFound => openai_error(
             404,
             &format!("unknown endpoint `{path}`"),
             "invalid_request_error",
         ),
     }
+}
+
+/// The route exists but does not serve this method.
+///
+/// RFC 9110 requires the `Allow` header on a `405`, and a client that reads it
+/// can correct itself without being told again.
+fn method_not_allowed(method: &str, allowed: &str) -> Response {
+    let mut response = openai_error_with_code(
+        405,
+        &format!("`{method}` is not allowed here; this endpoint takes `{allowed}`"),
+        "invalid_request_error",
+        Some("method_not_allowed"),
+    );
+    response
+        .headers
+        .push(("Allow".to_string(), allowed.to_string()));
+    response
 }
 
 /// Whether any client key is configured at all.

@@ -937,3 +937,10 @@ needs a key when one is configured. The key may arrive as `Authorization: Bearer
 `eggpass key add` issued or the `api_key` in the config file. A request
 without an accepted key is a `401` in the OpenAI error shape. The client's key
 is stripped before the request is forwarded upstream.
+
+**Statuses.** An endpoint that does not exist answers `404 unknown endpoint`.
+An endpoint that exists and takes a different method answers `405` with the
+`Allow` header RFC 9110 requires — `POST` to `/v1/models`, `/health` or
+`/v1/last-inference`, or `GET` to `/v1/chat/completions`. The distinction
+matters: a `404` on a correct path sends the reader looking for a typo that is
+not there.

@@ -79,6 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapses a stream for a non-streaming client, where it corrupted the answer
   body itself.
 
+- **A known endpoint with the wrong method answers `405`, not `404`.** `POST`
+  to `/v1/models`, `/health` or `/v1/last-inference` — and `GET` to
+  `/v1/chat/completions` — used to answer `404 unknown endpoint`, which sends
+  the user looking for a typo in a path that is correct. The answer is now
+  `405` with the `Allow` header RFC 9110 requires.
+
 - **A multi-byte character in a log message no longer panics.** The redactor
   walked a message a byte at a time and sliced the string at those offsets,
   which is not always a character boundary: an em dash near the start of a

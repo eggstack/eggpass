@@ -6,7 +6,6 @@ rust-version = "1.89"
 description = "A lightweight, local, OpenAI-compatible proxy for Grok and ChatGPT, authenticated with your own subscription over OAuth"
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/eggstack/eggpass"
 repository = "https://github.com/eggstack/eggpass"
 documentation = "https://docs.rs/eggpass"
 keywords = ["grok", "chatgpt", "openai", "proxy", "oauth"]
