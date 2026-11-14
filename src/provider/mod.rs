@@ -8,6 +8,7 @@
 //! third provider is a matter of writing one more spec.
 
 pub mod openai;
+pub mod usage;
 pub mod xai;
 
 use serde_json::Value;
@@ -19,6 +20,14 @@ pub enum ProviderId {
     Xai,
     /// ChatGPT, reached through Sign in with ChatGPT for Open Source.
     OpenAi,
+}
+
+impl serde::Serialize for ProviderId {
+    /// The provider's configuration-file spelling, so a machine-readable
+    /// report names a provider the way the rest of the tool does.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 impl ProviderId {
@@ -176,6 +185,8 @@ pub struct ProviderRuntime {
     pub client: crate::auth::OAuthClient,
     /// The token manager.
     pub tokens: crate::auth::TokenManager,
+    /// How long a request to this provider may take.
+    pub timeouts: crate::config::Timeouts,
 }
 
 impl ProviderRuntime {
@@ -200,7 +211,13 @@ impl ProviderRuntime {
             spec,
             client,
             tokens,
+            timeouts: config.timeouts,
         }
+    }
+
+    /// What this provider can say about its own allowance.
+    pub fn usage(&self) -> usage::ProviderUsage {
+        usage::collect(self.spec.id, self)
     }
 }
 

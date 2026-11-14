@@ -43,6 +43,13 @@ eggup-acquisition = "0.2.0"
 eggup-core = "0.2.0"
 eggup-eggpack = "0.2.0"
 eggup-eggfetch = "0.2.0"
+# The local UTC offset, for the reset times `eggpass usage` prints.
+#
+# `libc` is already in the lockfile through `nix`, `dirs` and `ureq`, so
+# promoting it to a direct dependency adds no new transitive crate and no
+# version churn. `nix`'s own `time` feature was checked and does not expose
+# `localtime_r`, so `nix` cannot do this.
+libc = "0.2.191"
 # `term` brings in `nix::sys::termios` and `nix::pty`, which the interactive
 # provider picker uses for raw mode and for its pseudoterminal tests.
 nix = { version = "0.31.3", features = ["signal", "process", "term"] }

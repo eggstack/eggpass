@@ -356,6 +356,7 @@ dependencies = [
  "eggup-core",
  "eggup-eggfetch",
  "eggup-eggpack",
+ "libc",
  "nix 0.31.3",
  "rand",
  "serde",

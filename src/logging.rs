@@ -236,7 +236,10 @@ fn find_jwt(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut index = 0usize;
     while index + 3 <= bytes.len() {
-        if &text[index..index + 3] == "eyJ" {
+        // The comparison is on bytes, not on a slice of the string: a byte
+        // index is not always a character boundary, and a message carrying an
+        // em dash or any other multi-byte character must not panic here.
+        if bytes[index..index + 3] == *b"eyJ" {
             return Some(index);
         }
         index += 1;
@@ -313,5 +316,22 @@ mod tests {
     fn ordinary_text_survives() {
         let text = "GET /v1/chat/completions model=grok-4.7 status=200";
         assert_eq!(redact(text), text);
+    }
+
+    #[test]
+    fn a_multi_byte_character_does_not_panic() {
+        // The redactor walked the message a byte at a time and sliced the
+        // string at those offsets, which is not a character boundary.
+        let text = "not signed in — run `eggpass login`";
+        assert_eq!(redact(text), text);
+
+        let text = "unavailable — the provider answered HTTP 404 — ok";
+        assert_eq!(redact(text), text);
+
+        // A multi-byte character immediately before a JWT still scrubs it.
+        let text = "— eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefg";
+        let out = redact(text);
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "{out}");
+        assert!(out.starts_with('—'), "{out}");
     }
 }

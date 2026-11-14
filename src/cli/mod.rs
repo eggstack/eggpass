@@ -162,6 +162,7 @@ fn dispatch(context: &Context) -> Result<(), CommandError> {
         } => commands::login::login(context, *device, *oauth, *provider),
         Command::Logout { provider } => commands::login::logout(context, *provider),
         Command::Status => commands::status::status(context),
+        Command::Usage { provider, json } => commands::usage::usage(context, *provider, *json),
         Command::Run { foreground } => commands::run::run(context, *foreground),
         Command::Stop => commands::run::stop(context),
         Command::Restart => commands::run::restart(context),

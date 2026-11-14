@@ -126,6 +126,21 @@ impl UpstreamClient {
 
     /// Build a client for a provider, with explicit timeouts.
     pub fn with_timeouts(spec: &ProviderSpec, timeouts: crate::config::Timeouts) -> UpstreamClient {
+        UpstreamClient::for_endpoint(&spec.base_url, &spec.extra_headers, timeouts)
+    }
+
+    /// Build a client for an endpoint that is not the provider's inference base.
+    ///
+    /// Some provider endpoints do not live on the inference base URL — x.ai's
+    /// billing endpoint lives on the CLI proxy whatever the configured
+    /// upstream is — and some need headers the inference request does not
+    /// carry. This builds a client for such an endpoint without touching the
+    /// provider's spec.
+    pub fn for_endpoint(
+        base_url: &str,
+        extra: &[(&'static str, String)],
+        timeouts: crate::config::Timeouts,
+    ) -> UpstreamClient {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(timeouts.connect_seconds)))
@@ -135,11 +150,12 @@ impl UpstreamClient {
             .build();
 
         UpstreamClient {
-            base_url: spec.base_url.trim_end_matches('/').to_string(),
-            extra: spec.extra_headers.clone(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            extra: extra.to_vec(),
             agent: ureq::Agent::new_with_config(config),
         }
     }
+
     /// Send a request to the upstream.
     pub fn send(
         &self,

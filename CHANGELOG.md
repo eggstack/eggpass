@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`eggpass usage` reports how much of the subscription allowance is used.**
+  One fresh read per provider, on demand: no polling, no cache, and no daemon
+  required — it works with the proxy stopped. Each provider gets a block with
+  a percentage bar, the quota window, the reset time in your own timezone and
+  the purchased credit. `--provider` narrows it to one provider and `--json`
+  prints the report as JSON.
+
+  The x.ai block reads the CLI proxy's billing endpoint with the token
+  `eggpass` already stores, and the ChatGPT block says **unavailable**:
+  Sign in with ChatGPT exposes no quota API, so there is no honest number to
+  print. The block says so, links OpenAI's own usage page and lists the three
+  error codes OpenAI does publish.
+
+  Two rules the output never breaks. A missing percentage reads `unavailable`
+  and never `0% used` — the billing endpoint is proto3 JSON and omits
+  zero-valued scalars, so an absent field means the provider did not say.
+  And the x.ai block carries a caption saying which pool the number belongs
+  to: on the default `api` upstream, `eggpass`'s requests are billed against
+  the xAI API tier and do not draw from the consumer subscription the billing
+  endpoint reports.
+
 ### Security
 
 - **A client key is required to run.** `eggpass run`, `restart` and
@@ -27,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at a word boundary, so `key=…` is removed while `monkey=…` is left alone.
 
 ### Fixed
+
+- **A multi-byte character in a log message no longer panics.** The redactor
+  walked a message a byte at a time and sliced the string at those offsets,
+  which is not always a character boundary: an em dash near the start of a
+  message aborted the process. The comparison is on bytes now.
 
 - **A malformed chunked body no longer aborts the daemon.** A chunk size of
   `ffffffffffffffff` is refused with `413`. A chunk-size, trailer, or

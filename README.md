@@ -125,6 +125,7 @@ in [docs/client-setup.md](docs/client-setup.md).
 | `eggpass login` | Authenticate with a provider over OAuth. `--device` for headless (x.ai only). |
 | `eggpass logout` | Revoke the credential at the provider, then delete it. |
 | `eggpass status` | Show the account state and the daemon state. |
+| `eggpass usage` | Show how much of the subscription allowance is used. One fresh read per provider; `--json` prints the report as JSON. |
 | `eggpass run` | Start the server as a background daemon. `--foreground` to stay in the terminal. |
 | `eggpass stop` | Stop the daemon. |
 | `eggpass restart` | Stop the daemon, then start it again. |

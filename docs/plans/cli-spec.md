@@ -31,10 +31,10 @@ and the config file is what survives a restart. They exist so a supervised
 daemon can be pointed at a different address without editing the config.
 
 `--provider <id>` applies to the commands that talk to a provider (`login`,
-`logout`). It is the non-interactive path into every command: with it set, the
-picker is never drawn and stdin is never read, so the command behaves the same
-whether it is run from a terminal, a pipe or cron. An unknown provider id is
-an error, not a silent fallback.
+`logout`, `usage`). It is the non-interactive path into every command: with it
+set, the picker is never drawn and stdin is never read, so the command behaves
+the same whether it is run from a terminal, a pipe or cron. An unknown
+provider id is an error, not a silent fallback.
 
 ---
 
@@ -653,6 +653,85 @@ Revoked key #2 (sk-eggpass-qR7xZ9mT).
 
 **Exit codes:** `0` ok · `1` the key number does not exist, the store could not
 be read or written, or the arguments were wrong.
+
+---
+
+## `eggpass usage`
+
+Report how much of the subscription allowance is used.
+
+```
+eggpass usage                  # every provider you are signed in to
+eggpass usage --provider xai   # one provider
+eggpass usage --json           # the report as JSON
+```
+
+**Behaviour**
+
+1. **One fresh read per provider.** Each provider is asked once, on this run,
+   and the command ends. There is no polling, no cache, and no background
+   refresh: a cached reading is a number that might be wrong, and this command
+   exists to be right.
+2. **No daemon is needed.** The credential file is read and the provider is
+   asked directly, exactly as `status`'s model count does. The command works
+   with the proxy stopped.
+3. **No state of its own.** `usage` writes no cache, no config and no key
+   store. It may *trigger* a token refresh — that is the `TokenManager`'s job,
+   and it writes the credential file — but it adds nothing of its own.
+4. **A provider that is not signed in still gets a block**, so the output does
+   not change shape, and no network call is made for it.
+5. **A provider that fails still gets a block**, and the failure is stated
+   rather than swallowed. The upstream body is never printed: it carries the
+   account's email, its user id and its balances.
+
+**Output** — one block per provider, in the fixed provider order, a blank line
+between blocks, no colour:
+
+```
+x.ai · SuperGrok
+  Weekly      ████░░░░░░░░░░░░░░░░  20% used
+  Resets      Nov 20, 03:07 (UTC)
+  Api             ██░░░░░░░░░░░░░░░░░░  10% used
+  Prepaid     $0.00
+  This is your Grok subscription. `eggpass` requests are billed separately against the xAI API tier.
+
+ChatGPT
+  Usage       unavailable — Sign in with ChatGPT does not expose a quota API
+  Limits      https://chatgpt.com/settings/usage
+  Signals     429 subscription_sharing_usage_limit_exceeded
+              503 subscription_sharing_usage_unavailable
+              403 subscription_sharing_user_not_eligible
+```
+
+**The rules the output follows**
+
+- **The label column is twelve characters wide**, so every value starts in the
+  same place.
+- **The bar is twenty cells**, `█` filled and `░` empty. A non-zero
+  percentage always shows at least one cell, and the bar is omitted entirely
+  when the percentage is unavailable.
+- **The number is the amount *used*.** It reads `20% used`, never `20% left`.
+- **Missing is not zero.** The Grok billing endpoint is proto3 JSON and omits
+  zero-valued scalars, so an absent percentage means the provider did not
+  say. It reads `unavailable`, never `0% used`.
+- **An explicit state replaces the percentage.** When the provider says the
+  account is not eligible, that is the answer and no number is shown.
+- **The reset time is local**, with its offset, because `Nov 18, 09:00` alone
+  is ambiguous. The year appears only when it differs from the current year.
+  A reset more than an hour in the past is marked `(stale)`.
+- **The caption is not optional.** On the default `api` upstream, `eggpass`'s
+  inference is metered against the xAI API tier and does **not** draw from
+  the consumer subscription the billing endpoint reports. The caption says
+  which pool the number belongs to, and it changes with
+  `providers.xai.upstream`.
+- **ChatGPT is unavailable, and says why.** Sign in with ChatGPT exposes no
+  quota API, so the block names the authentication mode, links OpenAI's own
+  usage page, and lists the three error codes OpenAI does publish. It never
+  infers a number.
+
+**Exit codes:** `0` at least one provider produced a block · `1` the arguments
+were wrong, or every provider failed operationally · `2` no provider is signed
+in on this machine.
 
 ---
 

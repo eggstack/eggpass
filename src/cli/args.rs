@@ -28,6 +28,13 @@ pub enum Command {
     },
     /// Report account and daemon state.
     Status,
+    /// Report how much of the subscription allowance is used.
+    Usage {
+        /// The provider to ask, when it was named.
+        provider: Option<ProviderId>,
+        /// Print the report as JSON.
+        json: bool,
+    },
     /// Start the server as a background daemon.
     Run {
         /// Stay in the foreground instead of detaching.
@@ -272,6 +279,24 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
             expect_no_args(&name, &rest)?;
             Command::Status
         }
+        "usage" => {
+            let mut json = false;
+            for arg in &rest {
+                if arg == "--json" {
+                    json = true;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    return Err(UsageError {
+                        message: format!("unknown option `{arg}` for `eggpass usage`"),
+                    });
+                }
+                return Err(UsageError {
+                    message: format!("`eggpass usage` takes no arguments (got `{arg}`)"),
+                });
+            }
+            Command::Usage { provider, json }
+        }
         "run" => {
             let mut foreground = false;
             for arg in &rest {
@@ -504,6 +529,7 @@ pub fn global_help() -> String {
              login       Authenticate with a provider over OAuth\n    \
              logout      Revoke and remove stored credentials\n    \
              status      Show account and daemon state\n    \
+             usage       Show how much of the subscription allowance is used\n    \
              run         Start the server as a background daemon\n    \
              stop        Stop the running daemon\n    \
              restart     Stop the daemon, then start it again\n    \
@@ -539,6 +565,15 @@ pub fn command_help(name: &str) -> String {
             lists the providers you are signed in to.\n"
             .to_string(),
         "status" => "eggpass status\n\nShow account state and daemon state.\n".to_string(),
+        "usage" => {
+            "eggpass usage [--json]\n\n\
+            Show how much of the subscription allowance is used. Each provider\n\
+            is asked once, on this run, and the answer is printed and the\n\
+            command ends. Without --provider every provider you are signed in\n\
+            to is asked.\n\n\
+             --json   Print the report as JSON instead of the bars\n"
+                .to_string()
+        }
         "run" => "eggpass run [--foreground]\n\nStart the server as a background daemon.\n\n\
             --foreground   Stay in the foreground instead of detaching\n"
             .to_string(),
@@ -822,5 +857,80 @@ mod tests {
             panic!("expected help")
         };
         assert!(text.contains("revoke"), "{text}");
+    }
+
+    #[test]
+    fn usage_parses() {
+        assert!(matches!(
+            parse_args(&["usage"]).unwrap(),
+            ParseOutcome::Run(Cli {
+                command: Command::Usage {
+                    provider: None,
+                    json: false
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn usage_takes_a_provider_after_the_subcommand() {
+        let ParseOutcome::Run(cli) = parse_args(&["usage", "--provider", "xai"]).unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Usage {
+                provider: Some(ProviderId::Xai),
+                json: false
+            }
+        );
+    }
+
+    #[test]
+    fn usage_takes_a_provider_before_the_subcommand() {
+        let ParseOutcome::Run(cli) = parse_args(&["--provider", "xai", "usage"]).unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Usage {
+                provider: Some(ProviderId::Xai),
+                json: false
+            }
+        );
+    }
+
+    #[test]
+    fn usage_takes_json() {
+        let ParseOutcome::Run(cli) = parse_args(&["usage", "--json"]).unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Usage {
+                provider: None,
+                json: true
+            }
+        );
+    }
+
+    #[test]
+    fn usage_takes_no_arguments() {
+        assert!(parse_args(&["usage", "extra"]).is_err());
+        assert!(parse_args(&["usage", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn an_unknown_provider_is_an_error() {
+        assert!(parse_args(&["usage", "--provider", "nonesuch"]).is_err());
+    }
+
+    #[test]
+    fn the_usage_command_has_its_own_help() {
+        let ParseOutcome::Help(text) = parse_args(&["usage", "--help"]).unwrap() else {
+            panic!("expected help")
+        };
+        assert!(text.contains("--json"), "{text}");
     }
 }
