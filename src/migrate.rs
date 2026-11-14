@@ -61,6 +61,7 @@ pub fn migrate(paths: &Paths) -> Result<Migration, std::io::Error> {
     let config_is_default = paths.config_file() == paths.dir().join(crate::paths::CONFIG_FILE_NAME);
     if config_is_default && legacy_config.is_file() {
         std::fs::copy(&legacy_config, paths.config_file())?;
+        crate::paths::restrict_permissions(paths.config_file(), 0o600)?;
         moved.push(crate::paths::CONFIG_FILE_NAME.to_string());
     }
 

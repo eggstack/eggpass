@@ -7,6 +7,7 @@
 
 pub mod aggregator;
 pub mod chat;
+pub mod guard;
 pub mod health;
 pub mod http;
 pub mod models;
@@ -46,9 +47,11 @@ pub struct ProviderHandle {
 pub struct ServerContext {
     /// The address the server is bound to.
     ///
-    /// A server that is not on loopback refuses unauthenticated requests, so
-    /// a proxy on the network is never an open one.
+    /// The authority guard uses it, along with `port`, to name the host the
+    /// server answers to.
     pub host: String,
+    /// The port the server is listening on.
+    pub port: u16,
     /// A key clients may present, taken from the configuration file.
     ///
     /// Empty means there is no such key. The keys `eggpass` issued are
@@ -172,33 +175,75 @@ impl Server {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, flag.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
 
+        // The gate sees the request head before the body is read, so an
+        // unauthenticated client never gets its body buffered. The handler
+        // checks again: the gate is an early refusal, not the authority.
+        let gate = {
+            let context = Arc::clone(&context);
+            Arc::new(move |request: &Request| pre_authorize(request, &context)) as http::Gate
+        };
+
         let handler = {
             let context = Arc::clone(&context);
-            Arc::new(move |request: Request| handle_request(request, &context))
-                as Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>
+            Arc::new(move |request: Request| handle_request(request, &context)) as http::Handler
         };
 
         // The server waits for the in-flight connections itself, so a stream
         // that is halfway out when the signal arrives still finishes.
-        Arc::clone(&self.http).serve(self.shutdown.clone(), handler);
+        Arc::clone(&self.http).serve(self.shutdown.clone(), gate, handler);
     }
+}
+
+/// Decide whether a request may proceed, from its head and the context.
+///
+/// Returns the refusal when it may not. This runs twice: once as the HTTP
+/// server's gate, before the body is read, and once at the top of
+/// [`handle_request`]. Both call this function, so the two checks cannot
+/// drift apart.
+fn pre_authorize(request: &Request, context: &ServerContext) -> Option<Response> {
+    if let Some(refusal) = guard::check(request, &context.host, context.port) {
+        return Some(refusal);
+    }
+
+    // The health probe is never authenticated: `status` and `croncheck` use
+    // it, and it carries nothing but a version string.
+    if matches!(router::route(request.path()), router::Route::Health) {
+        return None;
+    }
+
+    // A server with no key at all refuses everything. `eggpass run` will not
+    // start in this state, but the keys can be revoked while it runs.
+    if !keys_configured(context) {
+        return Some(openai_error_with_code(
+            401,
+            "no client key is configured on this server; run `eggpass key add`",
+            "invalid_request_error",
+            Some("no_api_key"),
+        ));
+    }
+
+    if !is_authorized(context, request) {
+        return Some(openai_error(
+            401,
+            "missing or invalid API key",
+            "invalid_request_error",
+        ));
+    }
+
+    None
 }
 
 /// Route a request and produce a response.
 fn handle_request(request: Request, context: &ServerContext) -> Response {
+    if let Some(refusal) = pre_authorize(&request, context) {
+        return refusal;
+    }
+
     let path = request.path().to_string();
     let route = router::route(&path);
 
-    // The health probe is never authenticated.
-    if matches!(route, router::Route::Health) {
-        return health::handle();
-    }
-
-    if !is_authorized(context, &request) {
-        return openai_error(401, "missing or invalid API key", "invalid_request_error");
-    }
-
     match (request.method.as_str(), route) {
+        ("GET", router::Route::Health) => health::handle(),
         ("GET", router::Route::Models) => models::list(&request, context),
         ("GET", router::Route::Model(id)) => models::single(&request, context, &id),
         ("POST", router::Route::ChatCompletions) | ("POST", router::Route::Responses) => {
@@ -212,21 +257,23 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
     }
 }
 
+/// Whether any client key is configured at all.
+pub fn keys_configured(context: &ServerContext) -> bool {
+    !context.api_key.is_empty() || !context.keys.is_empty()
+}
+
 /// Whether the request carries a key we accept.
 ///
 /// A key may arrive as `Authorization: Bearer`, as `X-Api-Key`, or as a `key`
 /// query parameter, and may be one of the keys `eggpass` issued or the one
 /// written in the configuration file.
 ///
-/// When no key is configured at all, the request is allowed — but only while
-/// the server is on loopback. A server that is reachable from the network
-/// refuses everything, because an unauthenticated proxy on someone's paid
-/// plan is an open proxy.
+/// A server with no key configured accepts nothing. The loopback exception
+/// that used to live here was not a boundary — a web page can reach loopback,
+/// so "open on loopback" meant "open to any page the user visits".
 pub fn is_authorized(context: &ServerContext, request: &Request) -> bool {
-    let configured = !context.api_key.is_empty() || !context.keys.is_empty();
-
-    if !configured {
-        return crate::config::is_loopback_host(&context.host);
+    if !keys_configured(context) {
+        return false;
     }
 
     for candidate in presented_keys(request) {
@@ -335,6 +382,7 @@ mod authorisation_tests {
     fn context_with_key(key: &str) -> ServerContext {
         ServerContext {
             host: "127.0.0.1".to_string(),
+            port: 8484,
             api_key: key.to_string(),
             keys: empty_store(),
             providers: HashMap::new(),
@@ -358,10 +406,34 @@ mod authorisation_tests {
         }
     }
 
+    fn health_request() -> Request {
+        Request {
+            method: "GET".to_string(),
+            target: "/health".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
     #[test]
-    fn an_empty_key_accepts_everything_on_loopback() {
+    fn a_server_with_no_key_refuses_everything() {
         let context = context_with_key("");
-        assert!(is_authorized(&context, &request_with(vec![], "")));
+
+        assert!(!is_authorized(&context, &request_with(vec![], "")));
+        assert!(!is_authorized(
+            &context,
+            &request_with(vec![("Authorization", "Bearer anything")], "")
+        ));
+
+        let refusal = pre_authorize(&request_with(vec![], ""), &context).expect("refused");
+        assert_eq!(refusal.status, 401);
+    }
+
+    #[test]
+    fn the_health_probe_needs_no_key() {
+        let context = context_with_key("");
+        assert!(pre_authorize(&health_request(), &context).is_none());
     }
 
     #[test]
@@ -426,14 +498,47 @@ mod authorisation_tests {
     }
 
     #[test]
-    fn revoking_the_last_key_leaves_the_endpoint_open_on_loopback() {
+    fn revoking_the_last_key_closes_the_endpoint() {
         let context = context_with_key("");
-        context.keys.add(None).expect("key");
+        let (_, plain) = context.keys.add(None).expect("key");
+        assert!(is_authorized(
+            &context,
+            &request_with(vec![("Authorization", &format!("Bearer {plain}"))], "")
+        ));
+
         context.keys.revoke(1).expect("revoke");
 
-        // No key configured at all is the default posture: the socket is on
-        // loopback, so nothing outside this machine can reach it.
-        assert!(is_authorized(&context, &request_with(vec![], "")));
+        // Nothing is configured now, so the running server refuses every
+        // request rather than reopening the loopback socket.
+        assert!(!is_authorized(
+            &context,
+            &request_with(vec![("Authorization", &format!("Bearer {plain}"))], "")
+        ));
+        let refusal = pre_authorize(&request_with(vec![], ""), &context).expect("refused");
+        assert_eq!(refusal.status, 401);
+    }
+
+    #[test]
+    fn a_foreign_host_is_refused_before_the_key_is_considered() {
+        let context = context_with_key("secret");
+        let request = request_with(vec![("Host", "evil.example:8484")], "");
+
+        let refusal = pre_authorize(&request, &context).expect("refused");
+        assert_eq!(refusal.status, 421);
+    }
+
+    #[test]
+    fn a_loopback_host_is_accepted() {
+        let context = context_with_key("secret");
+        let request = request_with(
+            vec![
+                ("Host", "127.0.0.1:8484"),
+                ("Authorization", "Bearer secret"),
+            ],
+            "",
+        );
+
+        assert!(pre_authorize(&request, &context).is_none());
     }
 
     #[test]
@@ -464,6 +569,7 @@ mod authorisation_tests {
     fn the_upstream_slots_are_bounded() {
         let context = ServerContext {
             host: "127.0.0.1".to_string(),
+            port: 8484,
             api_key: String::new(),
             keys: empty_store(),
             providers: HashMap::new(),

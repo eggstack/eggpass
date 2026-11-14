@@ -353,8 +353,13 @@ fn harness_with_spec(
         },
     );
 
+    let server = Server::bind_with_limits("127.0.0.1", 0, crate::config::ServerLimits::default())
+        .expect("proxy binds");
+    let port = server.address().port();
+
     let context = Arc::new(ServerContext {
         host: "127.0.0.1".to_string(),
+        port,
         api_key: api_key.to_string(),
         keys: Arc::clone(&keys),
         providers,
@@ -364,9 +369,6 @@ fn harness_with_spec(
         max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
     });
 
-    let server = Server::bind_with_limits("127.0.0.1", 0, crate::config::ServerLimits::default())
-        .expect("proxy binds");
-    let port = server.address().port();
     let running = Arc::clone(&server);
     std::thread::spawn(move || running.serve(context));
 
@@ -411,10 +413,11 @@ fn a_chat_completion_round_trips() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let response = agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(chat_body().to_string())
         .expect("the proxy answers");
@@ -428,10 +431,11 @@ fn a_chat_completion_round_trips() {
 #[test]
 fn the_clients_credentials_never_reach_the_upstream() {
     let stub = Stub::start(|_| Reply::json(200, r#"{"ok":true}"#));
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .header("Authorization", "Bearer client-secret")
         .header("X-Api-Key", "client-secret")
@@ -465,10 +469,11 @@ fn a_streaming_response_arrives_incrementally() {
             (Duration::from_millis(500), "data: [DONE]\n\n".to_string()),
         ],
     });
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let response = agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(json!({"model": "grok-4.7", "messages": [], "stream": true}).to_string())
         .expect("the proxy answers");
@@ -537,10 +542,11 @@ fn an_upstream_401_triggers_one_refresh_and_one_retry() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness(&stub, "", "stale-token");
+    let harness = harness(&stub, "secret-key", "stale-token");
 
     let response = agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(chat_body().to_string())
         .expect("the proxy answers");
@@ -673,10 +679,11 @@ fn the_health_endpoint_needs_no_key() {
 #[test]
 fn an_unknown_endpoint_answers_404_in_the_openai_shape() {
     let stub = Stub::start(|_| Reply::json(404, "{}"));
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let response = agent()
         .post(harness.url("/v1/embeddings"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(json!({}).to_string())
         .expect("the proxy answers");
@@ -689,10 +696,10 @@ fn an_unknown_endpoint_answers_404_in_the_openai_shape() {
 #[test]
 fn the_key_query_parameter_is_not_forwarded() {
     let stub = Stub::start(|_| Reply::json(200, r#"{"ok":true}"#));
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     agent()
-        .post(harness.url("/v1/chat/completions?key=client-secret"))
+        .post(harness.url("/v1/chat/completions?key=secret-key"))
         .header("Content-Type", "application/json")
         .send(chat_body().to_string())
         .expect("the proxy answers");
@@ -717,10 +724,11 @@ fn the_model_list_comes_from_the_upstream() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let response = agent()
         .get(harness.url("/v1/models"))
+        .header("Authorization", "Bearer secret-key")
         .call()
         .expect("the proxy answers");
     assert_eq!(response.status().as_u16(), 200);
@@ -749,10 +757,11 @@ fn a_model_the_upstream_does_not_advertise_is_a_404() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let response = agent()
         .get(harness.url("/v1/models/grok-9.9"))
+        .header("Authorization", "Bearer secret-key")
         .call()
         .expect("the proxy answers");
     assert_eq!(response.status().as_u16(), 404);
@@ -775,10 +784,11 @@ fn a_path_without_the_v1_prefix_also_works() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let response = agent()
         .post(harness.url("/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(chat_body().to_string())
         .expect("the proxy answers");
@@ -795,12 +805,13 @@ fn a_path_without_the_v1_prefix_also_works() {
 #[test]
 fn keep_alive_connections_serve_more_than_one_request() {
     let stub = Stub::start(|_| Reply::json(200, r#"{"ok":true}"#));
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let agent = agent();
     for _ in 0..3 {
         let response = agent
             .get(harness.url("/v1/models"))
+            .header("Authorization", "Bearer secret-key")
             .call()
             .expect("the proxy answers");
         assert_eq!(response.status().as_u16(), 200);
@@ -819,10 +830,11 @@ fn the_upstream_headers_reach_a_streaming_client() {
         content_type: "text/event-stream",
         chunks: vec![(Duration::from_millis(0), "data: [DONE]\n\n".to_string())],
     });
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     let response = agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(json!({"model": "grok-4.7", "messages": [], "stream": true}).to_string())
         .expect("the proxy answers");
@@ -844,10 +856,11 @@ fn a_client_cannot_inject_the_provider_owned_headers() {
     // client that set them must not be able to make the proxy claim to be
     // some other build.
     let stub = Stub::start(|_| Reply::json(200, r#"{"ok":true}"#));
-    let harness = harness(&stub, "", "grok-token");
+    let harness = harness(&stub, "secret-key", "grok-token");
 
     agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .header("X-XAI-Token-Auth", "spoofed")
         .header("x-grok-client-version", "9.9.9")
@@ -905,10 +918,16 @@ fn a_streamed_response_without_a_content_type_is_still_a_stream() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness_with_spec(&stub, "", "chatgpt-token", chatgpt_stub_spec(&stub));
+    let harness = harness_with_spec(
+        &stub,
+        "secret-key",
+        "chatgpt-token",
+        chatgpt_stub_spec(&stub),
+    );
 
     let response = agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(
             json!({"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hello"}]})
@@ -956,10 +975,16 @@ fn a_streamed_response_without_a_content_type_reaches_a_streaming_client() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness_with_spec(&stub, "", "chatgpt-token", chatgpt_stub_spec(&stub));
+    let harness = harness_with_spec(
+        &stub,
+        "secret-key",
+        "chatgpt-token",
+        chatgpt_stub_spec(&stub),
+    );
 
     let response = agent()
         .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(json!({"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hello"}], "stream": true}).to_string())
         .expect("the proxy answers");
@@ -997,10 +1022,16 @@ fn a_native_responses_request_is_forwarded_untouched() {
             Reply::json(404, "{}")
         }
     });
-    let harness = harness_with_spec(&stub, "", "chatgpt-token", chatgpt_stub_spec(&stub));
+    let harness = harness_with_spec(
+        &stub,
+        "secret-key",
+        "chatgpt-token",
+        chatgpt_stub_spec(&stub),
+    );
 
     let response = agent()
         .post(harness.url("/v1/responses"))
+        .header("Authorization", "Bearer secret-key")
         .header("Content-Type", "application/json")
         .send(
             json!({

@@ -274,10 +274,15 @@ impl KeyStore {
                 state.file = file;
                 state.stamp = stamp;
             }
-            Err(_) => {
+            Err(err) => {
                 // The file is unreadable or broken. Keep serving what we
-                // already have, and remember the stamp so a broken file is
-                // not re-read on every request.
+                // already have — failing closed would lock a running daemon
+                // out of its own keys — but say so, because a revocation the
+                // user believes happened is not in effect.
+                crate::logging::warn(&format!(
+                    "the key store at {} could not be read; still serving the keys loaded at startup: {err}",
+                    self.path.display()
+                ));
                 state.stamp = current;
             }
         }
@@ -603,6 +608,23 @@ mod tests {
         other.revoke(1).unwrap();
 
         assert!(!store.verify(&plain), "the store did not notice the change");
+    }
+
+    #[test]
+    fn a_corrupt_store_keeps_serving_what_it_had() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        let store = KeyStore::open(&path).unwrap();
+        let (_, plain) = store.add(None).unwrap();
+        assert!(store.verify(&plain));
+
+        // The file changes underneath the store, and the re-read fails.
+        std::fs::write(&path, "{not json").unwrap();
+
+        // Failing closed would lock a running daemon out of its own keys, so
+        // the previously loaded set stays in service — and the refresh logs a
+        // warning so the fail-open is visible.
+        assert!(store.verify(&plain), "the loaded key stopped working");
     }
 
     #[test]

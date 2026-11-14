@@ -3,14 +3,25 @@
 **`not logged in — run 'eggpass login'`** — the credentials are missing or
 expired and cannot be refreshed. Log in again.
 
+**`refusing to run: no client key is configured`** — `eggpass run`,
+`restart` and `croncheck` will not start the proxy without a key. Run
+`eggpass key add` (and put the key in your client), or set `api_key` in the
+config file.
+
 **`401` from the proxy** — either you are logged out, or the client is
 sending the wrong key. Check `eggpass status`, and check `eggpass key list`:
-if it shows a key, the client has to send one of them.
+the client has to send one of the keys it shows.
 
-**Every request is refused and the endpoint is bound outside loopback** — a
-server bound to a non-loopback address with no key refuses every request
-rather than serving as an open proxy. Issue one with `eggpass key add`, or set
-`api_key` in the config file.
+**`401` saying `no client key is configured on this server`** — the daemon is
+running from before the last key was revoked. Issue a key with
+`eggpass key add`; it takes effect on the next request, no restart.
+
+**`421` saying `the request was addressed to a host this server does not
+serve`** — the request reached the proxy with a `Host` header that is not
+`127.0.0.1`, `localhost`, `[::1]` or a `*.localhost` name. A reverse proxy in
+front is the usual cause: forward the header unchanged, e.g.
+`proxy_set_header Host 127.0.0.1:8484`. A request from a web page is the other
+cause, and the refusal is the point.
 
 **`address already in use`** — something else is on the port. Pick another one
 with `eggpass port 9000`; the command checks the port is free before it

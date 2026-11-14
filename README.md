@@ -36,18 +36,24 @@ One binary, `eggpass`. No runtime dependencies beyond a certificate store.
 
 ### Quick start
 
-Three commands:
+Four commands:
 
 ```sh
-eggpass login      # pick a provider, approve the sign-in
-eggpass run        # start the server in the background
-eggpass status     # see who is signed in and what is running
+eggpass login              # pick a provider, approve the sign-in
+eggpass key add laptop     # mint the key your clients send; shown once
+eggpass run                # start the server in the background
+eggpass status             # see who is signed in and what is running
 ```
 
-Then point a client at `http://127.0.0.1:8484/v1`:
+`eggpass run` refuses to start without a key. A loopback port is reachable
+from a web page, so "anything on this machine" was never a boundary; the key
+is.
+
+Then point a client at `http://127.0.0.1:8484/v1`, sending that key:
 
 ```sh
 curl http://127.0.0.1:8484/v1/chat/completions \
+  -H 'Authorization: Bearer sk-eggpass-…' \
   -H 'Content-Type: application/json' \
   -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Hello"}]}'
 ```
@@ -87,17 +93,27 @@ eggpass key list                # what exists
 eggpass key revoke 2            # take one away
 ```
 
-A new key works on the **next request** — no restart. While no keys exist the
-endpoint is open to anything on the machine, which is safe for a loopback
-socket. Issue one and a key is required from then on.
+A new key works on the **next request** — no restart. The server will not
+start while no key exists, and a running server refuses every request if its
+last key is revoked; `eggpass key add` is the way back.
+
+The key is shown once and only its salted hash is stored, so a lost key is a
+new key. If you would rather have one you can read back, set `api_key` in the
+config file: it is simpler and recoverable, while issued keys are numbered,
+revocable without a restart, and hashed at rest.
 
 ### Pointing a client at it
 
 | Setting | Value |
 | --- | --- |
 | Base URL | `http://127.0.0.1:8484/v1` |
-| API key | anything — unless you issued one, then that key |
+| API key | the key from `eggpass key add`, or the `api_key` in the config file |
 | Model | any name from `GET /v1/models` |
+
+Loopback is the intended shape. To reach it from another machine, forward the
+port over SSH — `ssh -L 8484:127.0.0.1:8484 box` — rather than binding
+`0.0.0.0`. `eggpass host 0.0.0.0` works and still requires a key, but the
+hop through SSH keeps the proxy on the interface it was designed for.
 
 Ready-made setups for the OpenAI SDK, OpenCode, Cline, Continue and curl are
 in [docs/client-setup.md](docs/client-setup.md).

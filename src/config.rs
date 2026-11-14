@@ -378,9 +378,10 @@ host = "127.0.0.1"
 # Change it with `eggpass port`, not by editing this file.
 port = 8484
 
-# Key clients must send as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
-# Leave empty to accept any key — which is only safe while the host is loopback.
-# `eggpass key add` issues keys of its own; this is the older, hand-written way.
+# A key clients may send as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
+# One key is required for the proxy to run. `eggpass key add` issues keys of
+# its own — numbered, revocable, and hashed at rest; this setting is the older
+# way, a single key you can read back.
 api_key = ""
 
 # Log verbosity: error | warn | info | debug
@@ -1131,6 +1132,13 @@ fn write_file(path: &Path, text: &str) -> Result<(), ConfigError> {
     std::fs::write(path, text).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
+    })?;
+
+    // The file may carry a hand-written `api_key`, so it is as sensitive as
+    // the credential files beside it.
+    crate::paths::restrict_permissions(path, 0o600).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
@@ -1233,6 +1241,20 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("port = 9100"), "{text}");
         assert!(text.contains("upstream = \"api\""), "{text}");
+    }
+
+    #[test]
+    fn a_written_configuration_is_not_world_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        write_file(&path, "port = 8484\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+        }
     }
 
     #[test]

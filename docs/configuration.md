@@ -21,9 +21,10 @@ host = "127.0.0.1"
 # Change it with `eggpass port`, not by editing this file.
 port = 8484
 
-# Key clients must send as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
-# Leave empty to accept any key — which is only safe while the host is loopback.
-# `eggpass key add` issues keys of its own; this is the older, hand-written way.
+# A key clients may send as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
+# One key is required for the proxy to run. `eggpass key add` issues keys of
+# its own — numbered, revocable, and hashed at rest; this setting is the older
+# way, a single key you can read back.
 api_key = ""
 
 # Log verbosity: error | warn | info | debug
@@ -94,7 +95,7 @@ resource = "https://api.openai.com/v1"
 | --- | --- | --- |
 | `host` | `127.0.0.1` | Change it with `eggpass host`. Loopback unless you say otherwise. |
 | `port` | `8484` | Change it with `eggpass port`. |
-| `api_key` | `""` | The older, hand-written client key. `eggpass key add` is the newer way. |
+| `api_key` | `""` | The older, hand-written client key: one key, readable back. `eggpass key add` issues numbered, revocable keys and stores only a hash. One of the two is required. |
 | `log_level` | `info` | `error`, `warn`, `info` or `debug`. |
 | `allow_privileged_port` | `false` | Required to bind below 1024. |
 | `routing.default_provider` | `xai` | Where a model with no matching prefix goes. |
@@ -115,7 +116,7 @@ So with the default map, `grok-4.3` goes to x.ai, `gpt-5.6-sol` and
 
 | Path | Purpose | Mode |
 | --- | --- | --- |
-| `~/.config/eggpass/config.toml` | Your configuration | `0644` |
+| `~/.config/eggpass/config.toml` | Your configuration, including `api_key` if you set one | `0600` |
 | `~/.config/eggpass/keys.json` | The keys `eggpass` issued — salted hashes only | `0600` |
 | `~/.config/eggpass/credentials/xai.json` | x.ai OAuth tokens | `0600` (directory `0700`) |
 | `~/.config/eggpass/credentials/openai.json` | ChatGPT OAuth tokens | `0600` |

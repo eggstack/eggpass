@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A client key is required to run.** `eggpass run`, `restart` and
+  `croncheck` refuse to start without one, and a running server refuses every
+  request if its last key is revoked. A loopback port is reachable from a web
+  page, so an unkeyed endpoint was reachable from any site the user visited;
+  the socket address was never the boundary. Run `eggpass key add`, or set
+  `api_key`, before starting the proxy.
+
+- **Requests are checked against the authority they arrive under.** On a
+  loopback bind a request must carry a `Host` of `127.0.0.1`, `localhost`,
+  `[::1]`, a `*.localhost` name, or the bound address; anything else answers
+  `421 Misdirected Request` with a message naming the address to use. This is
+  the second lock against DNS rebinding, and against a proxy that forwards a
+  foreign `Host`. A reverse proxy must pass the header through unchanged.
+
+- **The log redactor covers `?key=`.** A bare `key` parameter is now scrubbed
+  at a word boundary, so `key=…` is removed while `monkey=…` is left alone.
+
+### Fixed
+
+- **A malformed chunked body no longer aborts the daemon.** A chunk size of
+  `ffffffffffffffff` wrapped a bounds check and killed the process with a
+  capacity-overflow panic. Oversized bodies now answer `413`.
+
+- **The request body is read only after authentication.** An unauthenticated
+  client can no longer make the daemon buffer up to 32 MB per connection: the
+  key is checked on the request head, before the body is read.
+
+- **`config.toml` is written `0600`.** It can hold a client key and was
+  written with the process umask. An existing file is tightened on the next
+  command.
+
+- **A key store that becomes unreadable is reported.** The daemon keeps
+  serving the keys it loaded — failing closed would lock it out of its own
+  keys — but logs a warning instead of failing open silently.
+
+- **`EGGPASS_HOME` no longer reads `~/.grok/auth.json`.** A relocated
+  installation is an isolated one.
+
+- **`eggpass key revoke` says what actually happens** when the last key goes:
+  every request is refused until another is issued.
+
 ## [0.1.0] - 2026-11-13
 
 The first release. A local, OpenAI-compatible proxy for Grok and ChatGPT that

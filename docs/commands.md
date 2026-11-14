@@ -149,9 +149,18 @@ The daemon is self-contained: no launchd, no systemd. It is found by its PID
 file at `~/.config/eggpass/eggpass.pid`, which records the pid, the host it
 bound and the port it serves.
 
-If the daemon is bound outside loopback with no client key configured, it logs
-an error at startup — every request will be refused until `eggpass key add` is
-run.
+`run` refuses to start while no client key is configured, and prints how to
+fix it:
+
+```
+refusing to run: no client key is configured; run `eggpass key add` first
+(or set `api_key` in the config file)
+```
+
+`restart` checks first, before it stops the running daemon, so a missing key
+never leaves the endpoint down. `croncheck` refuses the same way rather than
+failing silently every five minutes; that is the one case where it is not
+quiet.
 
 ---
 
@@ -197,7 +206,8 @@ Both refuse to change anything if the new address is unusable:
 If the restart fails, the old configuration is rolled back and the server
 comes back up where it was.
 
-`host` defaults to loopback, and that default is the safe one: binding
+`host` defaults to loopback, and the intended shape is loopback plus an SSH
+tunnel (`ssh -L 8484:127.0.0.1:8484 box`) rather than a widened bind. Binding
 elsewhere puts the proxy, and through it your paid subscriptions, on the
 network. `local`, `localhost` and `loopback` all mean `127.0.0.1`.
 

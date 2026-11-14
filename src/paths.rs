@@ -125,6 +125,11 @@ impl Paths {
 
     /// The official Grok Build CLI's credential file, used as an import source.
     pub fn grok_cli_auth_file(&self) -> Option<PathBuf> {
+        // A relocated installation is an isolated one: `EGGPASS_HOME` must
+        // not reach back into the user's home for another tool's credentials.
+        if non_empty_env("EGGPASS_HOME").is_some() {
+            return None;
+        }
         dirs::home_dir().map(|home| home.join(GROK_CLI_DIR).join(GROK_CLI_AUTH_FILE_NAME))
     }
 
@@ -149,7 +154,19 @@ impl Paths {
         restrict_permissions(&self.dir, 0o700).map_err(|source| PathError::Io {
             path: self.dir.clone(),
             source,
-        })
+        })?;
+
+        // The configuration file may carry a hand-written `api_key`, so it is
+        // as sensitive as the credential files beside it. A `--config` path
+        // outside this directory belongs to the user and is left alone.
+        if self.config_file.parent() == Some(self.dir.as_path()) && self.config_file.exists() {
+            restrict_permissions(&self.config_file, 0o600).map_err(|source| PathError::Io {
+                path: self.config_file.clone(),
+                source,
+            })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -238,6 +255,48 @@ mod tests {
             paths.pid_file(),
             Path::new("/tmp/eggpass-test-home/eggpass.pid")
         );
+        unsafe {
+            std::env::remove_var("EGGPASS_HOME");
+        }
+    }
+
+    #[test]
+    fn ensure_dir_tightens_an_existing_config_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::in_directory(directory.path().join("eggpass"));
+        paths.ensure_dir().unwrap();
+        std::fs::write(paths.config_file(), "port = 8484\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(paths.config_file(), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+
+        paths.ensure_dir().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(paths.config_file())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+        }
+    }
+
+    #[test]
+    fn eggpass_home_skips_the_grok_cli_import() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::in_directory(directory.path());
+
+        // SAFETY: single-threaded test with no other threads touching the env.
+        unsafe {
+            std::env::set_var("EGGPASS_HOME", directory.path());
+        }
+        assert_eq!(paths.grok_cli_auth_file(), None);
         unsafe {
             std::env::remove_var("EGGPASS_HOME");
         }

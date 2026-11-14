@@ -40,10 +40,18 @@ client ──OpenAI API──► eggpass ──OAuth bearer──► api.x.ai / 
   before the request is forwarded, and the provider's token is put in their
   place. The provider-owned headers are stripped too, so a client cannot make
   the proxy claim to be a different build.
-- **Client keys are issued by `eggpass`.** `eggpass key add` mints a key,
-  shows it exactly once, and stores a salted hash of it — never the key
-  itself. The server re-reads the store whenever it changes, so a key can be
-  added or revoked without a restart.
+- **A client key is required to run.** `eggpass key add` mints a key, shows it
+  exactly once, and stores a salted hash of it — never the key itself. The
+  server re-reads the store whenever it changes, so a key can be added or
+  revoked without a restart. `eggpass run`, `restart` and `croncheck` refuse
+  to start without one, and a running server refuses every request if its
+  last key is revoked. Loopback was never the boundary: a web page can reach
+  `127.0.0.1`, so "no key" meant "open to any page the user visits".
+- **The authority is checked even with a key.** On a loopback bind the `Host`
+  header must be `127.0.0.1`, `localhost`, `[::1]`, a `*.localhost` name, or
+  the bound address. A request carrying anything else — the shape a DNS
+  rebinding attack produces, or a proxy that forgets to rewrite `Host` — gets
+  a `421 Misdirected Request` that names the address it should have used.
 - **Tokens refresh themselves** five minutes before they expire. A refresh
   that returns no new refresh token keeps the old one, so a rotating provider
   cannot lock you out. Each provider has its own credential file and its own
@@ -204,11 +212,20 @@ unusable — a taken port prints `port <port> is taken` and leaves the server
 alone. If the restart fails, the old configuration is restored and the server
 comes back up where it was.
 
-`host` defaults to loopback, and that default is the safe one: binding
-elsewhere puts the proxy, and through it your paid subscriptions, on the
-network. A non-loopback host is refused unless you have a key — one issued by
-`eggpass key add`, or the `api_key` in the config file — and warns when it is
-allowed.
+`host` defaults to loopback, and that is the intended shape. To reach the
+proxy from another machine, forward the port over SSH rather than widening
+the bind — it keeps the proxy on the interface it was designed for:
+
+```sh
+ssh -L 8484:127.0.0.1:8484 box
+```
+
+`eggpass host 0.0.0.0` works — this is a tool for people who expect to be able
+to widen it — and it still requires a key, and warns when it allows one. Two
+things change when you widen it: the authority guard is skipped, because the
+names a LAN address is reachable by are not knowable from the config, and the
+key becomes the only boundary. The daemon itself only ever speaks plain HTTP,
+so a tunnel is also what keeps the traffic off the wire.
 
 ## The daemon
 

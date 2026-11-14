@@ -195,6 +195,7 @@ const CREDENTIAL_KEYS: &[&str] = &[
     "password",
     "secret",
     "authorization",
+    "key",
 ];
 
 /// Find the start of a credential-bearing `key=` pair.
@@ -204,16 +205,30 @@ fn find_credential_key(text: &str) -> Option<(usize, usize)> {
         let mut from = 0usize;
         while let Some(offset) = lowered[from..].find(key) {
             let start = from + offset;
-            let after = &text[start + key.len()..];
-            let trimmed = after.trim_start_matches([' ', '\t']);
-            let skip = after.len() - trimmed.len();
-            if trimmed.starts_with('=') {
-                return Some((start, key.len() + skip + 1));
+            if is_parameter_start(text, start) {
+                let after = &text[start + key.len()..];
+                let trimmed = after.trim_start_matches([' ', '\t']);
+                let skip = after.len() - trimmed.len();
+                if trimmed.starts_with('=') {
+                    return Some((start, key.len() + skip + 1));
+                }
             }
             from = start + key.len();
         }
     }
     None
+}
+
+/// Whether a credential name starts a parameter rather than ending another
+/// word — `key=` yes, `monkey=` no.
+fn is_parameter_start(text: &str, start: usize) -> bool {
+    match text[..start].chars().next_back() {
+        None => true,
+        Some(previous) => matches!(
+            previous,
+            ' ' | '\t' | '\n' | '\r' | '?' | '&' | ',' | '"' | '\'' | '(' | '[' | '{'
+        ),
+    }
 }
 
 /// Find the start of a JWT (`eyJ...`.`...`.`...`).
@@ -279,6 +294,19 @@ mod tests {
         let out = redact("token is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefg here");
         assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "{out}");
         assert!(out.contains("here"), "{out}");
+    }
+
+    #[test]
+    fn a_bare_key_query_parameter_is_scrubbed() {
+        let out = redact("GET /v1/models?key=sk-eggpass-secret HTTP/1.1");
+        assert!(!out.contains("sk-eggpass-secret"), "{out}");
+        assert!(out.contains("key=<redacted>"), "{out}");
+    }
+
+    #[test]
+    fn a_word_ending_in_key_is_not_scrubbed() {
+        let out = redact("monkey=banana");
+        assert_eq!(out, "monkey=banana");
     }
 
     #[test]

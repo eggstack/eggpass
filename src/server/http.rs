@@ -125,6 +125,12 @@ impl Response {
     }
 }
 
+/// A hook that may refuse a request from its head, before the body is read.
+pub type Gate = Arc<dyn Fn(&Request) -> Option<Response> + Send + Sync + 'static>;
+
+/// The function that turns a request into a response.
+pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>;
+
 /// The HTTP server.
 pub struct HttpServer {
     listener: TcpListener,
@@ -177,11 +183,7 @@ impl HttpServer {
     /// Each connection is handled on its own thread. When the server is asked
     /// to stop, the in-flight connections are given the grace window to
     /// finish before this returns.
-    pub fn serve(
-        self: Arc<Self>,
-        shutdown: Arc<AtomicBool>,
-        handler: Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>,
-    ) {
+    pub fn serve(self: Arc<Self>, shutdown: Arc<AtomicBool>, gate: Gate, handler: Handler) {
         let address = self.local_addr().ok();
 
         // A watcher that wakes the accept loop up when the server is asked to
@@ -213,12 +215,13 @@ impl HttpServer {
             }
 
             self.active.fetch_add(1, Ordering::SeqCst);
+            let gate = Arc::clone(&gate);
             let handler = Arc::clone(&handler);
             let active = Arc::clone(&self.active);
             let idle_timeout = self.idle_timeout;
             let write_timeout = self.write_timeout;
             std::thread::spawn(move || {
-                let _ = handle_connection(stream, handler, idle_timeout, write_timeout);
+                let _ = handle_connection(stream, gate, handler, idle_timeout, write_timeout);
                 // The count drops only now: the response body has been
                 // written, so a stream that was cut short by a shutdown was
                 // still counted as in flight.
@@ -255,7 +258,8 @@ fn refuse(mut stream: TcpStream) -> std::io::Result<()> {
 /// Handle one connection, serving requests until it is closed.
 fn handle_connection(
     stream: TcpStream,
-    handler: Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>,
+    gate: Gate,
+    handler: Handler,
     idle_timeout: Duration,
     write_timeout: Duration,
 ) -> std::io::Result<()> {
@@ -271,7 +275,7 @@ fn handle_connection(
         // is closed rather than holding a thread forever.
         let _ = writer.set_read_timeout(Some(idle_timeout));
 
-        let request = match read_request(&mut reader, &mut writer) {
+        let request = match read_request(&mut reader, &mut writer, gate.as_ref()) {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(err) if is_idle_timeout(&err) => return Ok(()),
@@ -382,20 +386,62 @@ impl Read for SocketReader {
     }
 }
 
-/// Read one request. `Ok(None)` means the client closed the connection.
+/// An error raised while reading a request body.
+enum BodyError {
+    /// The connection ended or the framing was malformed.
+    Io(std::io::Error),
+    /// The body is larger than [`MAX_BODY_BYTES`].
+    TooLarge,
+}
+
+impl From<std::io::Error> for BodyError {
+    fn from(err: std::io::Error) -> BodyError {
+        BodyError::Io(err)
+    }
+}
+
+/// Read one request. `Ok(None)` means the connection is finished.
+///
+/// The head is parsed first and handed to the gate before a body byte is
+/// read or allocated. A refusal is written and the connection closed; the
+/// handler never runs. When the client is not waiting on `100 Continue`, the
+/// body is then drained into a fixed buffer, because closing on a half-read
+/// body sends a reset that can discard the response before the client reads
+/// it.
 fn read_request(
     reader: &mut SocketReader,
     writer: &mut TcpStream,
+    gate: &dyn Fn(&Request) -> Option<Response>,
 ) -> std::io::Result<Option<Request>> {
     let Some(head) = read_head(reader)? else {
         return Ok(None);
     };
 
-    let text = String::from_utf8_lossy(&head).to_string();
-    let mut lines = text.split("\r\n");
-    let Some(request_line) = lines.next() else {
+    let request = parse_head(&head);
+
+    if let Some(refusal) = gate(&request) {
+        write_response(writer, refusal, false)?;
+        if !expects_continue(&request.headers) {
+            let _ = read_body(reader, writer, &request.headers, false);
+        }
         return Ok(None);
-    };
+    }
+
+    match read_body(reader, writer, &request.headers, true) {
+        Ok(body) => Ok(Some(Request { body, ..request })),
+        Err(BodyError::TooLarge) => {
+            write_response(writer, payload_too_large(), false)?;
+            Ok(None)
+        }
+        Err(BodyError::Io(err)) => Err(err),
+    }
+}
+
+/// Parse a request head into a request with no body.
+fn parse_head(head: &[u8]) -> Request {
+    let text = String::from_utf8_lossy(head).to_string();
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
 
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
@@ -412,15 +458,31 @@ fn read_request(
         }
     }
 
-    let body = read_body(reader, writer, &headers)?;
-
-    Ok(Some(Request {
+    Request {
         method,
         target,
         version,
         headers,
-        body,
-    }))
+        body: Vec::new(),
+    }
+}
+
+/// Whether the client is waiting for `100 Continue` before sending the body.
+fn expects_continue(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
+    })
+}
+
+/// The `413` body for a request that is too large.
+fn payload_too_large() -> Response {
+    let limit = MAX_BODY_BYTES / (1024 * 1024);
+    Response::json(
+        413,
+        format!(
+            r#"{{"error":{{"message":"the request body is larger than {limit} MiB","type":"invalid_request_error","code":"body_too_large"}}}}"#
+        ),
+    )
 }
 
 /// Read the request head, up to the blank line.
@@ -465,12 +527,17 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Read the request body.
+/// Read the request body, collecting it when `keep` is true.
+///
+/// With `keep` false the bytes are read and thrown away in a fixed-size
+/// buffer, so a refusal can consume what the client is still sending without
+/// allocating the body.
 fn read_body(
     reader: &mut SocketReader,
     writer: &mut TcpStream,
     headers: &[(String, String)],
-) -> std::io::Result<Vec<u8>> {
+    keep: bool,
+) -> Result<Vec<u8>, BodyError> {
     let lookup = |name: &str| {
         headers
             .iter()
@@ -478,7 +545,7 @@ fn read_body(
             .map(|(_, value)| value.as_str())
     };
 
-    if lookup("expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue")) {
+    if keep && lookup("expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue")) {
         writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         writer.flush()?;
     }
@@ -486,7 +553,7 @@ fn read_body(
     if let Some(encoding) = lookup("transfer-encoding")
         && encoding.to_ascii_lowercase().contains("chunked")
     {
-        return read_chunked_body(reader);
+        return read_chunked_body(reader, keep);
     }
 
     let Some(length) = lookup("content-length").and_then(|value| value.parse::<usize>().ok())
@@ -495,10 +562,12 @@ fn read_body(
     };
 
     if length > MAX_BODY_BYTES {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "the request body is too large",
-        ));
+        return Err(BodyError::TooLarge);
+    }
+
+    if !keep {
+        discard(reader, length)?;
+        return Ok(Vec::new());
     }
 
     let mut body = vec![0u8; length];
@@ -506,8 +575,20 @@ fn read_body(
     Ok(body)
 }
 
+/// Read and throw away exactly `length` bytes.
+fn discard(reader: &mut SocketReader, length: usize) -> std::io::Result<()> {
+    let mut buffer = [0u8; 8192];
+    let mut remaining = length;
+    while remaining > 0 {
+        let take = remaining.min(buffer.len());
+        reader.read_exact(&mut buffer[..take])?;
+        remaining -= take;
+    }
+    Ok(())
+}
+
 /// Read a chunked request body.
-fn read_chunked_body(reader: &mut SocketReader) -> std::io::Result<Vec<u8>> {
+fn read_chunked_body(reader: &mut SocketReader, keep: bool) -> Result<Vec<u8>, BodyError> {
     let mut body = Vec::new();
 
     loop {
@@ -526,16 +607,21 @@ fn read_chunked_body(reader: &mut SocketReader) -> std::io::Result<Vec<u8>> {
             return Ok(body);
         }
 
-        if body.len() + size > MAX_BODY_BYTES {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "the request body is too large",
-            ));
+        // Bound the size before using it. `MAX_BODY_BYTES - size` cannot
+        // underflow once `size` is known to fit, so a chunk header of
+        // `ffffffffffffffff` is refused instead of wrapping the sum into a
+        // huge allocation.
+        if size > MAX_BODY_BYTES || body.len() > MAX_BODY_BYTES - size {
+            return Err(BodyError::TooLarge);
         }
 
-        let mut chunk = vec![0u8; size];
-        reader.read_exact(&mut chunk)?;
-        body.extend_from_slice(&chunk);
+        if keep {
+            let mut chunk = vec![0u8; size];
+            reader.read_exact(&mut chunk)?;
+            body.extend_from_slice(&chunk);
+        } else {
+            discard(reader, size)?;
+        }
 
         // The CRLF that closes the chunk.
         reader.read_line()?;
@@ -627,6 +713,7 @@ pub fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         413 => "Payload Too Large",
+        421 => "Misdirected Request",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -689,14 +776,109 @@ mod tests {
 mod integration_tests {
     use super::*;
 
-    fn start(handler: Arc<dyn Fn(Request) -> Response + Send + Sync + 'static>) -> u16 {
+    fn start(handler: Handler) -> u16 {
+        start_with_gate(Arc::new(|_: &Request| None), handler)
+    }
+
+    /// Start a server with an explicit gate.
+    fn start_with_gate(gate: Gate, handler: Handler) -> u16 {
         let server = Arc::new(HttpServer::bind("127.0.0.1:0").unwrap());
         let port = server.local_addr().unwrap().port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let running = Arc::clone(&server);
-        std::thread::spawn(move || running.serve(shutdown, handler));
+        std::thread::spawn(move || running.serve(shutdown, gate, handler));
         std::thread::sleep(Duration::from_millis(50));
         port
+    }
+
+    #[test]
+    fn a_gate_sees_the_head_before_the_body() {
+        // A gate that refuses everything: the handler must never run, the
+        // body must never be read, and the client must not be told to
+        // continue.
+        let gate = Arc::new(|_: &Request| Some(Response::json(401, r#"{"error":"no"}"#)));
+        let handler = Arc::new(|_: Request| -> Response { panic!("the handler must not run") });
+        let port = start_with_gate(gate, handler);
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Content-Length: 100\r\n\
+             Expect: 100-continue\r\n\r\n"
+        )
+        .unwrap();
+
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(!response.contains("100 Continue"), "{response}");
+    }
+
+    #[test]
+    fn a_refusal_survives_a_body_the_client_already_sent() {
+        let gate = Arc::new(|_: &Request| Some(Response::json(401, r#"{"error":"no"}"#)));
+        let handler = Arc::new(|_: Request| -> Response { panic!("the handler must not run") });
+        let port = start_with_gate(gate, handler);
+
+        // Larger than one read, so the drain path is exercised: closing with
+        // the body unread sends a reset that can discard the response.
+        let body = "x".repeat(64 * 1024);
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[test]
+    fn an_oversized_chunk_is_refused_and_the_server_survives() {
+        let port = start(Arc::new(|_: Request| Response::json(200, "{}")));
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Transfer-Encoding: chunked\r\n\r\n"
+        )
+        .unwrap();
+        write!(stream, "1\r\nA\r\nffffffffffffffff\r\n").unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+
+        // The server is still serving.
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build();
+        let agent = ureq::Agent::new_with_config(config);
+        let response = agent
+            .get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .expect("the server still answers");
+        assert_eq!(response.status().as_u16(), 200);
     }
 
     #[test]

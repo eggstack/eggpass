@@ -22,7 +22,7 @@ pub fn key(context: &Context, action: KeyAction) -> Result<(), CommandError> {
     match action {
         KeyAction::Add { label } => add(&store, label),
         KeyAction::List => list(context, &store),
-        KeyAction::Revoke { id, all } => revoke(context, &store, id, all),
+        KeyAction::Revoke { id, all } => revoke(&store, id, all),
     }
 }
 
@@ -76,12 +76,7 @@ fn list(context: &Context, store: &KeyStore) -> Result<(), CommandError> {
 }
 
 /// Take a key away.
-fn revoke(
-    context: &Context,
-    store: &KeyStore,
-    id: Option<u32>,
-    all: bool,
-) -> Result<(), CommandError> {
+fn revoke(store: &KeyStore, id: Option<u32>, all: bool) -> Result<(), CommandError> {
     if all {
         let removed = store
             .revoke_all()
@@ -91,7 +86,7 @@ fn revoke(
             return Ok(());
         }
         println!("Revoked {removed} key(s).");
-        warn_if_open(context, store);
+        warn_if_open(store);
         return Ok(());
     }
 
@@ -106,26 +101,18 @@ fn revoke(
         .map_err(|err| CommandError::new(err.to_string()))?;
 
     println!("Revoked key #{} ({}).", entry.id, entry.prefix);
-    warn_if_open(context, store);
+    warn_if_open(store);
     Ok(())
 }
 
-/// Say so when the last key has gone and the endpoint is open again.
-fn warn_if_open(context: &Context, store: &KeyStore) {
-    if !store.is_empty() || !context.config.api_key.is_empty() {
+/// Say so when the last key has gone and the endpoint is closed.
+fn warn_if_open(store: &KeyStore) {
+    if !store.is_empty() {
         return;
     }
 
-    let live = crate::cli::commands::address::live_address(context);
-    let host = if live.running {
-        live.host
-    } else {
-        context.config.host.clone()
-    };
-
-    if crate::config::is_loopback_host(&host) {
-        println!("That was the last key. The endpoint on {host} now accepts anything.");
-    } else {
-        println!("That was the last key. The endpoint on {host} now refuses every request.");
-    }
+    println!(
+        "That was the last key. Every request is now refused; \
+         run `eggpass key add` to issue another."
+    );
 }

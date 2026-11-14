@@ -10,6 +10,8 @@ use crate::server::{ProviderHandle, Server, ServerContext};
 
 /// Start the server as a background daemon.
 pub fn run(context: &Context, foreground: bool) -> Result<(), CommandError> {
+    require_key(context)?;
+
     match daemon::state(
         &context.paths.pid_file(),
         &context.config.host,
@@ -65,6 +67,8 @@ pub fn stop(context: &Context) -> Result<(), CommandError> {
 
 /// Stop the daemon, then start it again.
 pub fn restart(context: &Context) -> Result<(), CommandError> {
+    // Check before stopping: a missing key must not leave the endpoint down.
+    require_key(context)?;
     stop(context)?;
     run(context, false)
 }
@@ -74,6 +78,8 @@ pub fn restart(context: &Context) -> Result<(), CommandError> {
 /// Nothing is printed: a crontab entry must not mail the user. Everything
 /// that happens goes into the log file.
 pub fn croncheck(context: &Context) -> Result<(), CommandError> {
+    require_key(context)?;
+
     let pid_file = context.paths.pid_file();
     let state = daemon::state(&pid_file, &context.config.host, context.config.port);
     if state.is_running() {
@@ -87,6 +93,39 @@ pub fn croncheck(context: &Context) -> Result<(), CommandError> {
     }
 
     start_daemon(context, true)
+}
+
+/// Refuse to start without a client key.
+///
+/// A loopback socket is reachable from a web page, so "no key" is not a
+/// boundary. `run` and `croncheck` tell the user to issue one rather than
+/// serving an endpoint anything local can use.
+fn require_key(context: &Context) -> Result<(), CommandError> {
+    ensure_a_key_exists(&context.config.api_key, &context.paths.key_store_file())
+}
+
+/// The implementation behind [`require_key`], testable without a context.
+fn ensure_a_key_exists(api_key: &str, store: &std::path::Path) -> Result<(), CommandError> {
+    if !api_key.is_empty() {
+        return Ok(());
+    }
+
+    match crate::keys::KeyStore::open(store) {
+        Ok(keys) if !keys.is_empty() => Ok(()),
+        Ok(_) => Err(no_key()),
+        Err(err) => Err(CommandError::new(format!(
+            "the key store at {} could not be read ({err}); run `eggpass key add` to issue a key",
+            store.display()
+        ))),
+    }
+}
+
+/// The error a user sees when the proxy has no client key.
+fn no_key() -> CommandError {
+    CommandError::new(
+        "refusing to run: no client key is configured; run `eggpass key add` first \
+         (or set `api_key` in the config file)",
+    )
 }
 
 /// Fork into the background and wait for the daemon to come up.
@@ -186,21 +225,9 @@ fn serve(context: &Context) -> Result<(), CommandError> {
             .map_err(|err| CommandError::new(err.to_string()))?,
     );
 
-    // A server that is reachable from the network and has no key refuses
-    // every request rather than serving as an open proxy. Say so loudly: the
-    // user probably means to issue a key.
-    if !crate::config::is_loopback_host(&context.config.host)
-        && context.config.api_key.is_empty()
-        && keys.is_empty()
-    {
-        crate::logging::error(&format!(
-            "bound to {} with no API key configured; every request will be refused until `eggpass key add` is run",
-            context.config.host
-        ));
-    }
-
     let server_context = Arc::new(ServerContext {
         host: context.config.host.clone(),
+        port: context.config.port,
         api_key: context.config.api_key.clone(),
         keys,
         providers,
@@ -240,4 +267,46 @@ fn check_port_allowed(context: &Context) -> Result<(), CommandError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_api_key_needs_no_store() {
+        let path = std::path::Path::new("/nonexistent/keys.json");
+        assert!(ensure_a_key_exists("secret", path).is_ok());
+    }
+
+    #[test]
+    fn an_empty_store_is_refused_with_a_pointer_to_the_command() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let err = ensure_a_key_exists("", &directory.path().join("keys.json"))
+            .expect_err("a server with no key is refused");
+        let message = err.message.unwrap_or_default();
+        assert!(message.contains("eggpass key add"), "{message}");
+        assert!(message.contains("refusing to run"), "{message}");
+    }
+
+    #[test]
+    fn an_issued_key_is_enough() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("keys.json");
+        let store = crate::keys::KeyStore::open(&path).expect("key store");
+        store.add(None).expect("key");
+
+        assert!(ensure_a_key_exists("", &path).is_ok());
+    }
+
+    #[test]
+    fn a_broken_store_is_reported() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("keys.json");
+        std::fs::write(&path, "{not json").expect("write");
+
+        let err = ensure_a_key_exists("", &path).expect_err("a broken store is refused");
+        let message = err.message.unwrap_or_default();
+        assert!(message.contains("could not be read"), "{message}");
+    }
 }

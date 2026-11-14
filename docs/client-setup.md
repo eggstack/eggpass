@@ -6,14 +6,23 @@ to `eggpass`.
 | Setting | Value |
 | --- | --- |
 | Base URL | `http://127.0.0.1:8484/v1` |
-| API key | anything, e.g. `sk-local` — unless you issued a key, then that key |
+| API key | the key from `eggpass key add`, or the config file's `api_key` |
 | Model | any name from `GET /v1/models` |
 
 Both `/v1/chat/completions` and `/chat/completions` work, so it does not
 matter whether your client's base URL already carries the `/v1`.
 
-If you issued a key with `eggpass key add`, the client **must** send it, as
-`Authorization: Bearer <key>` or `X-Api-Key: <key>`.
+The client **must** send a key, as `Authorization: Bearer <key>` or
+`X-Api-Key: <key>`. `eggpass run` refuses to start without one: a loopback
+port is reachable from a web page, so the socket address is not a boundary.
+
+There are two ways to have one, and they are both supported:
+
+- `eggpass key add <label>` mints a key, shows it once, and stores a salted
+  hash. It is numbered and revocable without a restart, and it cannot be read
+  back out of the store.
+- `api_key = "…"` in `config.toml` is the older way: one key, readable
+  afterwards, so it survives a lost clipboard. The file is `0600`.
 
 ---
 
@@ -127,7 +136,7 @@ answer = client.chat.completions.create(
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8484/v1", api_key="not-needed")
+client = OpenAI(base_url="http://127.0.0.1:8484/v1", api_key="sk-eggpass-…")
 
 stream = client.chat.completions.create(
     model="grok-4.3",
@@ -136,12 +145,6 @@ stream = client.chat.completions.create(
 )
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
-```
-
-With a key issued by `eggpass`, pass it instead:
-
-```python
-client = OpenAI(base_url="http://127.0.0.1:8484/v1", api_key="sk-eggpass-…")
 ```
 
 ### TypeScript
@@ -210,7 +213,7 @@ live truth if you want the full set.
 | --- | --- |
 | API provider | OpenAI Compatible |
 | Base URL | `http://127.0.0.1:8484/v1` |
-| API key | anything, e.g. `sk-local` — unless you have issued a key with `eggpass key add`, in which case use that one |
+| API key | the key from `eggpass key add`, or the config file's `api_key` |
 | Model | any model name from `GET /v1/models` |
 
 ---
