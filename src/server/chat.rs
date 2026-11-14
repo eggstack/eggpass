@@ -23,7 +23,7 @@ use crate::upstream::{self, Method, UpstreamError};
 use super::{
     Request, Response, ServerContext, aggregator,
     aggregator::Aggregated,
-    openai_error, sse,
+    openai_error, openai_error_with_code, sse,
     translate::{self, ResponsesToChatStream},
 };
 
@@ -111,11 +111,34 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
         }
     };
 
+    let status = response.status;
     let content_type = response
         .header("Content-Type")
         .unwrap_or("application/json")
         .to_string();
     let headers = super::forwarded_headers(&response.headers);
+
+    // An error answer is never an event stream.
+    //
+    // A provider that forces streaming asks for `stream: true`, but the
+    // upstream still answers a rejected request with a plain JSON body. That
+    // body has to be read as an error rather than parsed as a stream, or the
+    // client is told "server error" when the upstream actually said, say,
+    // "model not found" with a 400.
+    if status >= 400 {
+        context.release_upstream_slot();
+        let bytes = match response.read_to_vec() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return openai_error(
+                    502,
+                    &format!("could not read the upstream response: {err}"),
+                    "server_error",
+                );
+            }
+        };
+        return upstream_error(status, &bytes);
+    }
 
     // Whether this is an event stream.
     //
@@ -171,10 +194,6 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
                 Response::bytes(200, headers, bytes)
             }
             Aggregated::Failed { code, message } => {
-                let detail = match &code {
-                    Some(code) => format!("{message} ({code})"),
-                    None => message,
-                };
                 let (status, kind) = match code.as_deref() {
                     Some("subscription_sharing_usage_limit_exceeded") => (429, "rate_limit_error"),
                     Some("subscription_sharing_user_not_eligible") => (403, "permission_error"),
@@ -182,7 +201,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
                     Some("subscription_sharing_invalid_user") => (401, "invalid_request_error"),
                     _ => (502, "server_error"),
                 };
-                openai_error(status, &detail, kind)
+                openai_error(status, &message, kind)
             }
             Aggregated::Incomplete => openai_error(
                 502,
@@ -193,7 +212,6 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
     }
 
     // A plain body.
-    let status = response.status;
     let bytes = match response.read_to_vec() {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -217,6 +235,62 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
     };
 
     Response::bytes(status, headers, bytes)
+}
+
+/// The upstream's error, in the OpenAI error shape.
+///
+/// The upstream's status, type and code are kept. A client that asked for a
+/// model the provider does not serve has to be told exactly that — a blanket
+/// "server error" hides both the reason and the status, and turns a request
+/// that cannot succeed into something that looks worth retrying.
+fn upstream_error(status: u16, body: &[u8]) -> Response {
+    let parsed: Option<Value> = serde_json::from_slice(body).ok();
+    let error = parsed.as_ref().and_then(|value| value.get("error"));
+
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            // The upstream answers a rejected parameter with `detail` and no
+            // `error` object at all.
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("detail"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("the upstream answered with HTTP {status}"));
+
+    let kind = match error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("invalid_request_error") => "invalid_request_error",
+        Some("rate_limit_error") => "rate_limit_error",
+        Some("authentication_error") => "authentication_error",
+        Some("permission_error") => "permission_error",
+        Some("server_error") => "server_error",
+        _ => match status {
+            401 => "authentication_error",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            400..=499 => "invalid_request_error",
+            _ => "server_error",
+        },
+    };
+
+    let status = match status {
+        400..=599 => status,
+        _ => 502,
+    };
+
+    openai_error_with_code(status, &message, kind, code.as_deref())
 }
 
 /// Apply a provider's rules to a request body.
@@ -338,6 +412,70 @@ impl Read for ReleasingStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::http::Body;
+
+    /// The bytes of a response body.
+    fn body_bytes(response: &Response) -> &[u8] {
+        match &response.body {
+            Body::Bytes(bytes) => bytes,
+            Body::Stream(_) => panic!("expected a complete body"),
+        }
+    }
+
+    #[test]
+    fn an_upstream_error_keeps_its_status_type_and_code() {
+        // The upstream's answer for a model it does not serve: a 400 with a
+        // `model_not_found` code. Flattening that into a 502 "server error"
+        // tells the client to retry something that cannot succeed.
+        let body = br#"{
+            "detail": "The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+                "message": "The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."
+            }
+        }"#;
+
+        let response = upstream_error(400, body);
+        assert_eq!(response.status, 400);
+        let value: Value = serde_json::from_slice(body_bytes(&response)).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["code"], "model_not_found");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not supported when using Codex")
+        );
+    }
+
+    #[test]
+    fn an_upstream_error_without_an_error_object_uses_its_detail() {
+        // The upstream answers a rejected parameter with `detail` and nothing
+        // else.
+        let body = br#"{"detail":"Unsupported parameter: background"}"#;
+
+        let response = upstream_error(400, body);
+        assert_eq!(response.status, 400);
+        let value: Value = serde_json::from_slice(body_bytes(&response)).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            value["error"]["message"],
+            "Unsupported parameter: background"
+        );
+    }
+
+    #[test]
+    fn an_upstream_error_keeps_a_rate_limit() {
+        let body =
+            br#"{"error":{"type":"rate_limit_error","code":"tokens","message":"slow down"}}"#;
+
+        let response = upstream_error(429, body);
+        assert_eq!(response.status, 429);
+        let value: Value = serde_json::from_slice(body_bytes(&response)).unwrap();
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(value["error"]["code"], "tokens");
+    }
 
     #[test]
     fn the_model_is_read_out_of_the_body() {
@@ -372,10 +510,25 @@ mod tests {
 
         assert_eq!(value["model"], "gpt-5");
         assert!(value.get("temperature").is_none());
-        assert!(value.get("max_output_tokens").is_none());
         assert!(value.get("metadata").is_none());
         assert_eq!(value["stream"], json!(true));
         assert_eq!(value["store"], json!(false));
+
+        // The route accepts a token limit, so a client that sets one means it.
+        assert_eq!(value["max_output_tokens"], 10);
+    }
+
+    #[test]
+    fn the_rejected_fields_are_the_ones_the_route_rejects() {
+        // Every field in the list is one the Sign in with ChatGPT route
+        // answers with "Unsupported parameter". A field that is not rejected
+        // must not be in the list, or a client's request is quietly changed.
+        for field in crate::provider::openai::REJECTED_FIELDS {
+            assert!(
+                !matches!(*field, "max_output_tokens"),
+                "{field} is accepted by the route"
+            );
+        }
     }
 
     #[test]

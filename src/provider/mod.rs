@@ -249,13 +249,28 @@ pub fn normalize_catalogue(kind: CatalogueKind, body: &[u8]) -> Vec<u8> {
                             .get("slug")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        let display = model.get("display_name").and_then(Value::as_str);
-                        serde_json::json!({
-                            "id": slug,
-                            "object": "model",
-                            "owned_by": "openai",
-                            "display_name": display,
-                        })
+                        let mut entry = serde_json::Map::new();
+                        entry.insert("id".to_string(), serde_json::json!(slug));
+                        entry.insert("object".to_string(), serde_json::json!("model"));
+                        entry.insert("owned_by".to_string(), serde_json::json!("openai"));
+
+                        // The upstream's own capability data is carried over, so
+                        // a client can tell which thinking levels a model
+                        // offers and how large its context is.
+                        for field in openai::CATALOGUE_FIELDS {
+                            if let Some(value) = model.get(*field) {
+                                entry.insert((*field).to_string(), value.clone());
+                            }
+                        }
+
+                        // x.ai's catalogue calls the context window
+                        // `context_length`, so the merged catalogue gives both
+                        // providers the same name for it.
+                        if let Some(window) = model.get("context_window") {
+                            entry.insert("context_length".to_string(), window.clone());
+                        }
+
+                        serde_json::Value::Object(entry)
                     })
                     .collect()
             })
@@ -326,6 +341,52 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], "gpt-5");
         assert_eq!(data[0]["object"], "model");
+    }
+
+    #[test]
+    fn the_slug_catalogue_keeps_the_upstreams_capability_data() {
+        // The upstream says which thinking levels a model offers and how large
+        // its context is. A client reads the catalogue to learn that, so it has
+        // to survive the normalisation.
+        let body = br#"{"models":[{
+            "slug":"gpt-6.1-sol",
+            "display_name":"GPT-6.1-Sol",
+            "visibility":"list",
+            "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],
+            "default_reasoning_level":"low",
+            "supports_reasoning_effort_updates":true,
+            "context_window":500000,
+            "max_context_window":872000,
+            "input_modalities":["text","image"],
+            "base_instructions":"You are Codex, a very long internal prompt.",
+            "model_messages":{"instructions_template":"another long prompt"}
+        }]}"#;
+
+        let normalized = normalize_catalogue(CatalogueKind::SlugArray, body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        let model = &value["data"][0];
+
+        assert_eq!(model["id"], "gpt-6.1-sol");
+        assert_eq!(model["object"], "model");
+        assert_eq!(model["owned_by"], "openai");
+        assert_eq!(model["display_name"], "GPT-6.1-Sol");
+
+        // The thinking levels, which are what a client offers the user.
+        assert_eq!(model["supported_reasoning_levels"][0]["effort"], "low");
+        assert_eq!(model["supported_reasoning_levels"][1]["effort"], "high");
+        assert_eq!(model["default_reasoning_level"], "low");
+        assert_eq!(model["supports_reasoning_effort_updates"], true);
+
+        // The limits, under both the upstream's name and x.ai's.
+        assert_eq!(model["context_window"], 500000);
+        assert_eq!(model["context_length"], 500000);
+        assert_eq!(model["max_context_window"], 872000);
+        assert_eq!(model["input_modalities"][1], "image");
+
+        // The upstream's own instructions are not part of a catalogue a client
+        // can read.
+        assert!(model.get("base_instructions").is_none());
+        assert!(model.get("model_messages").is_none());
     }
 
     #[test]

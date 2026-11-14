@@ -296,11 +296,25 @@ fn strip_bearer(value: &str) -> Option<&str> {
 
 /// An error in the OpenAI error shape.
 pub fn openai_error(status: u16, message: &str, kind: &str) -> Response {
+    openai_error_with_code(status, message, kind, None)
+}
+
+/// An error in the OpenAI error shape, carrying the provider's own code.
+///
+/// The code is what tells a client what actually went wrong — `model_not_found`
+/// says one thing and `subscription_sharing_usage_limit_exceeded` says another
+/// — so the upstream's code is passed through rather than flattened away.
+pub fn openai_error_with_code(
+    status: u16,
+    message: &str,
+    kind: &str,
+    code: Option<&str>,
+) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": message,
             "type": kind,
-            "code": serde_json::Value::Null,
+            "code": code,
         }
     });
     Response::json(status, body.to_string())

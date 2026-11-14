@@ -68,6 +68,34 @@ authenticates with your own subscription over OAuth.
 - **A self-contained daemon.** PID-file based, with no launchd unit and no
   systemd unit, and no service manager to configure.
 
+### Fixed
+
+- **A thinking level now reaches the model.** A Chat Completions request sets
+  the level with `reasoning_effort`; the Responses API rejects that spelling
+  outright, so it was being dropped and the model used its own default. It is
+  now renamed to `reasoning.effort`, and the upstream's reasoning summary is
+  asked for so the thinking has somewhere to go.
+
+- **The thinking comes back.** The upstream's reasoning summary is carried in
+  `reasoning_content` — the field x.ai's Chat Completions answer uses — so a
+  client shows the thinking for both providers, in a streamed answer as well as
+  a complete one.
+
+- **The model catalogue says what a model can do.** The ChatGPT entries were
+  reduced to a name, which left a client with nothing to offer the user. They
+  now carry the upstream's own data: the thinking levels a model offers, its
+  context window, whether it takes images.
+
+- **An upstream error keeps its status, type and code.** A request for a model
+  the provider does not serve came back as a `502 server error`, which reads as
+  "try again" for something that cannot succeed. It is now the upstream's own
+  `400 invalid_request_error` with the code `model_not_found`.
+
+- **A token limit is no longer thrown away.** `max_output_tokens` was on the
+  list of fields the Sign in with ChatGPT route rejects; it accepts it. A
+  client's `max_tokens` is now carried over as `max_output_tokens` instead of
+  being silently dropped.
+
 ### Security
 
 - The client's credentials are stripped before a request is forwarded, and the

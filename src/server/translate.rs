@@ -36,6 +36,37 @@ pub fn chat_request_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
+    // A Chat Completions client names a thinking level with `reasoning_effort`
+    // and a token limit with `max_tokens`. The Responses API names them
+    // `reasoning.effort` and `max_output_tokens`, and rejects the Chat
+    // Completions spellings outright — "Unsupported parameter: reasoning_effort"
+    // — so they are renamed here rather than dropped.
+    //
+    // A client that already speaks the Responses shape sends `reasoning` and
+    // `max_output_tokens`, and those are carried over untouched above.
+    if !output.contains_key("reasoning")
+        && let Some(effort) = object.get("reasoning_effort").and_then(Value::as_str)
+    {
+        output.insert(
+            "reasoning".to_string(),
+            // The summary is asked for as well, because the Chat Completions
+            // shape has nowhere else to carry the thinking: the upstream only
+            // returns the reasoning text when it is asked for. x.ai's Chat
+            // Completions answer always carries it in `reasoning_content`, so
+            // this is what makes the two providers behave the same way.
+            json!({ "effort": effort, "summary": "auto" }),
+        );
+    }
+
+    if !output.contains_key("max_output_tokens")
+        && let Some(limit) = object
+            .get("max_completion_tokens")
+            .or_else(|| object.get("max_tokens"))
+            .and_then(Value::as_u64)
+    {
+        output.insert("max_output_tokens".to_string(), json!(limit));
+    }
+
     // The instructions come from the system messages.
     let mut instructions: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
@@ -170,6 +201,16 @@ pub fn responses_to_chat_completion(body: &[u8]) -> Result<Vec<u8>, String> {
         "finish_reason": finish_reason,
     })];
 
+    // The thinking text, when the upstream sent any.
+    //
+    // x.ai's Chat Completions answer carries it in `reasoning_content`, so the
+    // same field is used here: a client that shows the thinking for one
+    // provider shows it for both.
+    let reasoning = response_reasoning(&value);
+    if !reasoning.is_empty() {
+        choices[0]["message"]["reasoning_content"] = json!(reasoning);
+    }
+
     // A failed response carries an error rather than an answer.
     //
     // The Responses object always carries an `error` key, and it is `null` on
@@ -221,6 +262,35 @@ pub fn response_text(value: &Value) -> String {
         }
     }
     parts.join("")
+}
+
+/// The thinking text in a Responses object.
+///
+/// The reasoning items carry a `summary` — a list of `summary_text` parts —
+/// rather than the reasoning itself. The summary is what the upstream is
+/// willing to hand over, so it is what a client is shown.
+fn response_reasoning(value: &Value) -> String {
+    let Some(output) = value.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        let Some(summary) = item.get("summary").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in summary {
+            if part.get("type").and_then(Value::as_str) == Some("summary_text")
+                && let Some(text) = part.get("text").and_then(Value::as_str)
+            {
+                parts.push(text.to_string());
+            }
+        }
+    }
+    parts.join("\n\n")
 }
 
 /// The finish reason of a Responses object.
@@ -330,6 +400,27 @@ impl<R: Read> ResponsesToChatStream<R> {
                     "choices": [{
                         "index": 0,
                         "delta": { "content": delta },
+                        "finish_reason": Value::Null,
+                    }],
+                });
+                encode_event(&chunk)
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                // The thinking text arrives as its own events, ahead of the
+                // answer. It goes out in `reasoning_content`, the field x.ai's
+                // Chat Completions answer uses for the same thing.
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                let chunk = json!({
+                    "id": self.id,
+                    "object": "chat.completion.chunk",
+                    "created": self.created,
+                    "model": self.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "reasoning_content": delta },
                         "finish_reason": Value::Null,
                     }],
                 });
@@ -534,6 +625,140 @@ mod tests {
         // The rejected fields are not carried over.
         assert!(value.get("temperature").is_none());
         assert!(value.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn the_thinking_level_is_renamed_for_the_responses_api() {
+        // A Chat Completions client names the thinking level with
+        // `reasoning_effort`. The Responses API rejects that spelling
+        // outright, so it is renamed rather than dropped.
+        let body = br#"{
+            "model": "gpt-6.1-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "xhigh"
+        }"#;
+
+        let converted = chat_request_to_responses(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        assert_eq!(value["reasoning"]["effort"], "xhigh");
+        // The summary is asked for, because the Chat Completions shape has
+        // nowhere else to carry the thinking.
+        assert_eq!(value["reasoning"]["summary"], "auto");
+        // The Chat Completions spelling is never forwarded.
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn a_responses_shaped_thinking_level_is_left_alone() {
+        // A client that already speaks the Responses shape keeps its own
+        // parameters.
+        let body = br#"{
+            "model": "gpt-6.1-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning": {"effort": "low", "summary": "detailed"}
+        }"#;
+
+        let converted = chat_request_to_responses(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        assert_eq!(value["reasoning"]["effort"], "low");
+        assert_eq!(value["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn the_token_limit_is_renamed_for_the_responses_api() {
+        let body = br#"{
+            "model": "gpt-6.1-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 100
+        }"#;
+
+        let converted = chat_request_to_responses(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        assert_eq!(value["max_output_tokens"], 100);
+        assert!(value.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn the_newer_token_limit_wins() {
+        let body = br#"{
+            "model": "gpt-6.1-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 100,
+            "max_completion_tokens": 250
+        }"#;
+
+        let converted = chat_request_to_responses(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        assert_eq!(value["max_output_tokens"], 250);
+    }
+
+    #[test]
+    fn the_thinking_text_is_carried_in_the_chat_completions_answer() {
+        // x.ai's Chat Completions answer carries the thinking in
+        // `reasoning_content`, so the same field is used here.
+        let body = br#"{
+            "id": "resp_1",
+            "model": "gpt-6.1-sol",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Thinking."}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}
+            ]
+        }"#;
+
+        let converted = responses_to_chat_completion(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        assert_eq!(value["choices"][0]["message"]["content"], "Done.");
+        assert_eq!(
+            value["choices"][0]["message"]["reasoning_content"],
+            "Thinking."
+        );
+    }
+
+    #[test]
+    fn an_answer_without_thinking_carries_no_thinking_field() {
+        let body = br#"{
+            "id": "resp_1",
+            "model": "gpt-6.1-sol",
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}]
+        }"#;
+
+        let converted = responses_to_chat_completion(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        assert!(
+            value["choices"][0]["message"]
+                .get("reasoning_content")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_thinking_text_is_streamed_as_it_arrives() {
+        let stream = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Think\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+        );
+
+        let mut translated = ResponsesToChatStream::new(stream.as_bytes());
+        let mut out = String::new();
+        let mut buffer = [0u8; 4096];
+        while let Ok(count) = translated.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            out.push_str(&String::from_utf8_lossy(&buffer[..count]));
+        }
+
+        assert!(out.contains(r#""reasoning_content":"Think""#), "{out}");
+        assert!(out.contains(r#""content":"Done""#), "{out}");
     }
 
     #[test]

@@ -73,7 +73,7 @@ automatically — `eggpass status` will show you as logged in.
 > The xAI consent page says "Grok Build", and it will. xAI has no
 > general-purpose public OAuth client for third-party apps, so `eggpass` signs
 > in with the official Grok Build CLI's public client id. See
-> [docs/commands.md](docs/commands.md#login) for what that does and does not
+> [docs/commands.md](docs/commands.md#eggpass-login) for what that does and does not
 > control.
 
 ### Client keys
@@ -136,7 +136,13 @@ whether your client's base URL already carries the `/v1`.
 
 `GET /v1/models` is the **union** of every provider you are signed in to,
 fetched live. There is no compiled-in list of model names, so a model no
-provider advertises is a `404` rather than a hopeful `200`.
+provider advertises is a `404` rather than a hopeful `200`. Each entry says
+what the model can do — the thinking levels it offers, its context window —
+so a client can offer them without a list of its own.
+
+Thinking levels are set the way the Chat Completions API spells them, with
+`reasoning_effort`, and the thinking comes back in `reasoning_content`. The
+proxy translates the spelling for ChatGPT, which speaks the Responses API.
 
 ## Configuration
 

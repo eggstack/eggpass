@@ -49,10 +49,12 @@ pub const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
 ///
 /// Passing one of these through fails the request, so they are removed from
 /// the body instead.
+///
+/// `max_output_tokens` is **not** in this list: the route accepts it, and a
+/// client that sets a token limit means it.
 pub const REJECTED_FIELDS: &[&str] = &[
     "background",
     "conversation",
-    "max_output_tokens",
     "max_tool_calls",
     "metadata",
     "moderation",
@@ -65,6 +67,48 @@ pub const REJECTED_FIELDS: &[&str] = &[
     "top_p",
     "truncation",
     "user",
+];
+
+/// The upstream model fields that are carried into the public catalogue.
+///
+/// The upstream's catalogue says a great deal about each model — which
+/// thinking levels it offers, how large its context is, whether it takes
+/// images — and a client that reads the catalogue is how it learns what a
+/// model can do. Throwing that away leaves a client with nothing but a name,
+/// which is how a thinking level ends up not being offered at all.
+///
+/// The list is an allowlist on purpose. The upstream also carries the model's
+/// own instructions in `base_instructions` and `model_messages` — tens of
+/// kilobytes of internal prompt text that has no business in a catalogue a
+/// client can read.
+pub const CATALOGUE_FIELDS: &[&str] = &[
+    // Identity.
+    "display_name",
+    "description",
+    // Thinking.
+    "supported_reasoning_levels",
+    "default_reasoning_level",
+    "supports_reasoning_effort_updates",
+    "supports_reasoning_summaries",
+    "supports_reasoning_summary_parameter",
+    "multi_agent_reasoning_effort",
+    // Limits.
+    "context_window",
+    "max_context_window",
+    "truncation_policy",
+    // Verbosity.
+    "default_verbosity",
+    "support_verbosity",
+    // Shape.
+    "input_modalities",
+    "tool_mode",
+    "shell_type",
+    "experimental_supported_tools",
+    // Availability.
+    "supported_in_api",
+    "priority",
+    "service_tiers",
+    "additional_speed_tiers",
 ];
 
 /// Generate the stable identifier for this host.

@@ -32,6 +32,10 @@ client ──OpenAI API──► eggpass ──OAuth bearer──► api.x.ai / 
 - **Chat Completions are translated for ChatGPT.** Sign in with ChatGPT speaks
   the Responses API, so a Chat Completions request is converted on the way in
   and the answer converted back on the way out. x.ai needs no translation.
+  The conversion renames the two fields the Responses API spells differently —
+  `reasoning_effort` becomes `reasoning.effort` and `max_tokens` becomes
+  `max_output_tokens` — because the Responses API rejects the Chat Completions
+  spellings outright.
 - **Your client's credentials never leave the machine** — they are stripped
   before the request is forwarded, and the provider's token is put in their
   place. The provider-owned headers are stripped too, so a client cannot make
@@ -61,6 +65,44 @@ That has two consequences worth knowing:
 - A model that no provider advertises is a `404`, not a hopeful `200`.
 - The catalogue changes when the providers change. There is nothing to update
   here when xAI or OpenAI ship a new model.
+
+Each entry carries what the provider says about the model, not just its name:
+the thinking levels it offers, its context window, whether it takes images.
+That is what lets a client tell the user which thinking levels are on offer
+without a hardcoded list of its own. See
+[Thinking levels](#thinking-levels) below.
+
+## Thinking levels
+
+A thinking level is the amount of reasoning a model does before it answers.
+Both providers name it, and each in its own way.
+
+- **x.ai** takes `reasoning_effort` on `/v1/chat/completions` and answers with
+  the thinking in `reasoning_content`.
+- **ChatGPT** speaks the Responses API, which takes `reasoning.effort` and
+  answers with a reasoning *item*.
+
+`eggpass` makes the two look the same to a client:
+
+- A Chat Completions request that sets `reasoning_effort` has it renamed to
+  `reasoning.effort` for ChatGPT, and the upstream's reasoning summary is asked
+  for as well. The Responses API rejects the Chat Completions spelling, so
+  without the rename the level would be silently dropped and the model would
+  use its own default instead.
+- The answer's thinking comes back in `reasoning_content`, the field x.ai
+  uses, whether it arrived as a summary or as streamed deltas.
+
+The levels each model accepts are the upstream's business, and the catalogue
+says which they are under `supported_reasoning_levels`. A level the model does
+not offer is refused by the upstream, and that refusal comes back to the client
+as the upstream's own error.
+
+## Errors
+
+An error from a provider keeps its status, its type and its code. A request for
+a model the provider does not serve comes back as a `400` with the code
+`model_not_found`, not as a blanket `502 server error` — the difference
+between "this cannot work" and "try again".
 
 ## The auth rules
 

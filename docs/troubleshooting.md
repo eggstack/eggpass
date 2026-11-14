@@ -38,6 +38,24 @@ the ChatGPT plan's allowance is used up, or the account is not eligible for
 plan usage. The error code comes from OpenAI; `eggpass status` shows whether
 plan usage was granted to this installation.
 
+**A request fails with `model_not_found`** — the model is not one the
+provider serves. The Sign in with ChatGPT route offers the `gpt-6` and
+`gpt-5.6` families; `gpt-5-codex` and `codex-mini-latest` are not among them,
+and asking for one is answered with a `400` that says so. `GET /v1/models`
+lists what is actually available.
+
+**A client shows no thinking levels for a model** — the levels come from the
+provider's catalogue, so the client has to be reading `/v1/models`. Some
+clients only read a model's name and show nothing else; check what the client
+did with the catalogue before suspecting the proxy. The levels a model does
+offer are listed under `supported_reasoning_levels`.
+
+**A thinking level is set but the model does not seem to think harder** — the
+level is sent as `reasoning_effort`, which is renamed to `reasoning.effort`
+for ChatGPT. Not every model takes every level: `none` and `minimal` are
+valid in general but are refused by some models, and the refusal comes back
+from OpenAI as an error.
+
 **`eggpass update` refuses to replace the binary** — the installation is
 Cargo-managed. Cargo owns that file and its bookkeeping, so replacing it
 behind Cargo's back would leave `cargo install --list` and `cargo uninstall`

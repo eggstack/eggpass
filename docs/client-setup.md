@@ -29,6 +29,34 @@ curl http://127.0.0.1:8484/v1/models
 A model no provider advertises is a `404`, not a hopeful `200`. `eggpass
 status` prints the count too.
 
+Each entry carries what the provider says about the model — the thinking
+levels it offers under `supported_reasoning_levels`, its context window, and
+whether it takes images — so a client that reads the catalogue can tell the
+user what the model does.
+
+## Thinking levels
+
+A thinking level is how much reasoning a model does before it answers. Set it
+the way the Chat Completions API spells it, and the proxy translates it for
+ChatGPT:
+
+```python
+answer = client.chat.completions.create(
+    model="gpt-6.1-sol",
+    messages=[{"role": "user", "content": "Hello"}],
+    reasoning_effort="high",
+)
+print(answer.choices[0].message.reasoning_content)
+```
+
+The thinking comes back in `reasoning_content`, the field x.ai's answer uses
+too, so one client shows it for both providers. In a streamed answer it
+arrives in the same field, ahead of the answer itself.
+
+Not every model takes every level — the levels a model offers are listed in
+the catalogue — and a level it does not take is refused by the provider, with
+the provider's own error.
+
 ---
 
 ## OpenAI SDK
