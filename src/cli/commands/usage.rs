@@ -21,9 +21,13 @@
 //! body carries the account's email, its user id and its balances; it goes
 //! to the provider and stops there.
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::cli::{CommandError, Context};
+use crate::daemon::{self, DaemonState};
 use crate::provider::usage::{ProviderUsage, UsageReport};
 use crate::provider::{ProviderId, ProviderRuntime};
 use crate::timeutil;
@@ -57,6 +61,11 @@ pub fn usage(
         None => ProviderId::all().to_vec(),
     };
 
+    // What the last inference to each provider was answered with. The daemon
+    // keeps it in memory, so there is nothing to read when it is not
+    // running.
+    let inferences = last_inferences(context);
+
     let entries: Vec<ProviderEntry> = providers
         .into_iter()
         .map(|provider| ProviderEntry {
@@ -66,6 +75,9 @@ pub fn usage(
             // the bars: a machine-readable number without it is as misleading
             // as a number without it on the terminal.
             caption: caption_for(provider, &context.config),
+            // The last inference is the only evidence there is about a
+            // provider that publishes no quota of its own.
+            last_inference: inferences.get(&provider).copied(),
         })
         .collect();
 
@@ -116,6 +128,12 @@ struct ProviderEntry {
     outcome: ProviderUsage,
     /// Which pool the numbers belong to, when the provider reported any.
     caption: Option<String>,
+    /// The HTTP status the last inference to this provider was answered with.
+    ///
+    /// It is here for every provider, including the ones that reported a
+    /// quota: a machine-readable report should carry the facts, not only the
+    /// ones that happen to be printed.
+    last_inference: Option<u16>,
 }
 
 /// The machine-readable form of the report.
@@ -175,7 +193,7 @@ fn render_block(out: &mut String, entry: &ProviderEntry) {
             out.push_str(entry.provider.display_name());
             out.push('\n');
             out.push_str(&field(
-                "Usage",
+                "Quota",
                 &format!(
                     "unavailable — not signed in; run `eggpass login --provider {}`",
                     entry.provider.as_str()
@@ -185,13 +203,21 @@ fn render_block(out: &mut String, entry: &ProviderEntry) {
         }
         ProviderUsage::Unavailable {
             reason,
+            source,
             hint,
             signals,
         } => {
             out.push_str(entry.provider.display_name());
             out.push('\n');
-            out.push_str(&field("Usage", &format!("unavailable — {reason}")));
+            out.push_str(&field("Quota", &format!("unavailable — {reason}")));
             out.push('\n');
+            // The quota cannot be read, so the last inference is the only
+            // evidence there is about the account.
+            render_inference(out, entry);
+            if let Some(source) = source {
+                out.push_str(&field("Source", source));
+                out.push('\n');
+            }
             if let Some(hint) = hint {
                 out.push_str(&field("Limits", hint));
                 out.push('\n');
@@ -208,10 +234,98 @@ fn render_block(out: &mut String, entry: &ProviderEntry) {
         ProviderUsage::Failed { reason } => {
             out.push_str(entry.provider.display_name());
             out.push('\n');
-            out.push_str(&field("Usage", &format!("unavailable — {reason}")));
+            out.push_str(&field("Quota", &format!("unavailable — {reason}")));
             out.push('\n');
+            render_inference(out, entry);
+            // The caption belongs here too: the inference that succeeded may
+            // be metered against another pool, and this is the block that
+            // says so.
+            render_caption(out, entry.caption.as_deref());
         }
     }
+}
+
+/// Render the caption, if there is one.
+///
+/// It is set in a fixed column rather than the label column: it is a note
+/// about the block, not a field of it.
+fn render_caption(out: &mut String, caption: Option<&str>) {
+    let Some(caption) = caption else {
+        return;
+    };
+    out.push_str(&format!("  {caption}\n"));
+}
+
+/// Render the row that says what the last inference was answered with.
+///
+/// It is printed when the quota could not be read, and only then: a block
+/// that already carries a percentage has said everything about the account
+/// that it can.
+fn render_inference(out: &mut String, entry: &ProviderEntry) {
+    let Some(status) = entry.last_inference else {
+        return;
+    };
+    out.push_str(&field("Inference", &crate::inference::outcome_text(status)));
+    out.push('\n');
+}
+
+/// Ask the running daemon what the last inference to each provider was
+/// answered with.
+///
+/// The daemon keeps it in memory and writes nothing, so there is nothing to
+/// read when it is not running: the row is then simply not printed. The
+/// request is best-effort — a daemon that cannot be reached must not break
+/// the report.
+fn last_inferences(context: &Context) -> BTreeMap<ProviderId, u16> {
+    let state = daemon::state(
+        &context.paths.pid_file(),
+        &context.config.host,
+        context.config.port,
+    );
+    let DaemonState::Running { host, port, .. } = state else {
+        return BTreeMap::new();
+    };
+    fetch_last_inferences(daemon::probe_host(&host), port)
+}
+
+/// Ask a daemon what the last inference to each provider was answered with.
+fn fetch_last_inferences(host: &str, port: u16) -> BTreeMap<ProviderId, u16> {
+    let url = format!("http://{host}:{port}/v1/last-inference");
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let Ok(response) = agent.get(&url).call() else {
+        return BTreeMap::new();
+    };
+    if response.status().as_u16() != 200 {
+        return BTreeMap::new();
+    }
+    let Ok(text) = response.into_body().read_to_string() else {
+        return BTreeMap::new();
+    };
+    parse_last_inferences(&text)
+}
+
+/// Read the daemon's answer.
+fn parse_last_inferences(text: &str) -> BTreeMap<ProviderId, u16> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return BTreeMap::new();
+    };
+    let Some(providers) = value.get("providers").and_then(|value| value.as_object()) else {
+        return BTreeMap::new();
+    };
+
+    providers
+        .iter()
+        .filter_map(|(name, status)| {
+            let provider = ProviderId::parse(name)?;
+            let status = u16::try_from(status.as_u64()?).ok()?;
+            Some((provider, status))
+        })
+        .collect()
 }
 
 /// Render a provider that reported usage.
@@ -313,9 +427,7 @@ fn render_reported(
 
     // The caption says which pool the number belongs to. It is not optional:
     // on the `api` upstream the number is not what `eggpass` spends.
-    if let Some(caption) = caption {
-        out.push_str(&format!("  {caption}\n"));
-    }
+    render_caption(out, caption);
 }
 
 /// A labelled line.
@@ -441,6 +553,31 @@ mod tests {
             provider: ProviderId::Xai,
             outcome,
             caption: None,
+            last_inference: None,
+        }
+    }
+
+    /// An entry with the status of the last inference.
+    fn entry_with_inference(outcome: ProviderUsage, status: u16) -> ProviderEntry {
+        ProviderEntry {
+            provider: ProviderId::OpenAi,
+            outcome,
+            caption: None,
+            last_inference: Some(status),
+        }
+    }
+
+    /// The ChatGPT answer: a provider with no quota API of its own.
+    fn chatgpt_unavailable() -> ProviderUsage {
+        ProviderUsage::Unavailable {
+            reason: "Sign in with ChatGPT does not expose a quota API".to_string(),
+            source: Some("not exposed by OAuth".to_string()),
+            hint: Some("https://chatgpt.com/settings/usage".to_string()),
+            signals: vec![
+                "429 subscription_sharing_usage_limit_exceeded",
+                "503 subscription_sharing_usage_unavailable",
+                "403 subscription_sharing_user_not_eligible",
+            ],
         }
     }
 
@@ -569,15 +706,8 @@ mod tests {
         let entry = ProviderEntry {
             provider: ProviderId::OpenAi,
             caption: None,
-            outcome: ProviderUsage::Unavailable {
-                reason: "Sign in with ChatGPT does not expose a quota API".to_string(),
-                hint: Some("https://chatgpt.com/settings/usage".to_string()),
-                signals: vec![
-                    "429 subscription_sharing_usage_limit_exceeded",
-                    "503 subscription_sharing_usage_unavailable",
-                    "403 subscription_sharing_user_not_eligible",
-                ],
-            },
+            outcome: chatgpt_unavailable(),
+            last_inference: None,
         };
 
         let text = render(&[entry]);
@@ -637,6 +767,133 @@ mod tests {
             text.contains("billed separately against the xAI API tier"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_chatgpt_block_says_what_the_last_inference_did() {
+        // The quota cannot be read for ChatGPT, so the inference is the only
+        // evidence there is about the account.
+        let text = render(&[entry_with_inference(chatgpt_unavailable(), 200)]);
+
+        assert!(text.contains("Quota       unavailable"), "{text}");
+        assert!(text.contains("Inference   succeeded"), "{text}");
+        assert!(text.contains("Source      not exposed by OAuth"), "{text}");
+        assert!(
+            text.contains("Limits      https://chatgpt.com/settings/usage"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_refused_inference_reads_with_its_status() {
+        let text = render(&[entry_with_inference(chatgpt_unavailable(), 429)]);
+        assert!(text.contains("Inference   failed (429)"), "{text}");
+    }
+
+    #[test]
+    fn a_block_with_no_inference_has_no_row() {
+        // The daemon has not served one, so there is nothing to say.
+        let text = render(&[entry(chatgpt_unavailable())]);
+        assert!(!text.contains("Inference"), "{text}");
+    }
+
+    #[test]
+    fn a_block_with_a_percentage_does_not_repeat_the_inference() {
+        // The quota is known here, so the block says everything about the
+        // account that it can.
+        let mut reported_entry = entry(reported(Some(40.0)));
+        reported_entry.last_inference = Some(200);
+        let text = render(&[reported_entry]);
+        assert!(!text.contains("Inference"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_read_still_says_what_the_inference_did() {
+        let mut failed = entry_with_inference(
+            ProviderUsage::Failed {
+                reason: "could not reach the billing endpoint".to_string(),
+            },
+            200,
+        );
+        failed.caption = caption_for(ProviderId::Xai, &crate::config::Config::default());
+        let text = render(&[failed]);
+
+        assert!(
+            text.contains("Quota       unavailable — could not reach the billing endpoint"),
+            "{text}"
+        );
+        assert!(text.contains("Inference   succeeded"), "{text}");
+        // The caption keeps the two apart: the inference that succeeded is
+        // metered against another pool.
+        assert!(
+            text.contains("billed separately against the xAI API tier"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_json_report_carries_the_last_inference() {
+        let entries = vec![entry_with_inference(chatgpt_unavailable(), 429)];
+
+        let report = UsageReportJson {
+            providers: &entries,
+        };
+        let text = serde_json::to_string(&report).unwrap();
+        assert!(text.contains("\"last_inference\":429"), "{text}");
+        assert!(
+            text.contains("\"source\":\"not exposed by OAuth\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_daemons_answer_is_read_over_http() {
+        // A listener that answers the way the daemon does.
+        let body = r#"{"providers":{"openai":429}}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("the listener binds");
+        let port = listener.local_addr().expect("the address").port();
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            use std::io::Write;
+            let _ = stream.write_all(answer.as_bytes());
+        });
+
+        let read = fetch_last_inferences("127.0.0.1", port);
+        assert_eq!(read.get(&ProviderId::OpenAi), Some(&429));
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_be_reached_is_not_an_error() {
+        // A port nothing is listening on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("the listener binds");
+        let port = listener.local_addr().expect("the address").port();
+        drop(listener);
+
+        assert!(fetch_last_inferences("127.0.0.1", port).is_empty());
+    }
+
+    #[test]
+    fn the_daemons_answer_is_read() {
+        let parsed = parse_last_inferences(r#"{"providers":{"openai":429,"xai":200}}"#);
+        assert_eq!(parsed.get(&ProviderId::OpenAi), Some(&429));
+        assert_eq!(parsed.get(&ProviderId::Xai), Some(&200));
+    }
+
+    #[test]
+    fn an_unusable_answer_is_read_as_nothing() {
+        assert!(parse_last_inferences("").is_empty());
+        assert!(parse_last_inferences("not json").is_empty());
+        assert!(parse_last_inferences(r#"{"providers":{}}"#).is_empty());
+        // A provider we do not know is not one of ours.
+        assert!(parse_last_inferences(r#"{"providers":{"nope":200}}"#).is_empty());
+        // And a status that is not a status is not one.
+        assert!(parse_last_inferences(r#"{"providers":{"openai":"200"}}"#).is_empty());
     }
 
     #[test]
@@ -718,6 +975,7 @@ mod tests {
             provider: ProviderId::OpenAi,
             caption: None,
             outcome: ProviderUsage::NotSignedIn,
+            last_inference: None,
         }];
 
         let report = UsageReportJson {

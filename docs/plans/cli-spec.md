@@ -677,7 +677,8 @@ eggpass usage --json           # the report as JSON
    with the proxy stopped.
 3. **No state of its own.** `usage` writes no cache, no config and no key
    store. It may *trigger* a token refresh — that is the `TokenManager`'s job,
-   and it writes the credential file — but it adds nothing of its own.
+   and it writes the credential file — but it adds nothing of its own. It does
+   **read** the daemon's memory, over the loopback socket.
 4. **A provider that is not signed in still gets a block**, so the output does
    not change shape, and no network call is made for it.
 5. **A provider that fails still gets a block**, and the failure is stated
@@ -696,7 +697,9 @@ x.ai · SuperGrok
   This is your Grok subscription. `eggpass` requests are billed separately against the xAI API tier.
 
 ChatGPT
-  Usage       unavailable — Sign in with ChatGPT does not expose a quota API
+  Quota       unavailable — Sign in with ChatGPT does not expose a quota API
+  Inference   succeeded
+  Source      not exposed by OAuth
   Limits      https://chatgpt.com/settings/usage
   Signals     429 subscription_sharing_usage_limit_exceeded
               503 subscription_sharing_usage_unavailable
@@ -725,9 +728,65 @@ ChatGPT
   which pool the number belongs to, and it changes with
   `providers.xai.upstream`.
 - **ChatGPT is unavailable, and says why.** Sign in with ChatGPT exposes no
-  quota API, so the block names the authentication mode, links OpenAI's own
-  usage page, and lists the three error codes OpenAI does publish. It never
-  infers a number.
+  quota API, so the block names the authentication mode, says where the quota
+  would have come from, links OpenAI's own usage page, and lists the three
+  error codes OpenAI does publish. It never infers a number.
+- **The last inference is shown when the quota could not be read.** The
+  `Inference` row says what the last inference to that provider was answered
+  with — `succeeded`, or `failed (429)`. It is the only evidence there is
+  about an account whose quota cannot be read, so a block that already carries
+  a percentage does not repeat it.
+- **Nothing is kept on disk.** The daemon holds one number per provider in
+  memory and writes nothing: no file, no log, no history. A record that
+  outlived the process would be a history of what the user asked for.
+
+**The last inference**
+
+The daemon keeps the HTTP status of the last inference to each provider, in
+memory, and serves it on `GET /v1/last-inference`:
+
+```json
+{ "providers": { "openai": 429 } }
+```
+
+The status is the one the proxy answered the client with: the upstream's own
+status for an upstream refusal, `401` for a refused credential and `502` for a
+connection that never reached the provider. It is gone when the daemon stops,
+so a daemon that has not served an inference has nothing to say — and the row
+is then not printed at all.
+
+The route is unauthenticated, like `/health`: the local command that reads it
+holds no key material — the keys `eggpass` issues are stored as salted hashes,
+so nothing on the machine can present one — and the answer is a status code
+and nothing else. The authority guard still applies, so a rebound request from
+a web page is refused with `421`.
+
+**`--json`**
+
+The report is one entry per provider, each carrying the provider's status and
+whatever that status has to say:
+
+```json
+{
+  "providers": [
+    {
+      "provider": "openai",
+      "status": "unavailable",
+      "reason": "Sign in with ChatGPT does not expose a quota API",
+      "source": "not exposed by OAuth",
+      "hint": "https://chatgpt.com/settings/usage",
+      "signals": ["429 subscription_sharing_usage_limit_exceeded"],
+      "caption": null,
+      "last_inference": 429
+    }
+  ]
+}
+```
+
+`last_inference` is the HTTP status of the last inference to that provider, or
+`null` when there is none. A field that does not apply is `null`, never a zero
+and never absent: a machine reading the report has to be able to tell "not
+exposed" from "zero".
 
 **Exit codes:** `0` at least one provider produced a block · `1` the arguments
 were wrong, or every provider failed operationally · `2` no provider is signed
@@ -865,14 +924,15 @@ not understand survive.
 | `POST /v1/responses` | OpenAI-compatible Responses API |
 | `GET /v1/models` | The live model catalogue, merged across signed-in providers |
 | `GET /v1/models/{id}` | Single model |
+| `GET /v1/last-inference` | The HTTP status of the last inference to each provider (no auth required) |
 | `GET /health` | Liveness probe (no auth required) |
 
 `GET /v1/models` is a **live round trip**. There is no static catalogue: the
 union of the signed-in providers' catalogues is what is advertised, and a
 model id no provider advertises is a `404`.
 
-**Authentication.** Every endpoint except `/health` needs a key when one is
-configured. The key may arrive as `Authorization: Bearer <key>`, as
+**Authentication.** Every endpoint except `/health` and `/v1/last-inference`
+needs a key when one is configured. The key may arrive as `Authorization: Bearer <key>`, as
 `X-Api-Key: <key>`, or as a `key` query parameter, and may be one of the keys
 `eggpass key add` issued or the `api_key` in the config file. A request
 without an accepted key is a `401` in the OpenAI error shape. The client's key

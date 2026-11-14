@@ -41,6 +41,12 @@ use crate::provider::usage::ProviderUsage;
 /// The page OpenAI points users at for their own usage.
 pub const USAGE_PAGE: &str = "https://chatgpt.com/settings/usage";
 
+/// Where the quota would have come from, had it been exposed.
+///
+/// The Sign in with ChatGPT grant carries no quota scope: the token says what
+/// the account may do, not how much of the allowance is left.
+pub const SOURCE: &str = "not exposed by OAuth";
+
 /// The error codes Sign in with ChatGPT publishes about the shared allowance.
 pub const SIGNALS: &[&str] = &[
     "429 subscription_sharing_usage_limit_exceeded",
@@ -60,6 +66,7 @@ pub const SIGNALS: &[&str] = &[
 pub fn collect(_runtime: &ProviderRuntime) -> ProviderUsage {
     ProviderUsage::Unavailable {
         reason: "Sign in with ChatGPT does not expose a quota API".to_string(),
+        source: Some(SOURCE.to_string()),
         hint: Some(USAGE_PAGE.to_string()),
         signals: SIGNALS.to_vec(),
     }
@@ -68,6 +75,7 @@ pub fn collect(_runtime: &ProviderRuntime) -> ProviderUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ProviderId;
 
     #[test]
     fn the_signals_name_the_documented_codes() {
@@ -80,5 +88,34 @@ mod tests {
     #[test]
     fn the_usage_page_is_openais_own() {
         assert_eq!(USAGE_PAGE, "https://chatgpt.com/settings/usage");
+    }
+
+    #[test]
+    fn the_source_says_the_grant_is_what_is_missing() {
+        assert_eq!(SOURCE, "not exposed by OAuth");
+    }
+
+    #[test]
+    fn the_answer_names_the_source_and_the_place_to_look() {
+        let runtime = crate::provider::ProviderRuntime::new(
+            ProviderId::OpenAi,
+            &crate::config::Config::default(),
+            &crate::paths::Paths::in_directory(std::path::Path::new(".")),
+        );
+
+        match collect(&runtime) {
+            ProviderUsage::Unavailable {
+                reason,
+                source,
+                hint,
+                signals,
+            } => {
+                assert!(reason.contains("does not expose a quota API"), "{reason}");
+                assert_eq!(source.as_deref(), Some(SOURCE));
+                assert_eq!(hint.as_deref(), Some(USAGE_PAGE));
+                assert_eq!(signals.len(), 3);
+            }
+            other => panic!("expected an unavailable answer, got {other:?}"),
+        }
     }
 }

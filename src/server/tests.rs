@@ -219,12 +219,21 @@ struct Harness {
     port: u16,
     /// The keys the proxy accepts, so a test can issue one.
     keys: Arc<crate::keys::KeyStore>,
+    /// The status of the last inference the proxy served.
+    inferences: Arc<crate::inference::InferenceState>,
+    /// The provider the harness serves.
+    provider: ProviderId,
     _directory: tempfile::TempDir,
 }
 
 impl Harness {
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// The status of the last inference the proxy served.
+    fn last_inference(&self) -> Option<u16> {
+        self.inferences.snapshot().get(&self.provider).copied()
     }
 }
 
@@ -357,6 +366,8 @@ fn harness_with_spec(
         .expect("proxy binds");
     let port = server.address().port();
 
+    let inferences = Arc::new(crate::inference::InferenceState::new());
+
     let context = Arc::new(ServerContext {
         host: "127.0.0.1".to_string(),
         port,
@@ -367,6 +378,7 @@ fn harness_with_spec(
         routing: Routing::default(),
         upstream_in_flight: Arc::new(AtomicUsize::new(0)),
         max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
+        inferences: Arc::clone(&inferences),
     });
 
     let running = Arc::clone(&server);
@@ -378,6 +390,8 @@ fn harness_with_spec(
     Harness {
         port,
         keys,
+        inferences,
+        provider: spec.id,
         _directory: directory,
     }
 }
@@ -426,6 +440,129 @@ fn a_chat_completion_round_trips() {
     let body = read_json_body(response);
     assert_eq!(body["choices"][0]["message"]["content"], "hi there");
     assert_eq!(body["id"], "chatcmpl-1");
+}
+
+#[test]
+fn a_successful_inference_is_recorded() {
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/chat/completions") {
+            Reply::json(
+                200,
+                r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(chat_body().to_string())
+        .expect("the proxy answers");
+
+    assert_eq!(harness.last_inference(), Some(200));
+}
+
+#[test]
+fn a_refused_inference_is_recorded_with_its_status() {
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/chat/completions") {
+            Reply::json(
+                429,
+                r#"{"error":{"type":"rate_limit_error","code":"subscription_sharing_usage_limit_exceeded","message":"the shared allowance is exhausted"}}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(chat_body().to_string())
+        .expect("the proxy answers");
+
+    assert_eq!(harness.last_inference(), Some(429));
+}
+
+#[test]
+fn a_streamed_inference_is_recorded_when_the_stream_ends() {
+    let stub = Stub::start(|_| Reply::Stream {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![(Duration::from_millis(0), "data: [DONE]\n\n".to_string())],
+    });
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(json!({"model": "grok-4.7", "messages": [], "stream": true}).to_string())
+        .expect("the proxy answers");
+
+    let mut reader = response.into_body().into_reader();
+    let mut buffer = [0u8; 1024];
+    while reader.read(&mut buffer).expect("the stream reads") > 0 {}
+
+    assert_eq!(harness.last_inference(), Some(200));
+}
+
+#[test]
+fn the_last_inference_is_served() {
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/chat/completions") {
+            Reply::json(
+                200,
+                r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    // Before any inference there is nothing to say.
+    let response = agent()
+        .get(harness.url("/v1/last-inference"))
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_json_body(response);
+    assert_eq!(body["providers"], json!({}));
+
+    agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(chat_body().to_string())
+        .expect("the proxy answers");
+
+    let response = agent()
+        .get(harness.url("/v1/last-inference"))
+        .call()
+        .expect("the proxy answers");
+    let body = read_json_body(response);
+    assert_eq!(body["providers"]["xai"], json!(200));
+}
+
+#[test]
+fn the_last_inference_needs_no_key() {
+    // The local command that reads it holds no key material, so the route is
+    // open — like `/health`, and no more.
+    let stub = Stub::start(|_| Reply::json(404, "{}"));
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    let response = agent()
+        .get(harness.url("/v1/last-inference"))
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 200);
 }
 
 #[test]

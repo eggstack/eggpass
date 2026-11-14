@@ -10,6 +10,7 @@ pub mod chat;
 pub mod guard;
 pub mod health;
 pub mod http;
+pub mod inference;
 pub mod models;
 pub mod router;
 pub mod sse;
@@ -85,6 +86,11 @@ pub struct ServerContext {
     pub upstream_in_flight: Arc<AtomicUsize>,
     /// The largest number of simultaneous upstream requests.
     pub max_upstream_requests: usize,
+    /// The status of the last inference to each provider.
+    ///
+    /// It is kept in memory and nowhere else: `eggpass usage` reports it for
+    /// a provider that does not publish a quota of its own.
+    pub inferences: Arc<crate::inference::InferenceState>,
 }
 
 impl ServerContext {
@@ -115,6 +121,13 @@ impl ServerContext {
     /// Give an upstream slot back.
     pub fn release_upstream_slot(&self) {
         self.upstream_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Record what an inference to a provider was answered with.
+    ///
+    /// The status is the one the proxy answered the client with.
+    pub fn record_inference(&self, provider: ProviderId, status: u16) {
+        self.inferences.record(provider, status);
     }
 }
 
@@ -225,8 +238,14 @@ fn gate_decision(request: &Request, context: &ServerContext) -> http::GateDecisi
 }
 
 /// Whether the handler reads the body. Health does not.
+///
+/// The last-inference route does not either: it answers a question, and a
+/// question carries no body.
 fn keep_body_for(path: &str) -> bool {
-    !matches!(router::route(path), router::Route::Health)
+    !matches!(
+        router::route(path),
+        router::Route::Health | router::Route::LastInference
+    )
 }
 
 /// Decide whether a request may proceed, from its head and the context.
@@ -241,7 +260,14 @@ fn pre_authorize(request: &Request, context: &ServerContext) -> Option<Response>
 
     // The health probe is never authenticated: `status` and `croncheck` use
     // it, and it carries nothing but a version string.
-    if matches!(router::route(request.path()), router::Route::Health) {
+    //
+    // The last-inference route is unauthenticated for the same reason: the
+    // local command that reads it holds no key material, and the answer is an
+    // HTTP status code and nothing else.
+    if matches!(
+        router::route(request.path()),
+        router::Route::Health | router::Route::LastInference
+    ) {
         return None;
     }
 
@@ -278,6 +304,7 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
 
     match (request.method.as_str(), route) {
         ("GET", router::Route::Health) => health::handle(),
+        ("GET", router::Route::LastInference) => inference::handle(context),
         ("GET", router::Route::Models) => models::list(&request, context),
         ("GET", router::Route::Model(id)) => models::single(&request, context, &id),
         ("POST", router::Route::ChatCompletions) | ("POST", router::Route::Responses) => {
@@ -424,6 +451,7 @@ mod authorisation_tests {
             routing: Routing::default(),
             upstream_in_flight: Arc::new(AtomicUsize::new(0)),
             max_upstream_requests: DEFAULT_MAX_UPSTREAM_REQUESTS,
+            inferences: Arc::new(crate::inference::InferenceState::new()),
         }
     }
 
@@ -611,6 +639,7 @@ mod authorisation_tests {
             routing: Routing::default(),
             upstream_in_flight: Arc::new(AtomicUsize::new(0)),
             max_upstream_requests: 2,
+            inferences: Arc::new(crate::inference::InferenceState::new()),
         };
 
         assert!(context.take_upstream_slot());

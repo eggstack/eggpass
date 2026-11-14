@@ -99,6 +99,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
         Ok(response) => response,
         Err(UpstreamError::Token(err)) => {
             context.release_upstream_slot();
+            context.record_inference(provider_id, 401);
             return openai_error(
                 401,
                 &format!("{}: {err}", handle.spec.display_name),
@@ -107,6 +108,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
         }
         Err(err) => {
             context.release_upstream_slot();
+            context.record_inference(provider_id, 502);
             return openai_error(502, &err.to_string(), "server_error");
         }
     };
@@ -130,6 +132,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
         let bytes = match response.read_to_vec() {
             Ok(bytes) => bytes,
             Err(err) => {
+                context.record_inference(provider_id, 502);
                 return openai_error(
                     502,
                     &format!("could not read the upstream response: {err}"),
@@ -137,7 +140,9 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
                 );
             }
         };
-        return upstream_error(status, &bytes);
+        let response = upstream_error(status, &bytes);
+        context.record_inference(provider_id, response.status);
+        return response;
     }
 
     // Whether this is an event stream.
@@ -167,6 +172,10 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
                 Box::new(ResponsesToChatStream::new(body))
             };
             let stream = ReleasingStream::new(inner, context.upstream_in_flight.clone());
+            // The upstream answered, so the last inference is a success. A
+            // stream that breaks afterwards is the client's problem: the code
+            // it was given is the code that was sent.
+            context.record_inference(provider_id, status);
             return sse::stream(headers, Box::new(stream));
         }
 
@@ -175,6 +184,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
             Ok(aggregated) => aggregated,
             Err(err) => {
                 context.release_upstream_slot();
+                context.record_inference(provider_id, 502);
                 return openai_error(502, &err, "server_error");
             }
         };
@@ -188,9 +198,13 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
                 } else {
                     match translate::responses_to_chat_completion(&bytes) {
                         Ok(bytes) => bytes,
-                        Err(err) => return openai_error(502, &err, "server_error"),
+                        Err(err) => {
+                            context.record_inference(provider_id, 502);
+                            return openai_error(502, &err, "server_error");
+                        }
                     }
                 };
+                context.record_inference(provider_id, 200);
                 Response::bytes(200, headers, bytes)
             }
             Aggregated::Failed { code, message } => {
@@ -201,13 +215,20 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
                     Some("subscription_sharing_invalid_user") => (401, "invalid_request_error"),
                     _ => (502, "server_error"),
                 };
+                // The upstream answered 200 and reported the failure in the
+                // stream. The proxy answers the client with the status the
+                // code stands for, and that is the code that is remembered.
+                context.record_inference(provider_id, status);
                 openai_error(status, &message, kind)
             }
-            Aggregated::Incomplete => openai_error(
-                502,
-                "the upstream stream ended without a completed response",
-                "server_error",
-            ),
+            Aggregated::Incomplete => {
+                context.record_inference(provider_id, 502);
+                openai_error(
+                    502,
+                    "the upstream stream ended without a completed response",
+                    "server_error",
+                )
+            }
         };
     }
 
@@ -216,6 +237,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
         Ok(bytes) => bytes,
         Err(err) => {
             context.release_upstream_slot();
+            context.record_inference(provider_id, 502);
             return openai_error(
                 502,
                 &format!("could not read the upstream response: {err}"),
@@ -230,10 +252,16 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
     } else {
         match translate::responses_to_chat_completion(&bytes) {
             Ok(bytes) => bytes,
-            Err(err) => return openai_error(502, &err, "server_error"),
+            Err(err) => {
+                context.record_inference(provider_id, 502);
+                return openai_error(502, &err, "server_error");
+            }
         }
     };
 
+    // The status recorded is the one the client was answered with, so a
+    // translation failure is recorded as the failure it is.
+    context.record_inference(provider_id, status);
     Response::bytes(status, headers, bytes)
 }
 

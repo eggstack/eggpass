@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the xAI API tier and do not draw from the consumer subscription the billing
   endpoint reports.
 
+- **The ChatGPT block says what the last inference was answered with.** Sign in
+  with ChatGPT publishes no quota API, so the block now carries the facts that
+  are knowable instead of a single "unavailable" line: whether the quota would
+  have come from OAuth at all, and what the last inference to ChatGPT was
+  answered with — `succeeded`, or `failed (429)`. The inference is the only
+  evidence there is about an account whose quota cannot be read.
+
+  The daemon keeps one number per provider in memory and writes nothing: no
+  file, no log, no history. A record that outlived the process would be a
+  history of what the user asked for. `eggpass usage` asks the running daemon
+  for it over the loopback socket, and prints the row when there is one.
+
 ### Security
 
 - **A client key is required to run.** `eggpass run`, `restart` and

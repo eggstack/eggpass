@@ -144,6 +144,7 @@ pub fn collect(runtime: &ProviderRuntime) -> ProviderUsage {
     if report.says_nothing() {
         return ProviderUsage::Unavailable {
             reason: "the provider reported no usage information".to_string(),
+            source: None,
             hint: None,
             signals: Vec::new(),
         };

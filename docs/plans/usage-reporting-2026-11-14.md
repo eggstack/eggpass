@@ -1223,3 +1223,47 @@ never against the daemon, and never as an automated test.
 | Whether `creditUsagePercent` is omitted at 0 % | **Not checked.** The live account is not at 0 %. The rule does not depend on the answer: an absent field and a zero field both read `unavailable` |
 | The `401` body, on a deliberately expired token | **Not checked.** The body is never printed by design, so the check would only confirm a string nobody sees |
 | The legacy shape, one call without `format=credits` | **Not checked.** It would mean putting the token in a shell command and copying the raw upstream body to disk, which is exactly what this work order forbids |
+
+### 16.6 The follow-up: what the last inference was answered with
+
+The ChatGPT block was built as an answer, and it was a thin one: a quota
+percentage is not exposed, so the block said so and stopped. That is honest,
+but it leaves the reader with nothing about the account beyond a refusal.
+
+The follow-up adds the one fact that is knowable and was missing — **what the
+last inference to that provider was answered with** — so the block reads:
+
+```
+ChatGPT
+  Quota       unavailable — Sign in with ChatGPT does not expose a quota API
+  Inference   succeeded
+  Source      not exposed by OAuth
+  Limits      https://chatgpt.com/settings/usage
+  Signals     429 subscription_sharing_usage_limit_exceeded
+              503 subscription_sharing_usage_unavailable
+              403 subscription_sharing_user_not_eligible
+```
+
+Three decisions are worth recording, because each of them could have gone the
+other way:
+
+1. **The record is the daemon's, not the command's.** `usage` makes no network
+   call for ChatGPT and never spends a token to find out whether the account
+   works. The daemon already knows: it forwards the inference.
+
+2. **Nothing is written.** The daemon keeps one number per provider — the HTTP
+   status the last inference was answered with — in memory, and serves it on
+   `GET /v1/last-inference`. There is no file and no log. A record that
+   outlived the process would be a history of what the user asked for, and the
+   first draft of this wrote exactly such a file. The status is the one the
+   proxy answered the client with, so it is a number the user has already seen;
+   it carries no prompt, no answer, no header and no token.
+
+3. **The row is shown only where the quota could not be read.** A block that
+   already carries a percentage has said everything about the account that it
+   can, and the x.ai numbers belong to the consumer subscription while the
+   inference is metered against the API tier — so printing both under one block
+   would invite exactly the misreading the caption exists to prevent.
+
+The status is in `--json` as well, for every provider — a machine-readable
+report should carry the facts, not only the ones that happen to be printed.

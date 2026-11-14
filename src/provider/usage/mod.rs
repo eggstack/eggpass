@@ -173,6 +173,12 @@ pub enum ProviderUsage {
     Unavailable {
         /// Why it is unavailable, in one line.
         reason: String,
+        /// Where the quota would have come from, in one line.
+        ///
+        /// "Not exposed by OAuth" says something different from the reason:
+        /// the reason says the provider has no quota API for this credential,
+        /// and the source says the OAuth grant is what it is missing.
+        source: Option<String>,
         /// Where the user can see it, when there is such a place.
         hint: Option<String>,
         /// The error codes the provider does publish, when it publishes any.

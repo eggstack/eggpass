@@ -97,4 +97,6 @@ The [usage-reporting plan](usage-reporting-2026-11-14.md) is **built**. The
 fresh read per provider, with no daemon and no cache. Grok is read from the xAI
 CLI-proxy billing endpoint; ChatGPT is reported as **unavailable**, because
 Sign in with ChatGPT exposes no quota API, and the command says so rather than
-inferring a number.
+inferring a number. The ChatGPT block also reports what the last inference to
+that provider was answered with — the one fact about the account that is
+knowable. The daemon keeps that in memory and writes nothing.

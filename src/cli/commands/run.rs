@@ -235,6 +235,9 @@ fn serve(context: &Context) -> Result<(), CommandError> {
         routing: context.config.routing.clone(),
         upstream_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
+        // The status of the last inference to each provider, kept in memory
+        // for `eggpass usage` to report.
+        inferences: Arc::new(crate::inference::InferenceState::new()),
     });
 
     daemon::write_info(
