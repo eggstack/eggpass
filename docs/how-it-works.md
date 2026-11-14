@@ -72,6 +72,25 @@ That is what lets a client tell the user which thinking levels are on offer
 without a hardcoded list of its own. See
 [Thinking levels](#thinking-levels) below.
 
+The two providers publish that information differently — ChatGPT as
+`supported_reasoning_levels`, x.ai as `capabilities.reasoning_effort` — and
+clients read it under yet other names. So each entry answers all of them:
+
+| Field | Meaning |
+| --- | --- |
+| `id`, `object`, `owned_by` | The OpenAI shape. |
+| `name`, `display_name` | The model's display name. |
+| `reasoning` | Whether the model offers thinking levels. |
+| `capabilities.reasoning.effort` | The thinking levels, as a plain list. |
+| `default_reasoning_level` | The level the model uses by default. |
+| `limit.context`, `context_length`, `context_window` | The context window. |
+| `supported_reasoning_levels` | ChatGPT's own description of its levels. |
+
+The provider's own fields are carried through untouched and the aliases are
+added beside them, so nothing is lost. A field a provider says nothing about
+is left out rather than guessed at: the x.ai models that publish no
+`capabilities` block carry no reasoning flag at all.
+
 ## Thinking levels
 
 A thinking level is the amount of reasoning a model does before it answers.
@@ -81,6 +100,9 @@ Both providers name it, and each in its own way.
   the thinking in `reasoning_content`.
 - **ChatGPT** speaks the Responses API, which takes `reasoning.effort` and
   answers with a reasoning *item*.
+
+Both publish the levels they offer in their catalogue, under different names,
+and the catalogue answers both.
 
 `eggpass` makes the two look the same to a client:
 

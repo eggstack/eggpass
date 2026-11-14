@@ -34,6 +34,24 @@ levels it offers under `supported_reasoning_levels`, its context window, and
 whether it takes images — so a client that reads the catalogue can tell the
 user what the model does.
 
+The levels are also offered under the names the wider OpenAI-compatible
+ecosystem reads, so a client that looks for `capabilities.reasoning.effort`
+finds them there too:
+
+```json
+{
+  "id": "gpt-6.1-sol",
+  "reasoning": true,
+  "capabilities": { "reasoning": { "supported": true, "effort": ["low", "medium", "high", "xhigh", "max", "ultra"] } },
+  "default_reasoning_level": "low",
+  "limit": { "context": 500000 },
+  "supported_reasoning_levels": [{ "effort": "low", "description": "Fast responses with lighter reasoning" }]
+}
+```
+
+What a model does not publish is not guessed at: a model whose provider says
+nothing about thinking carries no reasoning flag.
+
 ## Thinking levels
 
 A thinking level is how much reasoning a model does before it answers. Set it

@@ -263,13 +263,6 @@ pub fn normalize_catalogue(kind: CatalogueKind, body: &[u8]) -> Vec<u8> {
                             }
                         }
 
-                        // x.ai's catalogue calls the context window
-                        // `context_length`, so the merged catalogue gives both
-                        // providers the same name for it.
-                        if let Some(window) = model.get("context_window") {
-                            entry.insert("context_length".to_string(), window.clone());
-                        }
-
                         serde_json::Value::Object(entry)
                     })
                     .collect()
@@ -277,11 +270,126 @@ pub fn normalize_catalogue(kind: CatalogueKind, body: &[u8]) -> Vec<u8> {
             .unwrap_or_default(),
     };
 
+    let models: Vec<Value> = models
+        .into_iter()
+        .map(|mut model| {
+            if let Some(entry) = model.as_object_mut() {
+                add_aliases(entry);
+            }
+            model
+        })
+        .collect();
+
     let output = serde_json::json!({
         "object": "list",
         "data": models,
     });
     serde_json::to_vec(&output).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Add the alias fields a client may read, beside the upstream's own.
+///
+/// Clients disagree about how a model describes itself. The OpenAI shape
+/// names a model and says little else; the OpenRouter shape — which most of
+/// the OpenAI-compatible ecosystem has settled on — says what the model can
+/// do, under `capabilities` and `limit`.
+///
+/// The upstream's own fields are carried through untouched, and these are
+/// added beside them, derived only from what the upstream states. A field
+/// the upstream says nothing about is left out rather than guessed at: the
+/// models x.ai publishes without a `capabilities` block carry no reasoning
+/// flag, because saying `reasoning: false` would be a claim its own
+/// catalogue does not make.
+fn add_aliases(entry: &mut serde_json::Map<String, Value>) {
+    // The display name, under the OpenRouter spelling.
+    let display_name = entry
+        .get("display_name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(name) = display_name {
+        entry
+            .entry("name".to_string())
+            .or_insert_with(|| Value::String(name));
+    }
+
+    // The context window, under both names.
+    //
+    // ChatGPT publishes it as `context_window` and x.ai as `context_length`,
+    // so the merged catalogue gives both providers the same two names for it.
+    let context = entry
+        .get("context_window")
+        .or_else(|| entry.get("context_length"))
+        .cloned();
+    if let Some(context) = context {
+        entry
+            .entry("limit".to_string())
+            .or_insert_with(|| serde_json::json!({ "context": context }));
+        entry.entry("context_length".to_string()).or_insert(context);
+    }
+
+    // The default thinking level, under the name ChatGPT uses.
+    let default_effort = entry
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("default_reasoning_effort"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(default) = default_effort {
+        entry
+            .entry("default_reasoning_level".to_string())
+            .or_insert_with(|| Value::String(default));
+    }
+
+    // The thinking levels, under the OpenRouter spelling.
+    let levels = effort_levels(entry);
+    if !levels.is_empty() {
+        entry.insert("reasoning".to_string(), Value::Bool(true));
+
+        // x.ai publishes a `capabilities` block of its own, so the alias is
+        // added to it rather than over it.
+        let capabilities = entry
+            .entry("capabilities".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(capabilities) = capabilities.as_object_mut() {
+            capabilities.insert(
+                "reasoning".to_string(),
+                serde_json::json!({ "supported": true, "effort": levels }),
+            );
+        }
+    }
+}
+
+/// The thinking levels a model offers, under either provider's spelling.
+///
+/// ChatGPT publishes them as `supported_reasoning_levels`, a list of objects;
+/// x.ai publishes them as `capabilities.reasoning_effort`, a list of strings.
+fn effort_levels(entry: &serde_json::Map<String, Value>) -> Vec<String> {
+    let levels: Vec<String> = entry
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !levels.is_empty() {
+        return levels;
+    }
+
+    entry
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("reasoning_effort"))
+        .and_then(Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The model ids a provider's catalogue advertises.
@@ -387,6 +495,90 @@ mod tests {
         // can read.
         assert!(model.get("base_instructions").is_none());
         assert!(model.get("model_messages").is_none());
+    }
+
+    #[test]
+    fn the_slug_catalogue_also_answers_the_openrouter_shape() {
+        // Most of the OpenAI-compatible ecosystem reads a model record the
+        // OpenRouter way, so the same facts are offered under those names too.
+        let body = br#"{"models":[{
+            "slug":"gpt-6.1-sol",
+            "display_name":"GPT-6.1 Sol",
+            "visibility":"list",
+            "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],
+            "context_window":500000
+        }]}"#;
+
+        let normalized = normalize_catalogue(CatalogueKind::SlugArray, body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        let model = &value["data"][0];
+
+        assert_eq!(model["name"], "GPT-6.1 Sol");
+        assert_eq!(model["reasoning"], true);
+        assert_eq!(model["limit"]["context"], 500000);
+        assert_eq!(model["capabilities"]["reasoning"]["supported"], true);
+        assert_eq!(model["capabilities"]["reasoning"]["effort"][0], "low");
+        assert_eq!(model["capabilities"]["reasoning"]["effort"][1], "high");
+
+        // The upstream's own spelling is still there beside the alias.
+        assert_eq!(model["supported_reasoning_levels"][0]["effort"], "low");
+        assert_eq!(model["context_window"], 500000);
+    }
+
+    #[test]
+    fn the_data_catalogue_is_given_the_limit_alias() {
+        // x.ai publishes the context window as `context_length`, and publishes
+        // no thinking levels for this model, so it gets the limit and nothing
+        // else.
+        let body = br#"{"data":[{
+            "id":"grok-build-0.1",
+            "object":"model",
+            "owned_by":"xai",
+            "context_length":256000
+        }]}"#;
+
+        let normalized = normalize_catalogue(CatalogueKind::DataArray, body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        let model = &value["data"][0];
+
+        assert_eq!(model["limit"]["context"], 256000);
+        assert_eq!(model["context_length"], 256000);
+
+        // Nothing is claimed that x.ai does not publish.
+        assert!(model.get("capabilities").is_none());
+        assert!(model.get("reasoning").is_none());
+        assert!(model.get("name").is_none());
+    }
+
+    #[test]
+    fn the_data_catalogue_keeps_xais_own_capabilities() {
+        // x.ai publishes its thinking levels inside a `capabilities` block of
+        // its own. The alias is added beside them, not over them.
+        let body = br#"{"data":[{
+            "id":"grok-4.7",
+            "object":"model",
+            "owned_by":"xai",
+            "context_length":500000,
+            "capabilities":{
+                "reasoning_effort":["low","medium","high","xhigh"],
+                "default_reasoning_effort":"high"
+            }
+        }]}"#;
+
+        let normalized = normalize_catalogue(CatalogueKind::DataArray, body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        let model = &value["data"][0];
+
+        // x.ai's own fields are untouched.
+        assert_eq!(model["capabilities"]["reasoning_effort"][0], "low");
+        assert_eq!(model["capabilities"]["default_reasoning_effort"], "high");
+        assert_eq!(model["default_reasoning_level"], "high");
+
+        // And the OpenRouter shape is answered as well.
+        assert_eq!(model["reasoning"], true);
+        assert_eq!(model["capabilities"]["reasoning"]["supported"], true);
+        assert_eq!(model["capabilities"]["reasoning"]["effort"][3], "xhigh");
+        assert_eq!(model["limit"]["context"], 500000);
     }
 
     #[test]

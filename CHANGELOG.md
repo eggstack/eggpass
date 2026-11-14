@@ -86,7 +86,16 @@ authenticates with your own subscription over OAuth.
 - **The model catalogue says what a model can do.** The ChatGPT entries were
   reduced to a name, which left a client with nothing to offer the user. They
   now carry the upstream's own data: the thinking levels a model offers, its
-  context window, whether it takes images.
+  context window, whether it takes images. x.ai's entries already carried
+  theirs.
+
+- **The catalogue answers every spelling at once.** The two providers publish
+  that information under different names — ChatGPT as
+  `supported_reasoning_levels`, x.ai as `capabilities.reasoning_effort` — and
+  the clients that read it use yet others. Each entry now also answers
+  `reasoning`, `capabilities.reasoning.effort`, `default_reasoning_level`,
+  `limit.context` and `name`, beside the provider's own fields. Nothing is
+  claimed that a provider does not publish.
 
 - **An upstream error keeps its status, type and code.** A request for a model
   the provider does not serve came back as a `502 server error`, which reads as
