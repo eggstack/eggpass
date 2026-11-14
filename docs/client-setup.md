@@ -53,6 +53,11 @@ The thinking comes back in `reasoning_content`, the field x.ai's answer uses
 too, so one client shows it for both providers. In a streamed answer it
 arrives in the same field, ahead of the answer itself.
 
+x.ai always returns its thinking. The ChatGPT route writes a summary when it
+chooses to, so `reasoning_content` is there when there is thinking to show and
+absent when there is not. The level is applied either way — the model is
+always asked to think at the level that was set.
+
 Not every model takes every level — the levels a model offers are listed in
 the catalogue — and a level it does not take is refused by the provider, with
 the provider's own error.

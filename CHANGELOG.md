@@ -79,7 +79,9 @@ authenticates with your own subscription over OAuth.
 - **The thinking comes back.** The upstream's reasoning summary is carried in
   `reasoning_content` — the field x.ai's Chat Completions answer uses — so a
   client shows the thinking for both providers, in a streamed answer as well as
-  a complete one.
+  a complete one. The ChatGPT route decides for itself whether to write a
+  summary, so the field is absent when there is none to show; the level is
+  applied either way.
 
 - **The model catalogue says what a model can do.** The ChatGPT entries were
   reduced to a name, which left a client with nothing to offer the user. They

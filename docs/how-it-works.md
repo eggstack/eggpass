@@ -92,6 +92,10 @@ Both providers name it, and each in its own way.
 - The answer's thinking comes back in `reasoning_content`, the field x.ai
   uses, whether it arrived as a summary or as streamed deltas.
 
+x.ai always returns its thinking. The ChatGPT route decides for itself whether
+to write a summary, so the field is there when there is thinking to show and
+absent when there is not — the level is applied either way.
+
 The levels each model accepts are the upstream's business, and the catalogue
 says which they are under `supported_reasoning_levels`. A level the model does
 not offer is refused by the upstream, and that refusal comes back to the client
