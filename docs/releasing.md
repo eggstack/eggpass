@@ -9,9 +9,9 @@ release" that every installed `eggpass` then pulls.
 ## What you need
 
 - Push access to `eggstack/eggpass`.
-- The `CARGO_REGISTRY_TOKEN` repository secret — a crates.io API token with
-  the `publish` scope for this crate. Without it the crates.io step fails,
-  and only that step: the GitHub release is unaffected.
+- The `CARGO_REGISTRY_TOKEN` repository secret, which must be a crates.io
+  API token with the `publish` scope for this crate. Without it, the crates.io
+  step fails, but the GitHub release is unaffected.
 
 ```sh
 gh secret set CARGO_REGISTRY_TOKEN --repo eggstack/eggpass
@@ -21,17 +21,16 @@ gh secret set CARGO_REGISTRY_TOKEN --repo eggstack/eggpass
 
 | Fact | Value |
 | --- | --- |
-| Git tag | `v0.1.0` — the version, with a `v` |
-| `Cargo.toml` version | `0.1.0` — the version, without a `v` |
-| Manifest `release_id` | `0.1.0` — **no `v`** |
+| Git tag | `v0.1.0` (version with a `v`) |
+| `Cargo.toml` version | `0.1.0` (version without a `v`) |
+| Manifest `release_id` | `0.1.0` (**no `v`**) |
 | Manifest `product_id` | `eggpass` |
 | Manifest `source_revision` | the 40-character commit the tag peels to |
 | Manifest file name | `eggpass-release-manifest.json` |
 
-The `release_id` carries no `v` because that is what `eggpass update`
-compares against the running build. A `v`-prefixed `release_id` makes the
-updater refuse to compare the two, and it reports it in a confusing way. The
-**tag** carries the `v`, because that is the URL the assets are served from.
+The `release_id` has no `v` because `eggpass update` compares it with the
+running build. A `v`-prefixed value makes that comparison fail. The Git tag
+includes the `v` because release asset URLs use that format.
 
 The asset names carry **no version** either, so that
 `releases/latest/download/<name>` keeps working across releases:
@@ -117,9 +116,9 @@ value is `eggpass`.
 
 ## The manifest
 
-The manifest is the whole input the updater reads. It is the eggstack
-family's release-manifest v1 — the schema
-[`eggpack-manifest`](https://crates.io/crates/eggpack-manifest) defines:
+The manifest is the whole input the updater reads. It uses eggstack's
+release-manifest v1 schema, defined by
+[`eggpack-manifest`](https://crates.io/crates/eggpack-manifest):
 
 ```json
 {
@@ -156,10 +155,9 @@ Unknown fields fail closed, and so does an unsupported schema version.
 
 ## Integrity, not authenticity
 
-The SHA-256 in the manifest is an **integrity** fact. It proves the download
-was not corrupted. It does **not** prove that the download came from us —
-there is no signature in this chain. Say so plainly wherever the updater is
-described.
+The SHA-256 in the manifest checks **integrity** and detects a corrupted
+download. It does **not** prove who published the download because this chain
+has no signature. State this limit wherever the updater is described.
 
 ## Rollback
 
@@ -172,8 +170,8 @@ and no release is ever deleted or overwritten: publish a new one.
 - **A wrong digest.** The updater refuses the candidate before it runs, so a
   bad digest means a stale manifest. Rebuild and restage the draft.
 - **A missing target.** The updater reports that the canonical target is not
-  in the manifest. Check the build matrix — `ubuntu-24.04-arm` must be
-  available for `aarch64-unknown-linux-gnu`.
+  in the manifest. Check that the build matrix includes `ubuntu-24.04-arm`
+  for `aarch64-unknown-linux-gnu`.
 - **A version mismatch.** The workflow refuses to stage a release whose
   `Cargo.toml` version is not the tag's version. Bump the version, commit,
   and tag the new commit.

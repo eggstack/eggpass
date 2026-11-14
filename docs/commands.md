@@ -1,405 +1,154 @@
 # Commands
 
-Every command is idempotent, safe to run from cron, and prints a line you can
-read. Nothing is ever asked for twice.
+`eggpass` runs the proxy on your machine, but sends inference requests to the provider selected by the model route. Prompts are transmitted to xAI or ChatGPT; they do not stay on the machine. See [configuration.md](configuration.md) for routing and network settings.
+
+## Start here
+
+A client key is required before the server can start. Create one, sign in to a provider, then start the server:
+
+```sh
+eggpass key add laptop          # copy the key; it is shown only once
+eggpass login --provider xai
+eggpass run
+```
+
+Point an OpenAI-compatible client at `http://127.0.0.1:8484/v1` and send the key as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. The server listens on loopback by default. See [configuration.md](configuration.md) before binding it to a network interface.
 
 ## Global options
 
 | Option | Meaning |
 | --- | --- |
-| `--config <PATH>` | Use this config file instead of `~/.config/eggpass/config.toml`. |
-| `--provider <ID>` | Skip the interactive picker. `xai` or `openai`. Must come **before** the command. |
-| `--help`, `-h` | Help for the command. |
-| `--version`, `-V` | The version. |
+| `--config <PATH>` | Use a different TOML config file for this command. Other eggpass files stay in the usual data directory. |
+| `--provider <ID>` | Select `xai` or `openai` for `login`, `logout`, or `usage`. |
+| `--verbose`, `-v` | Enable debug logging. |
+| `--help`, `-h` | Show help. |
+| `--version`, `-V` | Show the version. |
+
+Global options can appear before or after the command. For example:
 
 ```sh
-eggpass --provider xai login      # no picker
+eggpass --provider xai login
 eggpass --config ./local.toml run
 ```
 
----
-
-## `eggpass login`
-
-Authenticate with a provider over OAuth.
+## `login` and `logout`
 
 ```sh
-eggpass login
+eggpass login                         # choose a provider interactively
 eggpass login --provider xai
-eggpass login --device            # x.ai only
-eggpass login --oauth             # browser redirect instead of device code
-```
-
-| Option | Meaning |
-| --- | --- |
-| `--device` | Use the device-code flow. Headless. x.ai only. |
-| `--oauth` | Use the browser redirect flow. Mutually exclusive with `--device`. |
-| `--provider <ID>` | Sign in to this provider without the picker. |
-
-**Exit codes:** `0` success or cancelled · `1` denied/expired/failed.
-
-### The picker
-
-With no `--provider`, `eggpass login` opens an interactive picker listing the
-providers the build knows about:
-
-```
-$ eggpass login
-
-  Select a provider to sign in with:
-
-  Use j/k or ↑/↓ to navigate, Enter to select, q/Esc to quit
-
-    > x.ai
-        Grok models, on your x.ai subscription
-      ChatGPT
-        ChatGPT models, on your ChatGPT plan
-
-```
-
-`j`/`k` and the arrow keys both move the cursor, and the cursor stops at the
-ends rather than wrapping. `q` or `Esc` cancels, and `Ctrl-C` interrupts.
-When stdin is not a terminal the picker falls back to a numbered list.
-
-Signing in to a provider you are already signed in to simply **replaces** the
-stored credential. There is no `--force` flag and no "already logged in"
-refusal.
-
-`eggpass logout` uses the same picker, listing only the providers you are
-actually signed in to.
-
-### The xAI sign-in page says "Grok Build"
-
-It does, and it will. xAI has no general-purpose public OAuth client for
-third-party apps, so `eggpass` signs in with the official Grok Build CLI's
-public client id — the same public credential every Grok Build install
-carries. xAI's consent page takes the product name from that client id, so it
-introduces itself as Grok Build.
-
-What we *do* control is the `referrer` parameter, which xAI documents as the
-"OAuth usage attribution" value. We send `eggpass`, so the usage is attributed
-to eggpass even though the page says Grok Build. xAI's own CLI sends `user`,
-and OpenCode sends `opencode`.
-
-If the page shows a **code to copy** instead of redirecting to your browser's
-callback, paste that code into the terminal and press Enter — the login is
-waiting for it, exactly as the official CLI does.
-
-### The OAuth callback
-
-The callback listens on a **random ephemeral loopback port**, chosen per
-login. It has nothing to do with the API port, so you can log in while the
-daemon is running, and you can log in on a machine where the API port is
-already taken.
-
----
-
-## `eggpass logout`
-
-Revoke the credential at the provider, then delete the local file.
-
-```sh
-eggpass logout
+eggpass login --provider xai --device  # x.ai device-code flow
+eggpass login --provider xai --oauth   # browser flow
+eggpass logout                         # choose a signed-in provider
 eggpass logout --provider openai
 ```
 
-**Exit codes:** `0` always — a failed revocation is not an error · `1` the
-credential could not be read or removed.
+Without `--provider`, `login` offers enabled providers and `logout` offers providers with stored credentials. x.ai uses the device-code flow by default when available; ChatGPT uses a browser flow. `--device` and `--oauth` cannot be combined. Signing in again replaces that provider's stored credentials.
 
-The daemon keeps running and answers `401` until you log in again.
+`logout` attempts provider-side revocation, then removes the local credential. Revocation is best-effort, so a failed revocation does not prevent local removal. A running server stays up, but requests to the signed-out provider will fail until you sign in again.
 
----
+**Exit codes:** `login` returns `0` on success or cancellation, `1` on failure, and `2` if device flow is requested for a provider that does not support it. `logout` returns `0` on success, cancellation, or failed provider-side revocation. Credential read or removal errors return `1`.
 
-## `eggpass status`
-
-Show the account state and the daemon state.
+## `status`
 
 ```sh
 eggpass status
 ```
 
-**Exit codes:** `0` always. Parseability matters more than status codes here.
+Shows stored account state and daemon state, including the live address and port when running, plus the configured authentication state. It may contact signed-in providers to count available models. It does not show API keys or OAuth tokens.
 
-It reports, per provider, whether you are signed in, the account email, the
-account id, and — for ChatGPT — whether plan usage was granted. It also
-reports the daemon: running or not, the address and port **actually being
-served**, and the auth state:
+**Exit code:** `0` if the command completes.
 
-```
-auth: open — no key configured
-auth: 2 key(s)
-auth: the key from the configuration file
-auth: 1 key(s), the key from the configuration file
-```
-
----
-
-## `eggpass usage`
-
-Show how much of the subscription allowance is used.
+## `usage`
 
 ```sh
-eggpass usage                  # every provider you are signed in to
-eggpass usage --provider xai   # one provider
-eggpass usage --json           # the report as JSON
+eggpass usage                         # query all providers
+eggpass usage --provider xai          # query one provider
+eggpass usage --json                 # machine-readable report
 ```
 
-**Exit codes:** `0` at least one provider produced a block · `1` every provider
-failed operationally · `2` no provider is signed in on this machine.
+Queries provider usage directly, without needing the daemon. This is a fresh request, not a cached or polled reading. The report describes usage as reported by each provider. On the default xAI `api` upstream, the reported consumer-subscription quota is separate from inference requests, which are billed to the xAI API tier. The report's caption reflects the configured upstream. If quota is unavailable, the report may include the latest inference HTTP status kept by the daemon in memory. That endpoint reports only per-provider client-facing HTTP status codes, not prompts or response bodies.
 
-Each provider gets one fresh read, on this run. There is no polling and no
-cache: a cached reading is a number that might be wrong, and this command
-exists to be right. It needs no daemon — the credential file is read and the
-provider is asked directly.
+**Exit codes:** `0` if at least one provider is signed in and not every selected provider failed operationally, `1` if every selected provider failed operationally, `2` if none is signed in.
 
-```
-x.ai · SuperGrok
-  Weekly      ████░░░░░░░░░░░░░░░░  20% used
-  Resets      Nov 20, 03:07 (UTC)
-  Api             ██░░░░░░░░░░░░░░░░░░  10% used
-  Prepaid     $0.00
-  This is your Grok subscription. `eggpass` requests are billed separately against the xAI API tier.
-
-ChatGPT
-  Quota       unavailable — Sign in with ChatGPT does not expose a quota API
-  Inference   succeeded
-  Source      not exposed by OAuth
-  Limits      https://chatgpt.com/settings/usage
-  Signals     429 subscription_sharing_usage_limit_exceeded
-              503 subscription_sharing_usage_unavailable
-              403 subscription_sharing_user_not_eligible
-```
-
-The number is how much is **used**, never how much is left. A percentage the
-provider did not report reads `unavailable`, never `0% used`: the billing
-endpoint is proto3 JSON and omits zero-valued fields, so an absent number means
-the provider did not say. When the provider states a condition instead — not
-eligible, limit reached — that statement replaces the number.
-
-The caption under the x.ai block is not decoration. On the default `api`
-upstream the allowance reported there is your **consumer subscription**, and
-`eggpass`'s own requests are billed against the xAI API tier. The caption names
-the pool the number belongs to and changes with `providers.xai.upstream`.
-
-**ChatGPT has no quota to read.** Sign in with ChatGPT exposes no endpoint that
-returns an allowance, so the block says so, names where the quota would have
-come from, links OpenAI's own usage page, and lists the three error codes
-OpenAI does publish. It never guesses a number.
-
-The `Inference` row is the one fact left about such an account: the HTTP status
-the last inference to that provider was answered with, `succeeded` for a 2xx
-and `failed (429)` otherwise. The daemon keeps that in memory and writes
-nothing — no file, no log, no history — so the row is absent when the daemon is
-not running or has not served an inference since it started, and it disappears
-when the daemon restarts.
-
----
-
-## `eggpass run`
-
-Start the server as a background daemon.
+## `run`, `stop`, and `restart`
 
 ```sh
-eggpass run              # background
-eggpass run --foreground # stay in the terminal
-```
-
-**Exit codes:** `0` running · `1` failed to start.
-
-The daemon is self-contained: no launchd, no systemd. It is found by its PID
-file at `~/.config/eggpass/eggpass.pid`, which records the pid, the host it
-bound and the port it serves.
-
-`run` refuses to start while no client key is configured, and prints how to
-fix it:
-
-```
-refusing to run: no client key is configured; run `eggpass key add` first
-(or set `api_key` in the config file)
-```
-
-`restart` checks first, before it stops the running daemon, so a missing key
-never leaves the endpoint down. `croncheck` refuses the same way rather than
-failing silently every five minutes; that is the one case where it is not
-quiet.
-
----
-
-## `eggpass stop` · `eggpass restart`
-
-```sh
+eggpass run                    # start in the background
+eggpass run --foreground       # stay in this terminal
 eggpass stop
 eggpass restart
 ```
 
-**Exit codes:** `stop` — `0` stopped or was not running · `1` could not be
-stopped. `restart` — `0` running · `1` failed to restart.
+`run` and `restart` require at least one client key, either from `eggpass key add` or from `api_key` in the config file. `run` reports if the daemon is already running. The daemon uses a PID file and log file; it does not require launchd or systemd. `restart` checks for a key before stopping the current daemon.
 
----
+**Exit codes:** `run` and `restart` return `0` when running and `1` on failure. `stop` returns `0` if stopped or already stopped, and `1` if stopping fails.
 
-## `eggpass port` · `eggpass host`
-
-Show or change the address the server listens on.
+## `port` and `host`
 
 ```sh
-eggpass port            # show the port being served
-eggpass port 9000       # move to 9000 and restart
-eggpass host            # show the bind address
-eggpass host 0.0.0.0    # listen on every interface and restart
+eggpass port                 # show configured address and port
+eggpass port 9000            # change the port
+eggpass host                 # show the bind address
+eggpass host 0.0.0.0         # bind all IPv4 interfaces
 ```
 
-**Exit codes:** `0` ok, including "already serving" · `1` invalid port, port
-taken, invalid host, host refused, or the restart failed.
+When the daemon is running, a changed value is applied by restarting it. When it is stopped, the new value takes effect at the next start. The commands validate the new address before stopping a running server and roll back the config if restart fails. A port must be from 1 through 65535. Ports below 1024 require `allow_privileged_port = true`. Hosts must be IP addresses, or `localhost`, `local`, or `loopback` for `127.0.0.1`.
 
-Both commands only restart when the requested value actually differs from
-what is *being served*, read from the PID file rather than from the config —
-so a config file that was edited by hand does not cause a pointless restart.
-
-Both refuse to change anything if the new address is unusable:
-
-- `eggpass port 9000` when something else is on 9000 prints
-  `port 9000 is taken` and leaves the server alone. The port is checked
-  **before** anything is stopped.
-- `eggpass host 0.0.0.0` without a key refuses, and says so:
-  *"refusing to bind 0.0.0.0: issue a key with `eggpass key add` first"*.
-  An issued key counts, as does the `api_key` in the config file.
-
-If the restart fails, the old configuration is rolled back and the server
-comes back up where it was.
-
-`host` defaults to loopback, and the intended shape is loopback plus an SSH
-tunnel (`ssh -L 8484:127.0.0.1:8484 box`) rather than a widened bind. Binding
-elsewhere puts the proxy, and through it your paid subscriptions, on the
-network. `local`, `localhost` and `loopback` all mean `127.0.0.1`.
-
-A server bound outside loopback with no key at all **refuses every request**
-rather than serving as an open proxy.
-
----
-
-## `eggpass key`
-
-Issue, list and revoke the keys your clients use. You never bring your own —
-`eggpass` mints them.
-
-### `eggpass key add [LABEL]`
+Loopback is the safer default. Binding outside loopback exposes the proxy and the provider accounts it can use to the network, so a client key is required. An SSH tunnel is an alternative:
 
 ```sh
-$ eggpass key add laptop
-
-Created key #1.
-
-    sk-eggpass-3nQ7fB2xWvKcR8dTmZaYhLpEuJqXf1s
-
-This is the only time the key is shown — only its hash is stored.
-Send it as:
-    Authorization: Bearer sk-eggpass-3nQ7fB2xWvKcR8dTmZaYhLpEuJqXf1s
+ssh -L 8484:127.0.0.1:8484 box
 ```
 
-The label is optional and is only your own bookkeeping. One key may serve
-several clients.
+**Exit codes:** `0` if the value is shown or applied, including when already serving it. `1` for an invalid or unavailable address, a write failure, or a failed restart.
 
-**Exit codes:** `0` created · `1` the store could not be written.
-
-### `eggpass key list`
-
-```
-  #  key                  label          created
-  1  sk-eggpass-3nQ7fB2x   laptop        2026-11-13T21:30:00Z
-  2  sk-eggpass-qR7xZ9mT   phone         2026-11-13T21:44:12Z
-```
-
-Only the visible prefix is shown — the rest of the key is not recoverable,
-because only a salted hash of it is stored. The command also notes when the
-config file's `api_key` is set as well, since that key is honoured too.
-
-### `eggpass key revoke <N>` · `eggpass key revoke --all`
+## `key`
 
 ```sh
-eggpass key revoke 2
+eggpass key add [LABEL]
+eggpass key list
+eggpass key revoke <N>
 eggpass key revoke --all
 ```
 
-**Exit codes:** `0` ok · `1` the key number does not exist, or the store could
-not be written.
+`eggpass key` with no action lists keys. New keys are shown once, then only salted hashes are stored. Keep the displayed key somewhere safe and send it to clients in an authorization header. Labels are optional. Key numbers are stable and are not reused. Adding or revoking a key takes effect on the next request without a restart.
 
-Key numbers are stable: they are never reused and never renumbered, so
-`revoke 2` always means the same key even after other keys have been revoked.
+The config file's `api_key`, if set, remains accepted alongside issued keys. Revoking every issued key does not disable that configured key. If there are no issued keys and no configured `api_key`, the running server refuses authenticated API requests with `401`; `GET /health` and `GET /v1/last-inference` remain unauthenticated. The health response is JSON with `status`, `service`, and a `version` string. The last-inference response contains only a map of provider names to their latest client-facing HTTP status codes.
 
-Revoking the **last** key closes the endpoint and says so:
+**Exit code:** `0` on success. `1` if the key store cannot be read or written, or a requested key number does not exist.
 
-```
-That was the last key. Every request is now refused; run `eggpass key add` to issue another.
-```
-
-The two probes that carry no data — `GET /health` and `GET /v1/last-inference`
-— still answer, which is how `eggpass status` and `eggpass usage` keep working
-while the proxy itself is shut. `eggpass key add` is the way back.
-
-A key takes effect on the **next request** — the server re-reads the store
-whenever it changes, so nothing has to be restarted.
-
----
-
-## `eggpass edit`
-
-Open the config file in `$EDITOR`.
+## `edit`
 
 ```sh
 eggpass edit
 ```
 
-**Exit codes:** `0` ok · `1` the editor failed or the config is invalid.
+Opens the config in `$EDITOR`, then `$VISUAL`, then `helix`, `vim`, or `nano`, falling back to `vi`. The config is validated after the editor exits.
 
-The file is validated when the editor exits.
+**Exit code:** `0` if the edited config is valid, `1` if the editor fails or validation fails.
 
----
+## `croncheck`
 
-## `eggpass croncheck`
-
-Start the daemon only if it is not already running.
+Start the daemon only if it is not already running. It is intended for a crontab, but it still requires a client key and can fail. Ordinary success is quiet.
 
 ```sh
 eggpass croncheck
 ```
 
-**Exit codes:** `0` in all normal cases — running or successfully started.
-
-**It prints nothing.** If the server is already up, the command does nothing
-and says nothing. That is the point: it is meant to be run from cron without
-filling a mail spool.
-
 ```cron
 */5 * * * * /usr/local/bin/eggpass croncheck >> ~/.config/eggpass/cron.log 2>&1
 ```
 
----
+**Exit codes:** `0` if already running or started, `1` on failure.
 
-## `eggpass update`
-
-Update to the latest released version, or to one exact version.
+## `update`
 
 ```sh
-eggpass update            # the latest published release
-eggpass update 0.2.0      # one exact version — which is also the rollback
-eggpass update --check    # report what would happen, change nothing
+eggpass update              # install the latest release
+eggpass update 0.2.0        # install an exact version
+eggpass update --check      # report the plan without changing files
 ```
 
-**Exit codes:** `0` updated, or `--check` completed · `1` the release is
-unavailable, the digest did not match, the candidate failed to prove its
-version, or this installation may not be updated.
+The updater uses the published release manifest and checks the downloaded asset's digest for integrity. The digest does not prove who published it. It does not restart a running daemon, so that process keeps the old binary until restarted. Cargo-managed installations cannot be replaced by this updater. See [updating.md](updating.md) for verification details.
 
-How the verification works is in [updating.md](updating.md).
-
-A running server keeps the old binary until it is restarted. `eggpass update`
-says so rather than restarting for you, because an implicit restart during an
-update would cut live streams.
-
-### Cargo-managed installations
-
-`eggpass` refuses to replace a binary that Cargo owns. If you installed with
-`cargo install`, the updater prints the `cargo install` command to run
-instead — `cargo install --path .` for a local checkout, or
-`cargo install eggpass --git https://github.com/eggstack/eggpass` for the
-repository. Replacing Cargo's copy by hand would leave `cargo install --list`
-and `cargo uninstall` lying.
+**Exit codes:** `0` when updated or when `--check` completes, `1` if the release is unavailable, verification fails, or this installation cannot be updated.

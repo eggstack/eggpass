@@ -1,145 +1,60 @@
 # Client setup
 
-`eggpass` speaks the OpenAI API. Any client that can talk to OpenAI can talk
-to `eggpass`.
-
-| Setting | Value |
-| --- | --- |
-| Base URL | `http://127.0.0.1:8484/v1` |
-| API key | the key from `eggpass key add`, or the config file's `api_key` |
-| Model | any name from `GET /v1/models` |
-
-Both `/v1/chat/completions` and `/chat/completions` work, so it does not
-matter whether your client's base URL already carries the `/v1`.
-
-The client **must** send a key, as `Authorization: Bearer <key>` or
-`X-Api-Key: <key>`. `eggpass run` refuses to start without one: a loopback
-port is reachable from a web page, so the socket address is not a boundary.
-
-There are two ways to have one, and they are both supported:
-
-- `eggpass key add <label>` mints a key, shows it once, and stores a salted
-  hash. It is numbered and revocable without a restart, and it cannot be read
-  back out of the store.
-- `api_key = "…"` in `config.toml` is the older way: one key, readable
-  afterwards, so it survives a lost clipboard. The file is `0600`.
-
----
-
-## Finding the model names
-
-The catalogue is fetched live from every provider you are signed in to, and it
-is the union of them. There is no compiled-in list.
+`eggpass` exposes an OpenAI-compatible API at
+`http://127.0.0.1:8484/v1`. Start the server, then configure your client with
+the base URL, a client key, and a model ID from `GET /v1/models`.
 
 ```sh
-curl http://127.0.0.1:8484/v1/models
+eggpass login
+eggpass key add laptop   # copy the key; it is shown once
+eggpass run
+export EGGPASS_API_KEY='paste-the-key-here'
 ```
 
-A model no provider advertises is a `404`, not a hopeful `200`. `eggpass
-status` prints the count too.
+The client must send the key as `Authorization: Bearer <key>` or `X-Api-Key:
+<key>`. `eggpass` refuses to start without a configured key.
 
-Each entry carries what the provider says about the model — the thinking
-levels it offers under `supported_reasoning_levels`, its context window, and
-whether it takes images — so a client that reads the catalogue can tell the
-user what the model does.
+Both `/v1/chat/completions` and `/chat/completions` are accepted. Use the base
+URL shown above for clients that expect the standard OpenAI path.
 
-The levels are also offered under the names the wider OpenAI-compatible
-ecosystem reads, so a client that looks for `capabilities.reasoning.effort`
-finds them there too:
+## Find model IDs
 
-```json
-{
-  "id": "gpt-6.1-sol",
-  "reasoning": true,
-  "capabilities": { "reasoning": { "supported": true, "effort": ["low", "medium", "high", "xhigh", "max", "ultra"] } },
-  "default_reasoning_level": "low",
-  "limit": { "context": 500000 },
-  "supported_reasoning_levels": [{ "effort": "low", "description": "Fast responses with lighter reasoning" }]
-}
+Fetch the live catalogue using your key:
+
+```sh
+curl http://127.0.0.1:8484/v1/models \
+  -H "Authorization: Bearer $EGGPASS_API_KEY"
 ```
 
-What a model does not publish is not guessed at: a model whose provider says
-nothing about thinking carries no reasoning flag.
-
-## Thinking levels
-
-A thinking level is how much reasoning a model does before it answers. Set it
-the way the Chat Completions API spells it, and the proxy translates it for
-ChatGPT:
-
-```python
-answer = client.chat.completions.create(
-    model="gpt-6.1-sol",
-    messages=[{"role": "user", "content": "Hello"}],
-    reasoning_effort="high",
-)
-print(answer.choices[0].message.reasoning_content)
-```
-
-The thinking comes back in `reasoning_content`, the field x.ai's answer uses
-too, so one client shows it for both providers. In a streamed answer it
-arrives in the same field, ahead of the answer itself.
-
-x.ai always returns its thinking. The ChatGPT route writes a summary when it
-chooses to, so `reasoning_content` is there when there is thinking to show and
-absent when there is not. The level is applied either way — the model is
-always asked to think at the level that was set.
-
-Not every model takes every level — the levels a model offers are listed in
-the catalogue — and a level it does not take is refused by the provider, with
-the provider's own error.
-
----
-
-## Tool calls
-
-Tools work the same way for both providers: define them as the Chat
-Completions API defines them, and the answer carries the call in
-`message.tool_calls`.
-
-```python
-answer = client.chat.completions.create(
-    model="gpt-6.1-sol",
-    messages=[{"role": "user", "content": "What is the weather in Paris?"}],
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-        },
-    }],
-)
-call = answer.choices[0].message.tool_calls[0]
-```
-
-Send the result back in the same turn, with the call's own id, so the model can
-carry on:
-
-```python
-answer = client.chat.completions.create(
-    model="gpt-6.1-sol",
-    messages=[
-        {"role": "user", "content": "What is the weather in Paris?"},
-        {"role": "assistant", "content": "", "tool_calls": answer.choices[0].message.tool_calls},
-        {"role": "tool", "tool_call_id": call.id, "content": "18C, sunny"},
-    ],
-    tools=[...],
-)
-```
-
----
+The response combines usable catalogues from signed-in providers. Provider
+availability and normalization can affect which entries appear. Use an ID
+from the response in your client configuration.
 
 ## OpenAI SDK
 
 ### Python
 
 ```python
+import os
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8484/v1", api_key="sk-eggpass-…")
+client = OpenAI(
+    base_url="http://127.0.0.1:8484/v1",
+    api_key=os.environ["EGGPASS_API_KEY"],
+)
 
+answer = client.chat.completions.create(
+    model="MODEL_ID_FROM_V1_MODELS",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(answer.choices[0].message.content)
+```
+
+For streaming, set `stream=True` and iterate over the returned chunks:
+
+```python
 stream = client.chat.completions.create(
-    model="grok-4.3",
+    model="MODEL_ID_FROM_V1_MODELS",
     messages=[{"role": "user", "content": "Hello"}],
     stream=True,
 )
@@ -152,38 +67,26 @@ for chunk in stream:
 ```ts
 import OpenAI from "openai";
 
+const apiKey = process.env.EGGPASS_API_KEY;
+if (!apiKey) throw new Error("Set EGGPASS_API_KEY first");
+
 const client = new OpenAI({
   baseURL: "http://127.0.0.1:8484/v1",
-  apiKey: "not-needed",
+  apiKey,
 });
 
-const stream = await client.chat.completions.create({
-  model: "gpt-5.6-sol",
+const answer = await client.chat.completions.create({
+  model: "MODEL_ID_FROM_V1_MODELS",
   messages: [{ role: "user", content: "Hello" }],
-  stream: true,
 });
-
-for await (const chunk of stream) {
-  process.stdout.write(chunk.choices[0]?.delta?.content ?? "");
-}
+console.log(answer.choices[0]?.message.content);
 ```
-
-### The Responses API
-
-`POST /v1/responses` is served natively for providers that speak it, so a
-Responses-shaped client works without translation.
-
-```sh
-curl http://127.0.0.1:8484/v1/responses \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-sol","input":"Hello"}'
-```
-
----
 
 ## OpenCode
 
-Add the provider to `~/.config/opencode/opencode.json`:
+Add an OpenAI-compatible provider to `~/.config/opencode/opencode.json`. Replace
+the example model ID and API key with your values. Do not commit a config file
+that contains a real key.
 
 ```json
 {
@@ -191,69 +94,64 @@ Add the provider to `~/.config/opencode/opencode.json`:
   "provider": {
     "eggpass": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Grok and ChatGPT (local proxy)",
-      "options": { "baseURL": "http://127.0.0.1:8484/v1" },
+      "name": "eggpass",
+      "options": {
+        "baseURL": "http://127.0.0.1:8484/v1",
+        "apiKey": "PASTE_KEY_FROM_EGGPASS_KEY_ADD"
+      },
       "models": {
-        "grok-4.3": { "name": "Grok 4.3" },
-        "gpt-5": { "name": "GPT-5" }
+        "MODEL_ID_FROM_V1_MODELS": { "name": "Model name" }
       }
     }
   }
 }
 ```
 
-The model list in the config is yours to curate — `GET /v1/models` is the
-live truth if you want the full set.
+## Cline and Continue
 
----
-
-## Cline, Continue, and anything OpenAI-shaped
+Choose **OpenAI Compatible** as the provider and enter:
 
 | Setting | Value |
 | --- | --- |
-| API provider | OpenAI Compatible |
 | Base URL | `http://127.0.0.1:8484/v1` |
-| API key | the key from `eggpass key add`, or the config file's `api_key` |
-| Model | any model name from `GET /v1/models` |
+| API key | The key from `eggpass key add` |
+| Model | An ID returned by `GET /v1/models` |
 
----
+Other OpenAI-compatible clients use the same values.
+
+## Responses API
+
+`POST /v1/responses` is also available. Send the same client key:
+
+```sh
+curl http://127.0.0.1:8484/v1/responses \
+  -H "Authorization: Bearer $EGGPASS_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MODEL_ID_FROM_V1_MODELS","input":"Hello"}'
+```
+
+## Thinking levels and tool calls
+
+For Chat Completions, set `reasoning_effort` to a level listed for that model
+in `/v1/models`. ChatGPT requests are translated to the Responses API. Returned
+reasoning may be available in `reasoning_content`, depending on the provider
+and model.
+
+Tool calls use the Chat Completions format. The client should send the
+assistant's tool call back with the tool result and its `tool_call_id`, as
+required by the OpenAI API.
 
 ## curl
 
 ```sh
-curl http://127.0.0.1:8484/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Hello"}]}'
-```
-
-With a key:
-
-```sh
-curl http://127.0.0.1:8484/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer sk-eggpass-…' \
-  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Hello"}]}'
-```
-
-### Streaming
-
-Add `"stream": true` and use `curl -N` so the terminal is not buffering:
-
-```sh
 curl -N http://127.0.0.1:8484/v1/chat/completions \
+  -H "Authorization: Bearer $EGGPASS_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  -d '{"model":"MODEL_ID_FROM_V1_MODELS","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Each chunk is flushed as it arrives, so the first token shows up when the
-model produces it.
-
----
-
-## Health checks
-
-`GET /health` is a liveness probe and is **never** authenticated, so it can
-be used as-is by a monitor:
+`-N` disables curl's output buffering. `GET /health` is an unauthenticated
+liveness check:
 
 ```sh
 curl http://127.0.0.1:8484/health

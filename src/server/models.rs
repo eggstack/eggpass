@@ -1,12 +1,8 @@
 //! The model catalogue.
 //!
-//! The catalogue is the **union** of every provider we are signed in to. Each
-//! provider's own list is fetched live and normalised into the OpenAI shape,
-//! so the catalogue is never stale and a model that exists upstream is never
-//! missing here.
-//!
-//! There is no compiled-in list of model names. A model that no provider
-//! advertises is a `404`, not a hopeful `200`.
+//! The catalogue merges live, normalized lists from signed-in providers.
+//! Provider availability and normalization can limit which models appear.
+//! There is no compiled-in list; IDs absent from the merged list return `404`.
 
 use serde_json::{Value, json};
 

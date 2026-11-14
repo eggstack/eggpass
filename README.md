@@ -4,17 +4,17 @@
 
 # eggpass
 
-A lightweight, local, OpenAI-compatible proxy for Grok and ChatGPT.
+A local, OpenAI-compatible proxy for Grok and ChatGPT. Sign in with your
+subscription, then connect OpenAI-compatible clients to one local API.
 
-Sign in with your own subscription over OAuth, and every OpenAI client on your
-machine — OpenCode, Cline, Continue, the OpenAI SDK, a shell script — can talk
-to Grok and ChatGPT models. No provider API key, no cloud, nothing leaves the
-machine.
+`eggpass` runs on your machine and sends inference requests directly to x.ai or
+OpenAI. It does not relay requests through an eggpass cloud service. You do not
+need a separate provider API key.
 
 ## Requirements
 
-- Rust **1.89** or newer, to build it
-- A Grok subscription account, a ChatGPT plan, or both
+- Rust 1.89 or newer to install from source with Cargo
+- A Grok subscription, a ChatGPT plan, or both
 
 ## Install
 
@@ -22,7 +22,7 @@ machine.
 cargo install eggpass --git https://github.com/eggstack/eggpass
 ```
 
-Or from a clone:
+Or install from a local checkout:
 
 ```sh
 git clone https://github.com/eggstack/eggpass
@@ -30,187 +30,149 @@ cd eggpass
 cargo install --path .
 ```
 
-One binary, `eggpass`. No runtime dependencies beyond a certificate store.
-
-## Get started
-
-### Quick start
-
-Four commands:
+## Quick start
 
 ```sh
-eggpass login              # pick a provider, approve the sign-in
-eggpass key add laptop     # mint the key your clients send; shown once
-eggpass run                # start the server in the background
-eggpass status             # see who is signed in and what is running
+eggpass login              # choose a provider and sign in
+eggpass key add laptop     # copy the key; it is shown once
+eggpass run                # start the local server
+eggpass status             # check login and server state
 ```
 
-`eggpass run` refuses to start without a key. A loopback port is reachable
-from a web page, so "anything on this machine" was never a boundary; the key
-is.
+The x.ai login uses a device code by default. Use `--oauth` for a browser
+redirect or `--device` to request the device-code flow explicitly. ChatGPT uses
+a browser sign-in. Logging in again replaces that provider's saved credential.
 
-Then point a client at `http://127.0.0.1:8484/v1`, sending that key:
+`eggpass run` requires a client key. Issued keys are shown once and stored only
+as salted hashes. Save the key for your client, for example:
+
+```sh
+export EGGPASS_API_KEY='paste-the-key-here'
+```
+
+Replace `MODEL_ID_FROM_V1_MODELS` in the request below with an ID returned by
+`GET /v1/models`.
+
+Send a test request:
 
 ```sh
 curl http://127.0.0.1:8484/v1/chat/completions \
-  -H 'Authorization: Bearer sk-eggpass-…' \
+  -H "Authorization: Bearer $EGGPASS_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"MODEL_ID_FROM_V1_MODELS","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-`eggpass run --foreground` keeps the server in the terminal instead.
+Use `eggpass run --foreground` to keep the server in the current terminal.
 
-### Signing in
-
-`eggpass login` opens a picker listing the providers you can sign in with.
-Signing in to a provider you are already signed in to replaces the stored
-credential — there is no `--force` flag.
-
-The **x.ai** sign-in uses the device-code flow: it prints a short code and a
-URL, and you approve it from any device — a phone, another machine, or this
-one. No browser needs to run on the machine, which is also what makes it work
-over SSH. `eggpass login --oauth` uses the browser redirect instead.
-
-The **ChatGPT** sign-in uses *Sign in with ChatGPT for Open Source*.
-
-Already running the official Grok CLI? Its credentials are picked up
-automatically — `eggpass status` will show you as logged in.
-
-> The xAI consent page says "Grok Build", and it will. xAI has no
-> general-purpose public OAuth client for third-party apps, so `eggpass` signs
-> in with the official Grok Build CLI's public client id. See
-> [docs/commands.md](docs/commands.md#eggpass-login) for what that does and does not
-> control.
-
-### Client keys
-
-`eggpass` issues the keys your clients use. You never bring your own — it
-mints them, shows them once, and stores only a salted hash:
-
-```sh
-eggpass key add laptop          # → sk-eggpass-… shown once
-eggpass key list                # what exists
-eggpass key revoke 2            # take one away
-```
-
-A new key works on the **next request** — no restart. The server will not
-start while no key exists, and a running server refuses every request if its
-last key is revoked; `eggpass key add` is the way back. The two exceptions are
-`GET /health` and `GET /v1/last-inference`: they answer without a key because
-they carry nothing but a version string and a status code, and `eggpass usage`
-reads the latter without holding any key material.
-
-The key is shown once and only its salted hash is stored, so a lost key is a
-new key. If you would rather have one you can read back, set `api_key` in the
-config file: it is simpler and recoverable, while issued keys are numbered,
-revocable without a restart, and hashed at rest.
-
-### Pointing a client at it
+## Connect a client
 
 | Setting | Value |
 | --- | --- |
 | Base URL | `http://127.0.0.1:8484/v1` |
-| API key | the key from `eggpass key add`, or the `api_key` in the config file |
-| Model | any name from `GET /v1/models` |
+| API key | The key from `eggpass key add`, or `api_key` in the config file |
+| Model | An ID returned by `GET /v1/models` |
 
-Loopback is the intended shape. To reach it from another machine, forward the
-port over SSH — `ssh -L 8484:127.0.0.1:8484 box` — rather than binding
-`0.0.0.0`. `eggpass host 0.0.0.0` works and still requires a key, but the
-hop through SSH keeps the proxy on the interface it was designed for.
+The client must send its key as `Authorization: Bearer <key>` or `X-Api-Key:
+<key>`. Setup examples for the OpenAI SDK, OpenCode, Cline, Continue, and curl
+are in [docs/client-setup.md](docs/client-setup.md).
 
-Ready-made setups for the OpenAI SDK, OpenCode, Cline, Continue and curl are
-in [docs/client-setup.md](docs/client-setup.md).
+To use the proxy from another machine, keep it bound to loopback and forward
+the port over SSH:
 
-## Commands
+```sh
+ssh -L 8484:127.0.0.1:8484 box
+```
 
-| Command | What it does |
+## Providers and models
+
+Requests are routed by model name. The longest matching prefix in the
+configuration wins; unmatched names go to the default provider.
+
+`GET /v1/models` merges live catalogues from signed-in providers. A provider
+that is unavailable or does not return a usable catalogue may contribute no
+models. The response is normalized for OpenAI-compatible clients, so some
+provider-specific models or fields may not appear. There is no built-in model
+list. Check the endpoint for current IDs before configuring a client.
+
+`eggpass` supports Chat Completions and the Responses API. Chat Completions
+requests for ChatGPT are translated to and from the Responses API. Details on
+routing, streaming, and supported fields are in
+[docs/how-it-works.md](docs/how-it-works.md).
+
+## Keys and local access
+
+The server requires at least one client key to start. Create and manage issued
+keys with `eggpass key add`, `eggpass key list`, and `eggpass key revoke`.
+Alternatively, set `api_key` in the config file. A key change takes effect on
+the next request, without a restart.
+
+The server binds to `127.0.0.1` by default. A loopback port can still be
+reached by web pages, so the key is required. `GET /health` returns the version
+string, and `GET /v1/last-inference` returns only the last client-facing HTTP
+status per provider. Those two endpoints do not require a key.
+
+Inference requests, including prompts and responses, are sent to the selected
+provider. `eggpass` does not keep prompt or response history. It keeps only the
+most recent inference status for each provider in daemon memory; that state is
+cleared when the daemon stops.
+
+## Common commands
+
+| Command | Purpose |
 | --- | --- |
-| `eggpass login` | Authenticate with a provider over OAuth. `--device` for headless (x.ai only). |
-| `eggpass logout` | Revoke the credential at the provider, then delete it. |
-| `eggpass status` | Show the account state and the daemon state. |
-| `eggpass usage` | Show how much of the subscription allowance is used. One fresh read per provider; `--json` prints the report as JSON. |
-| `eggpass run` | Start the server as a background daemon. `--foreground` to stay in the terminal. |
-| `eggpass stop` | Stop the daemon. |
-| `eggpass restart` | Stop the daemon, then start it again. |
-| `eggpass port` | Show the listen port, or change it. A change is applied and the server restarted. |
-| `eggpass host` | Show the bind address, or change it. Same behaviour as `port`. |
-| `eggpass key` | Issue, list and revoke the keys your clients use. |
-| `eggpass edit` | Open the config file in `$EDITOR`. |
-| `eggpass croncheck` | Start the daemon only if it is not already running. Prints nothing. |
-| `eggpass update` | Update to the latest released version, or to one exact version. `--check` reports without changing anything. |
+| `eggpass login` | Sign in to a provider. |
+| `eggpass logout` | Revoke and remove a provider credential. |
+| `eggpass status` | Show provider login and server state. |
+| `eggpass usage` | Read subscription usage where available. |
+| `eggpass run` | Start the server. Use `--foreground` to keep it in the terminal. |
+| `eggpass stop` / `restart` | Stop or restart the server. |
+| `eggpass port` / `host` | Show or change the listen address. Changes restart the server. |
+| `eggpass key` | Add, list, or revoke client keys. |
+| `eggpass edit` | Edit the config file. |
+| `eggpass croncheck` | Start the server if it is not running. |
+| `eggpass update` | Install a verified published release. |
 
-Every command is idempotent and safe to script from cron.
-
-## Endpoints
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /v1/chat/completions` | Chat completions, streaming and non-streaming |
-| `POST /v1/responses` | The OpenAI Responses API |
-| `GET /v1/models` | The model catalogue |
-| `GET /v1/models/{id}` | One model |
-| `GET /v1/last-inference` | The HTTP status of the last inference to each provider, for `eggpass usage` |
-| `GET /health` | Liveness probe, never authenticated |
-
-Both `/v1/chat/completions` and `/chat/completions` work, so it does not matter
-whether your client's base URL already carries the `/v1`.
-
-`GET /v1/models` is the **union** of every provider you are signed in to,
-fetched live. There is no compiled-in list of model names, so a model no
-provider advertises is a `404` rather than a hopeful `200`. Each entry says
-what the model can do — the thinking levels it offers, its context window —
-so a client can offer them without a list of its own.
-
-Thinking levels are set the way the Chat Completions API spells them, with
-`reasoning_effort`, and the thinking comes back in `reasoning_content`. The
-proxy translates the spelling for ChatGPT, which speaks the Responses API.
-
-Tool calls work the same way for both providers: the call comes back in
-`message.tool_calls`, and the proxy carries it into the next turn so the tool's
-result has something to attach to.
+See [docs/commands.md](docs/commands.md) for flags, exit codes, and side
+effects.
 
 ## Configuration
 
-`~/.config/eggpass/config.toml`, written with the defaults on first run.
-`eggpass edit` opens it in `$EDITOR`.
+The config file is `~/.config/eggpass/config.toml`. It is created with defaults
+on first run and can be opened with `eggpass edit`.
 
 ```toml
-host = "127.0.0.1"   # the address the API binds to
-port = 8484          # the port it listens on
-api_key = ""         # optional hand-written client key
+host = "127.0.0.1"
+port = 8484
+api_key = ""
 ```
 
-The full reference — routing, OAuth settings, timeouts, the file layout — is
-in [docs/configuration.md](docs/configuration.md).
+See [docs/configuration.md](docs/configuration.md) for routing, provider
+settings, timeouts, and files on disk.
 
 ## Documentation
 
-| Document | What it covers |
+| Document | Contents |
 | --- | --- |
-| [docs/commands.md](docs/commands.md) | Every command, its flags, its exit codes, its side effects. |
-| [docs/client-setup.md](docs/client-setup.md) | OpenAI SDK, OpenCode, Cline, Continue, curl. |
-| [docs/configuration.md](docs/configuration.md) | The config file, the files on disk, the migration. |
-| [docs/how-it-works.md](docs/how-it-works.md) | Routing, translation, token refresh, key handling. |
-| [docs/updating.md](docs/updating.md) | How `eggpass update` verifies and replaces itself. |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes, fixes. |
-| [docs/releasing.md](docs/releasing.md) | How a release is cut and signed off. Maintainers. |
-| [docs/plans/](docs/plans/) | The research, the plans and what actually shipped. |
+| [Commands](docs/commands.md) | Command syntax, options, and effects |
+| [Client setup](docs/client-setup.md) | OpenAI SDK, OpenCode, Cline, Continue, and curl |
+| [Configuration](docs/configuration.md) | Config settings and files |
+| [How it works](docs/how-it-works.md) | Routing, translation, authentication, and streaming |
+| [Updating](docs/updating.md) | Update verification and rollback |
+| [Troubleshooting](docs/troubleshooting.md) | Common errors and fixes |
+| [Releasing](docs/releasing.md) | Maintainer release procedure |
+| [Design notes](docs/plans/) | Historical research and implementation record |
 
 ## Development
 
 ```sh
-cargo test                  # unit and integration tests, no network
+cargo test
 cargo clippy --all-targets -- -D warnings
-cargo fmt --all
+cargo fmt --all -- --check
 cargo build --release
 ```
 
-The integration tests run the proxy in front of a stub upstream written
-directly against a socket, so they never touch the network.
-
-`scripts/verify-live.sh` is the one script that talks to x.ai for real. It
-needs a human to approve the device-code login, and it spends a few tokens.
+Tests use a local stub upstream and do not access provider services.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

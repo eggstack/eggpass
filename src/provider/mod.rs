@@ -311,12 +311,8 @@ pub fn normalize_catalogue(kind: CatalogueKind, body: &[u8]) -> Vec<u8> {
 /// the OpenAI-compatible ecosystem has settled on — says what the model can
 /// do, under `capabilities` and `limit`.
 ///
-/// The upstream's own fields are carried through untouched, and these are
-/// added beside them, derived only from what the upstream states. A field
-/// the upstream says nothing about is left out rather than guessed at: the
-/// models x.ai publishes without a `capabilities` block carry no reasoning
-/// flag, because saying `reasoning: false` would be a claim its own
-/// catalogue does not make.
+/// Aliases are derived from upstream data; absent facts are omitted rather
+/// than guessed. A reasoning alias may replace a colliding upstream value.
 fn add_aliases(entry: &mut serde_json::Map<String, Value>) {
     // The display name, under the OpenRouter spelling.
     let display_name = entry

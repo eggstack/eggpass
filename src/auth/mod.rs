@@ -39,7 +39,7 @@ pub const FALLBACK_REFERRER: &str = "grok-build";
 
 /// The shorter scope set used by the reference implementation.
 ///
-/// Used as a fallback when xAI refuses the full set (open risk #4).
+/// Used as a fallback when xAI refuses the full set.
 pub const FALLBACK_SCOPES: &[&str] = crate::provider::xai::FALLBACK_SCOPES;
 
 /// How long we wait for the OAuth callback before giving up.

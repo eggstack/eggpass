@@ -540,7 +540,7 @@ Requirements from the CLI spec: `run` backgrounds the server, `stop` ends it,
 `croncheck` starts it only if it is not running, and `port` changes take effect
 on restart. **Superseded on the last point** — `port` and `host` now apply the
 change and restart the daemon themselves; see
-[`plan-eggpass.md`](plan-eggpass.md#381-the-address-commands).
+[`cli-spec.md`](cli-spec.md#eggpass-port).
 
 **Recommendation: a self-contained daemon with a PID file — no launchd, no
 systemd.**
@@ -560,7 +560,7 @@ Details:
 | `stop` | `SIGTERM` → wait up to ~10s → `SIGKILL`. Graceful shutdown closes the listener and finishes in-flight requests. |
 | Log | `~/.config/eggpass/eggpass.log`, with rotation or size cap. |
 | `run` semantics | **Idempotent**: if already running, print the PID and exit 0. Never start a second instance. |
-| Port change | Write the new port to config; the running daemon keeps the old port until `restart`. The CLI should say so explicitly. **Superseded** — `port` now applies the change and restarts the daemon itself (see [`plan-eggpass.md`](plan-eggpass.md#381-the-address-commands)). |
+| Port change | The original design required a manual restart. **Superseded** — `port` now applies the change and restarts the daemon itself; see [`cli-spec.md`](cli-spec.md#eggpass-port). |
 | Host change | The bind address is part of the same contract as the port: `host` applies it and restarts. Loopback is the default, and a non-loopback address requires `api_key` to be configured. |
 | Single-instance guard | Bind failure on the port is itself the guard; also check the PID file before starting. |
 

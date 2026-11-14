@@ -1,105 +1,85 @@
 # Troubleshooting
 
-**`not logged in — run 'eggpass login'`** — the credentials are missing or
-expired and cannot be refreshed. Log in again.
+## Sign-in and keys
 
-**`refusing to run: no client key is configured`** — `eggpass run`,
-`restart` and `croncheck` will not start the proxy without a key. Run
-`eggpass key add` (and put the key in your client), or set `api_key` in the
-config file.
+**`not logged in` or credentials cannot refresh:** Run `eggpass login` for
+the affected provider. Sign-in replaces that provider's saved credential.
 
-**`401` from the proxy** — either you are logged out, or the client is
-sending the wrong key. Check `eggpass status`, and check `eggpass key list`:
-the client has to send one of the keys it shows.
+**`refusing to run: no client key is configured`:** Add a key with
+`eggpass key add`, or set `api_key` in the config file. The client must send
+the key with each protected request.
 
-**`401` saying `no client key is configured on this server`** — the daemon is
-running from before the last key was revoked. Issue a key with
-`eggpass key add`; it takes effect on the next request, no restart.
+**Proxy returns `401`:** Check `eggpass status`, then compare the client's key
+with `eggpass key list` or the configured `api_key`. If the response says no
+client key is configured, add a key. It takes effect on the next request.
 
-**`421` saying `the request was addressed to a host this server does not
-serve`** — the request reached the proxy with a `Host` header that is not
-`127.0.0.1`, `localhost`, `[::1]` or a `*.localhost` name. A reverse proxy in
-front is the usual cause: forward the header unchanged, e.g.
-`proxy_set_header Host 127.0.0.1:8484`. A request from a web page is the other
-cause, and the refusal is the point.
+**Browser did not open during sign-in:** The login prints the URL. Open it
+manually, or use `eggpass login --provider xai --device` for x.ai device-code
+sign-in.
 
-**`address already in use`** — something else is on the port. Pick another one
-with `eggpass port 9000`; the command checks the port is free before it
-restarts anything, and tells you so if it is not.
+**The x.ai sign-in page shows a code to copy:** Paste the code into the
+terminal and press Enter.
 
-**`port 9000 is taken`** — the same thing, said more directly. Nothing was
-changed and the server is still running where it was.
+## Server and network
 
-**The server says it is running but nothing answers** — the daemon is running
-but its port has changed. `eggpass status` prints the port it is actually
-serving. `eggpass restart` applies the configured port.
+**`421` or a host authority error:** Use `http://127.0.0.1:8484` as the host.
+If a reverse proxy is in front, make sure it sends an accepted `Host` header.
+Requests addressed to another host are rejected on loopback binds.
 
-**The browser did not open for the login** — the URL is printed as well; open
-it by hand, or use `eggpass login --provider xai --device`.
+**`address already in use` or `port 9000 is taken`:** Another process is using
+the requested port. Choose another port with `eggpass port 9001`. The command
+checks the port before restarting the server.
 
-**The sign-in page shows a code to copy instead of redirecting** — paste that
-code into the terminal and press Enter. The login is waiting for it, exactly
-as the official Grok CLI does.
+**The server runs but does not answer on the configured port:** Run
+`eggpass status` to see the host and port it is actually serving. Use
+`eggpass port` or `eggpass host` to apply a configuration change.
 
-**Streaming feels slow** — check that the client is not buffering. `curl -N`
-shows the raw stream.
+**Remote client cannot connect:** The server binds to loopback by default.
+Use an SSH tunnel, for example `ssh -L 8484:127.0.0.1:8484 box`, instead of
+exposing the API directly.
 
-**The model answers but the agent never runs a tool** — the answer comes back
-with no `tool_calls` in it, so the client has nothing to run. A client that
-drives tools needs the provider's tool calls translated into the Chat
-Completions shape; check which provider serves the model with
-`eggpass status`. x.ai answers with tool calls as they are, and ChatGPT's are
-translated.
+## Requests and models
 
-**The tool ran but the model ignored the result** — the tool's answer did not
-make it back into the conversation with the call it belongs to, so the upstream
-saw an answer it could not place. The client must send the model's own tool
-call back along with the tool's result, in the order the model produced them.
+**Streaming appears buffered:** Test with `curl -N` to disable curl's output
+buffering. Provider response time can also affect when the first chunk arrives.
 
-**A ChatGPT request fails with `subscription_sharing_usage_limit_exceeded`** —
-the ChatGPT plan's allowance is used up, or the account is not eligible for
-plan usage. The error code comes from OpenAI; `eggpass status` shows whether
-plan usage was granted to this installation.
+**A request returns `model_not_found`:** Fetch `GET /v1/models` with your client
+key and choose an ID from the response. The catalogues are fetched live, and a
+provider may omit models that are unavailable or filtered during normalization.
 
-**A request fails with `model_not_found`** — the model is not one the
-provider serves. The Sign in with ChatGPT route offers the `gpt-6` and
-`gpt-5.6` families; `gpt-5-codex` and `codex-mini-latest` are not among them,
-and asking for one is answered with a `400` that says so. `GET /v1/models`
-lists what is actually available.
+**A client shows no reasoning levels:** Check whether the model entry in
+`GET /v1/models` lists them, and whether the client reads those fields.
 
-**A client shows no thinking levels for a model** — the levels come from the
-provider's catalogue, so the client has to be reading `/v1/models`. Some
-clients only read a model's name and show nothing else; check what the client
-did with the catalogue before suspecting the proxy. The levels a model does
-offer are listed under `supported_reasoning_levels`.
+**A reasoning level is rejected:** Use a level listed for that model. Providers
+can reject levels they do not support.
 
-**A thinking level is set but the model does not seem to think harder** — the
-level is sent as `reasoning_effort`, which is renamed to `reasoning.effort`
-for ChatGPT. Not every model takes every level: `none` and `minimal` are
-valid in general but are refused by some models, and the refusal comes back
-from OpenAI as an error.
+**An agent does not run a tool:** Check that the response contains
+`message.tool_calls` and that the client handles OpenAI Chat Completions tool
+calls. For the tool result, the client must send the assistant's tool call and
+the matching `tool_call_id` back in the conversation.
 
-**`eggpass update` refuses to replace the binary** — the installation is
-Cargo-managed. Cargo owns that file and its bookkeeping, so replacing it
-behind Cargo's back would leave `cargo install --list` and `cargo uninstall`
-lying. The command prints the `cargo install` line to run instead.
+## Usage and updates
 
-**`eggpass update` says the release is already current** — the published
-release matches the running version. Nothing to do.
+**ChatGPT usage is unavailable:** Sign in with ChatGPT does not expose a quota
+API to eggpass. Use the link shown by `eggpass usage` to view account usage.
 
-**`eggpass update` says the running version is newer than the published one**
-— the running build is a local or unreleased build, and the catalogue is not
-entitled to replace it.
+**`eggpass update` refuses to replace the binary:** The installation is
+Cargo-managed. Run the `cargo install` command printed by the updater instead.
 
----
+**`eggpass update` says the release is already current:** There is no newer
+published release to install.
 
-## Where to look next
+**The running version is newer than the published release:** The running build
+may be a local or unreleased version. The updater will not replace it with an
+older published build unless you name that version explicitly.
 
-| Question | Where |
+## More help
+
+| Need | Read or run |
 | --- | --- |
-| What is the server actually doing? | `eggpass status` |
-| What is in the log? | `~/.config/eggpass/eggpass.log` |
-| Which keys exist? | `eggpass key list` |
-| What does the config say? | `eggpass edit` |
-| What exactly does a command do? | [commands.md](commands.md) |
-| How does routing work? | [how-it-works.md](how-it-works.md) |
+| Server and login state | `eggpass status` |
+| Daemon log | `~/.config/eggpass/eggpass.log` |
+| Issued keys | `eggpass key list` |
+| Command details | [commands.md](commands.md) |
+| Config settings | [configuration.md](configuration.md) |
+| Request path and authentication | [how-it-works.md](how-it-works.md) |

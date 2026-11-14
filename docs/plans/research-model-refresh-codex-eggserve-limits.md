@@ -92,11 +92,9 @@ If a cache is ever wanted, the TTL would want to be short-ish and the
 > - There is **no documented device-code flow**, so the `--device` option has
 >   no equivalent here.
 >
-> The details that follow are still accurate as a description of the Codex
-> CLI's own implementation — which is what the reference material describes —
-> but the *design* should now be based on SIWC. See
-> [`plan-eggpass.md`](plan-eggpass.md)
-> §3.4–3.5 for the revised design, and §2.7 below for why this matters.
+> The details that follow describe the Codex CLI's own implementation. The
+> shipped ChatGPT integration instead uses Sign in with ChatGPT; see
+> [`shipped-2026-11-13.md`](shipped-2026-11-13.md#phase-4-chatgpt-siwc).
 
 The shape is genuinely parallel to the x.ai path — same PKCE, same
 authorization-code grant, same refresh-with-rotation. But there are two
@@ -584,11 +582,8 @@ is a reason to keep this a *provider capability* rather than a core feature.
    timeout) in `src/server/http.rs`.
 
 3. **ChatGPT path: use Sign in with ChatGPT, not the Codex CLI's client.**
-   > **Update (2026-11-13).** This recommendation is superseded in detail by
-   > [`plan-eggpass.md`](plan-eggpass.md),
-   > but the shape of the answer holds: the auth plumbing is the easy part and
-   > our `TokenProvider` trait is the right seam; the real work is on the
-   > inference side.
+   > **Update (2026-11-13).** The implementation uses Sign in with ChatGPT;
+   > see [`shipped-2026-11-13.md`](shipped-2026-11-13.md#phase-4-chatgpt-siwc).
    >
    > The route is now the **public** `https://api.openai.com/v1` — the same
    > `/v1` path style as x.ai, no `ChatGPT-Account-Id` header, and a live

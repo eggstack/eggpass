@@ -6,11 +6,8 @@
 //! reading the local UTC offset so a quota reset time can be shown in the
 //! user's own timezone.
 //!
-//! The offset is read through `libc::localtime_r`, which is already in the
-//! dependency tree and which resolves the offset *at the instant asked for* —
-//! so a reset time on the far side of a daylight-saving change is right. A
-//! hand-rolled tzfile parser would be the one place this code could quietly
-//! go wrong, and the payoff here is a single offset.
+//! The local offset is resolved with `libc::localtime` at the requested
+//! instant, so daylight-saving changes use the offset in force then.
 
 use std::str::FromStr;
 

@@ -1,69 +1,47 @@
 # Configuration
 
-## The config file
+## Config file and data directory
 
-`~/.config/eggpass/config.toml`, written with the defaults on first run.
-`eggpass edit` opens it in `$EDITOR`; the file is validated when the editor
-exits. `--config <PATH>` points a single command at a different file.
+The default config is `~/.config/eggpass/config.toml`. On first run, eggpass writes a file with the defaults. A missing config uses defaults; commands that load an invalid TOML file or value fail. Use `eggpass edit` to edit and validate it. The `--config <PATH>` option changes only the config file path, not the credential, key, PID, or log locations.
 
-This is the file `eggpass` writes for you:
+The data directory is selected in this order:
+
+1. `EGGPASS_HOME`, which relocates all eggpass files.
+2. `XDG_CONFIG_HOME/eggpass`.
+3. `~/.config/eggpass`.
+
+## Core settings
+
+This valid TOML example shows the main settings and defaults. Omitted OAuth settings use built-in provider values.
 
 ```toml
-# eggpass configuration
-#
-# This file is plain TOML and is safe to edit by hand.
-
-# The address the local API binds to. Loopback by default.
-# Change it with `eggpass host`, not by editing this file.
 host = "127.0.0.1"
-
-# TCP port the local API listens on.
-# Change it with `eggpass port`, not by editing this file.
 port = 8484
-
-# A key clients may send as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
-# One key is required for the proxy to run. `eggpass key add` issues keys of
-# its own — numbered, revocable, and hashed at rest; this setting is the older
-# way, a single key you can read back.
 api_key = ""
-
-# Log verbosity: error | warn | info | debug
 log_level = "info"
-
-# Set to true to allow binding a privileged port below 1024.
 allow_privileged_port = false
 
-# The upstream timeouts, in seconds. The defaults are generous because a long
-# answer can take minutes to stream.
 [timeouts]
 connect_seconds = 30
 global_seconds = 1800
 body_seconds = 1800
 
-# The local server's limits.
 [server]
 max_connections = 256
 idle_timeout_seconds = 120
 write_timeout_seconds = 600
 
-# Where `eggpass update` looks for releases. The repository publishes a
-# release manifest beside the binaries it names.
 [update]
 repository = "eggstack/eggpass"
 manifest_name = "eggpass-release-manifest.json"
 
-# Which upstream serves x.ai requests.
-#   "api"   = https://api.x.ai/v1                    (full catalog, default)
-#   "build" = https://cli-chat-proxy.grok.com/v1     (Grok Build proxy)
 [providers.xai]
 enabled = true
 upstream = "api"
 
-# ChatGPT, reached through Sign in with ChatGPT for Open Source.
 [providers.openai]
 enabled = true
 
-# Which provider serves a model, and the prefix map used to decide.
 [routing]
 default_provider = "xai"
 
@@ -71,98 +49,50 @@ default_provider = "xai"
 "grok-" = "xai"
 "gpt-" = "openai"
 "codex" = "openai"
-
-# The x.ai OAuth settings. Change these only if xAI rotates them; the values
-# below are the ones the official Grok CLI uses.
-[oauth.xai]
-client_id = "b1a00492-073a-47ea-816f-4c329264a828"
-issuer = "https://auth.x.ai"
-scopes = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
-referrer = "eggpass"
-
-# The ChatGPT OAuth settings. `ext_agent_host_id` identifies this installation
-# and is created on the first sign-in if it is not set.
-[oauth.openai]
-issuer = "https://auth.openai.com"
-scopes = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
-agent_name_hint = "eggpass"
-resource = "https://api.openai.com/v1"
 ```
 
-### The settings that matter
-
-| Setting | Default | Notes |
+| Setting | Default | Meaning |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | Change it with `eggpass host`. Loopback unless you say otherwise. |
-| `port` | `8484` | Change it with `eggpass port`. |
-| `api_key` | `""` | The older, hand-written client key: one key, readable back. `eggpass key add` issues numbered, revocable keys and stores only a hash. One of the two is required. |
-| `log_level` | `info` | `error`, `warn`, `info` or `debug`. |
-| `allow_privileged_port` | `false` | Required to bind below 1024. |
-| `routing.default_provider` | `xai` | Where a model with no matching prefix goes. |
-| `providers.*.enabled` | `true` | Turn a provider off without deleting its credential. |
+| `host` | `127.0.0.1` | Listen address. Use `eggpass host` to change it. |
+| `port` | `8484` | Listen port. Use `eggpass port` to change it. |
+| `api_key` | empty | Optional static client key. It is accepted alongside keys from `eggpass key add`. At least one of these key sources is required to start the server. |
+| `log_level` | `info` | `error`, `warn`, `info`, or `debug`. |
+| `allow_privileged_port` | `false` | Must be `true` to use a port below 1024. |
+| `timeouts.*` | See example | Upstream connection, whole-request, and response-body time limits in seconds. |
+| `server.*` | See example | Local connection limit and idle/write timeouts. |
+| `providers.*.enabled` | `true` | Disable a provider without deleting its stored credentials. Routing to a disabled provider will not serve requests. |
+| `providers.xai.upstream` | `api` | `api` uses `https://api.x.ai/v1`; `build` uses `https://cli-chat-proxy.grok.com/v1`. |
+| `routing.default_provider` | `xai` | Provider used when no model prefix matches. |
+| `routing.prefixes` | See example | Model-name prefixes mapped to providers. |
+| `update.*` | See example | Repository and release-manifest name used by `eggpass update`. |
 
-### Routing
+For a prefix match, the longest matching prefix wins. With the defaults, names beginning with `grok-` route to xAI; names beginning with `gpt-` or `codex` route to ChatGPT. Unmatched names route to xAI. Routing is based on the model name, not the endpoint path.
 
-Requests are routed by **model name**. The longest matching prefix in
-`routing.prefixes` wins; a model that matches nothing goes to
-`routing.default_provider`.
+The advanced `[oauth.xai]` settings are `client_id`, `issuer`, `scopes`, and `referrer`. `[oauth.openai]` supports `issuer`, `scopes`, `agent_name_hint`, `resource`, and `ext_agent_host_id`. `scopes` can be a space-separated string or an array of strings. Leave these at their built-in values unless a provider requires a change. The ChatGPT host ID is generated and recorded on first sign-in if it is absent.
 
-So with the default map, `grok-4.3` goes to x.ai, `gpt-5.6-sol` and
-`codex-mini-latest` go to ChatGPT, and an unrecognised name goes to x.ai.
+## Keys and network exposure
 
----
+A client key is required to start the server, including when it listens only on loopback. Use `eggpass key add` to create a numbered, revocable key, or set `api_key` for one static key. The static key is readable in the config. Issued keys are shown once and stored as salted hashes. Clients may send either as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
 
-## The files on disk
+The server listens on loopback by default. Binding to a non-loopback address exposes the proxy and the provider accounts it can use to the network. A key is required for that bind. The `GET /health` and `GET /v1/last-inference` probes are unauthenticated: health returns a JSON object with `status`, `service`, and a version string; last-inference returns only per-provider client-facing HTTP status codes. All other API requests require a valid key.
 
-| Path | Purpose | Mode |
-| --- | --- | --- |
-| `~/.config/eggpass/config.toml` | Your configuration, including `api_key` if you set one | `0600` |
-| `~/.config/eggpass/keys.json` | The keys `eggpass` issued — salted hashes only | `0600` |
-| `~/.config/eggpass/credentials/xai.json` | x.ai OAuth tokens | `0600` (directory `0700`) |
-| `~/.config/eggpass/credentials/openai.json` | ChatGPT OAuth tokens | `0600` |
-| `~/.config/eggpass/eggpass.pid` | Daemon pid, the host it bound, the port it serves | `0644` |
-| `~/.config/eggpass/eggpass.log` | Daemon log | `0644` |
+Eggpass runs locally, but inference requests are sent to the provider selected by routing. Prompts and request content are transmitted to xAI or ChatGPT for inference; they do not stay on this machine. `eggpass usage` also contacts providers directly to query usage, and `eggpass status` may contact them to count available models.
 
-### The key store
+Use `eggpass host` and `eggpass port` to change a live server's address. These commands update the config and restart the server when needed. Manual config edits take effect when the server next starts. See [commands.md](commands.md) for the commands and an SSH tunnel example.
 
-`keys.json` holds one record per issued key: its number, its optional label,
-the visible prefix, a random per-key salt, and the SHA-256 of
-`salt || key`. **The key itself is never written to disk**, so the file
-cannot be read to impersonate a client.
+## Files
 
-The store has exactly one writer — the `eggpass key` command. The server only
-reads it, and re-reads it whenever it changes, which is why a new key works
-on the next request with no restart.
+| Path | Contents and handling |
+| --- | --- |
+| `config.toml` | Settings, possibly including the readable `api_key`. Normally mode `0600`. |
+| `keys.json` | Issued-key numbers, labels, visible prefixes, salts, and hashes. It does not contain the full keys. Mode `0600`. |
+| `credentials/xai.json` | xAI OAuth credentials, including tokens. Mode `0600`. |
+| `credentials/openai.json` | ChatGPT OAuth credentials, including tokens. Mode `0600`. |
+| `eggpass.pid` | Daemon process ID and the address and port it serves. |
+| `eggpass.log` | Daemon log. |
 
-### The credential files
+The data directory and `credentials` directory are restricted to mode `0700`; credential and key files use `0600` on Unix-like systems. Keep any custom config file containing `api_key` private too.
 
-One file per provider, so a provider can be signed out without touching the
-other. Each holds the access token, the refresh token and the expiry, in
-`0600`, inside a `0700` directory.
+With the default data directory, xAI credentials may be read from `~/.grok/auth.json` when `credentials/xai.json` is absent. If an imported refresh token is rotated, eggpass stores its replacement in its own credential file; the Grok CLI's original file is not updated. Setting `EGGPASS_HOME` disables this import to keep the relocated installation isolated.
 
----
-
-## The rename migration
-
-An installation that predates the rename lived in `~/.config/grokproxy`. The
-first run copies that directory's contents into `~/.config/eggpass` — it
-**copies**, it does not move, and it deletes nothing — and leaves a
-`migrated-to-eggpass` marker behind so the old directory says what happened.
-
-The old directory is left exactly as it was, so you can look at it, and so
-nothing is lost if you were relying on it.
-
----
-
-## The Grok CLI import
-
-`~/.grok/auth.json`, written by the official Grok CLI, is read as an import
-source when `credentials/xai.json` is missing. You do not have to do anything
-for this to happen — `eggpass status` simply shows you as logged in.
-
-**One thing to know about refresh tokens.** x.ai rotates them: every refresh
-returns a new refresh token and revokes the old one. `eggpass` keeps the new
-one, so it keeps working — but if the credential was *imported* from
-`~/.grok/auth.json`, the file it came from still holds the revoked token, and
-the official Grok CLI will need its own login again. Log in with
-`eggpass login` rather than relying on the import if you use both tools.
+Installations from before the rename may have data in `~/.config/grokproxy`. On first run, eggpass copies the old data into the new directory and leaves the original in place.

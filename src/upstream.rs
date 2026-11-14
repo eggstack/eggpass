@@ -3,10 +3,9 @@
 //! One client per provider. The provider's spec says where the requests go
 //! and which headers it needs; everything else is the same for every provider.
 //!
-//! The model catalogue is **not** cached and there is no compiled-in list of
-//! model names. Every `GET /v1/models` is a live round trip to the provider,
-//! so the catalogue is never stale and a model that exists upstream is never
-//! missing here.
+//! The model catalogue is not cached or compiled in. Each `GET /v1/models`
+//! fetches live lists from signed-in providers; availability and normalization
+//! determine which models appear.
 
 use std::io::Read;
 use std::time::Duration;

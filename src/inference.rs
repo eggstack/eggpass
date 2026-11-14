@@ -1,19 +1,6 @@
-//! What the last inference to each provider answered with.
-//!
-//! The daemon keeps one number per provider — the HTTP status the last
-//! inference was answered with — and nothing else. There is no file, no log
-//! and no history: the state lives in the daemon's memory and is gone when
-//! the daemon stops. That is deliberate. A record that outlived the process
-//! would be a log, and a log of inferences is a history of what the user
-//! asked for.
-//!
-//! It is here so that `eggpass usage` can say something about a provider
-//! that publishes no quota of its own: when the number is unknown, the last
-//! answer is the only evidence there is about the account.
-//!
-//! The status is the one the proxy answered the client with, which is the
-//! upstream's own status for an upstream refusal, and `401` or `502` for a
-//! refusal or a connection that never reached the provider.
+//! Per-provider status of the most recent inference, kept only in daemon memory.
+//! Used by `eggpass usage` when a provider exposes no quota. Records the
+//! client-facing HTTP status, including local `401` and `502` failures.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -27,7 +14,6 @@ pub struct InferenceState {
 }
 
 impl InferenceState {
-    /// An empty state.
     pub fn new() -> InferenceState {
         InferenceState::default()
     }
