@@ -107,6 +107,15 @@ authenticates with your own subscription over OAuth.
   client's `max_tokens` is now carried over as `max_output_tokens` instead of
   being silently dropped.
 
+- **The model can use tools again.** The ChatGPT route speaks the Responses
+  API, where a tool call is an output item of type `function_call` — and the
+  translation dropped it. A client that drives tools was handed an empty
+  answer where the model had asked for a tool, and an agent could make no
+  progress. The call now arrives in `message.tool_calls` with the finish
+  reason `tool_calls`, a streamed answer carries it as it arrives, and the
+  model's own call is carried back into the conversation so the tool's result
+  has something to attach to.
+
 ### Security
 
 - The client's credentials are stripped before a request is forwarded, and the

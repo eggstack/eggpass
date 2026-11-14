@@ -82,6 +82,44 @@ the provider's own error.
 
 ---
 
+## Tool calls
+
+Tools work the same way for both providers: define them as the Chat
+Completions API defines them, and the answer carries the call in
+`message.tool_calls`.
+
+```python
+answer = client.chat.completions.create(
+    model="gpt-6.1-sol",
+    messages=[{"role": "user", "content": "What is the weather in Paris?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }],
+)
+call = answer.choices[0].message.tool_calls[0]
+```
+
+Send the result back in the same turn, with the call's own id, so the model can
+carry on:
+
+```python
+answer = client.chat.completions.create(
+    model="gpt-6.1-sol",
+    messages=[
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": answer.choices[0].message.tool_calls},
+        {"role": "tool", "tool_call_id": call.id, "content": "18C, sunny"},
+    ],
+    tools=[...],
+)
+```
+
+---
+
 ## OpenAI SDK
 
 ### Python

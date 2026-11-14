@@ -33,6 +33,18 @@ as the official Grok CLI does.
 **Streaming feels slow** — check that the client is not buffering. `curl -N`
 shows the raw stream.
 
+**The model answers but the agent never runs a tool** — the answer comes back
+with no `tool_calls` in it, so the client has nothing to run. A client that
+drives tools needs the provider's tool calls translated into the Chat
+Completions shape; check which provider serves the model with
+`eggpass status`. x.ai answers with tool calls as they are, and ChatGPT's are
+translated.
+
+**The tool ran but the model ignored the result** — the tool's answer did not
+make it back into the conversation with the call it belongs to, so the upstream
+saw an answer it could not place. The client must send the model's own tool
+call back along with the tool's result, in the order the model produced them.
+
 **A ChatGPT request fails with `subscription_sharing_usage_limit_exceeded`** —
 the ChatGPT plan's allowance is used up, or the account is not eligible for
 plan usage. The error code comes from OpenAI; `eggpass status` shows whether

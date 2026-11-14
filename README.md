@@ -144,6 +144,10 @@ Thinking levels are set the way the Chat Completions API spells them, with
 `reasoning_effort`, and the thinking comes back in `reasoning_content`. The
 proxy translates the spelling for ChatGPT, which speaks the Responses API.
 
+Tool calls work the same way for both providers: the call comes back in
+`message.tool_calls`, and the proxy carries it into the next turn so the tool's
+result has something to attach to.
+
 ## Configuration
 
 `~/.config/eggpass/config.toml`, written with the defaults on first run.

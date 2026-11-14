@@ -123,6 +123,33 @@ says which they are under `supported_reasoning_levels`. A level the model does
 not offer is refused by the upstream, and that refusal comes back to the client
 as the upstream's own error.
 
+## Tool calls
+
+A model that can use tools asks for one, the client runs it, and the result goes
+back into the conversation. The two providers spell that differently.
+
+- **x.ai** speaks Chat Completions natively, so a tool call is already the shape
+  a client expects: `message.tool_calls`.
+- **ChatGPT** speaks the Responses API, where a tool call is an output *item*
+  of type `function_call` — announced with its name and id, then filled in as
+  its arguments arrive.
+
+`eggpass` translates the second into the first, so a client sees the same thing
+whichever provider answered:
+
+- The upstream's `function_call` becomes `message.tool_calls`, carrying the
+  `call_id` the client matches the tool's answer against, and the finish reason
+  becomes `tool_calls`.
+- While streaming, the call is announced with its id and name, and its arguments
+  arrive as they do.
+- When the client sends the model's own tool call back with the tool's answer,
+  it is carried into the conversation as a `function_call` item, so the upstream
+  can place the answer next to the call it belongs to.
+
+That last step matters more than it looks. Without it the tool's answer arrives
+with nothing to attach to, and the conversation quietly loses the tool's result
+— the model answers as though it had never been told.
+
 ## Errors
 
 An error from a provider keeps its status, its type and its code. A request for

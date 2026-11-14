@@ -108,11 +108,32 @@ pub fn chat_request_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
                     }));
                 }
                 "assistant" => {
-                    if let Some(text) = content_text(content) {
+                    // An assistant message with no text carries nothing, and a
+                    // message with empty text is not a message the Responses
+                    // API wants. A tool call is carried on its own below.
+                    if let Some(text) = content_text(content)
+                        && !text.is_empty()
+                    {
                         input.push(json!({
                             "role": "assistant",
                             "content": [{"type": "output_text", "text": text}],
                         }));
+                    }
+                    // The model's own tool call.
+                    //
+                    // The Responses API expects the call to be in the
+                    // conversation before the tool's answer, and it matches the
+                    // two by their `call_id`. Leaving the call out leaves the
+                    // upstream with a tool answer it cannot place.
+                    for call in message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(item) = convert_tool_call(call) {
+                            input.push(item);
+                        }
                     }
                 }
                 _ => {
@@ -187,19 +208,57 @@ fn convert_tool(tool: &Value) -> Option<Value> {
     Some(converted)
 }
 
+/// Convert one Chat Completions tool call into the Responses shape.
+///
+/// The Chat Completions shape nests the call under `function`; the Responses
+/// shape puts it on the item itself. The `call_id` is what ties the call to
+/// the tool's answer later in the conversation, so it is carried over.
+fn convert_tool_call(call: &Value) -> Option<Value> {
+    let function = call.get("function")?;
+    let name = function.get("name").and_then(Value::as_str)?;
+    let arguments = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+
+    Some(json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }))
+}
+
 /// Convert a Responses response into a Chat Completions response.
 pub fn responses_to_chat_completion(body: &[u8]) -> Result<Vec<u8>, String> {
     let value: Value =
         serde_json::from_slice(body).map_err(|err| format!("the response is not JSON: {err}"))?;
 
     let text = response_text(&value);
-    let finish_reason = finish_reason(&value);
+    let tool_calls = response_tool_calls(&value);
+    let mut reason = finish_reason(&value);
+    if !tool_calls.is_empty() {
+        // The model asked for a tool rather than for an answer, and that is
+        // what the finish reason says.
+        reason = "tool_calls";
+    }
 
     let mut choices = vec![json!({
         "index": 0,
         "message": { "role": "assistant", "content": text },
-        "finish_reason": finish_reason,
+        "finish_reason": reason,
     })];
+
+    // The tool calls, when the model asked for one.
+    //
+    // The Responses API carries a tool call as an output item; the Chat
+    // Completions shape carries it in `message.tool_calls`. Without this the
+    // client sees an empty answer where the model asked for a tool, and a
+    // client that drives tools has nothing to run.
+    if !tool_calls.is_empty() {
+        choices[0]["message"]["tool_calls"] = Value::Array(tool_calls);
+    }
 
     // The thinking text, when the upstream sent any.
     //
@@ -237,6 +296,44 @@ pub fn responses_to_chat_completion(body: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     serde_json::to_vec(&output).map_err(|err| err.to_string())
+}
+
+/// The tool calls in a Responses object.
+///
+/// The Responses API carries a tool call as an output item of type
+/// `function_call`: the tool's name, the arguments it was given, and the
+/// `call_id` that ties the call to the tool's answer. The Chat Completions
+/// shape asks for the same thing in `message.tool_calls`.
+///
+/// The `call_id` is the client's handle on the call, so it is preferred over
+/// the item's own id.
+fn response_tool_calls(value: &Value) -> Vec<Value> {
+    let Some(output) = value.get("output").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter_map(|item| {
+            let name = item.get("name").and_then(Value::as_str)?;
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .unwrap_or_default();
+
+            Some(json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments },
+            }))
+        })
+        .collect()
 }
 
 /// The assistant text in a Responses object.
@@ -341,6 +438,24 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// A tool call the model asked for.
+///
+/// The upstream tells the story of a tool call across several events: the call
+/// is announced, its arguments arrive in pieces, and the call is completed.
+/// The pieces are tied together by the upstream's item id.
+struct ToolCall {
+    /// The upstream's item id, which its argument events name.
+    item_id: String,
+    /// The id the client matches the tool's answer against.
+    call_id: String,
+    /// The tool's name.
+    name: String,
+    /// The arguments seen so far.
+    arguments: String,
+    /// Whether the client has been told about this call.
+    announced: bool,
+}
+
 /// Rewrites a Responses event stream into Chat Completions chunks.
 ///
 /// The event stream is read a chunk at a time and rewritten on the way
@@ -355,6 +470,7 @@ pub struct ResponsesToChatStream<R> {
     model: String,
     created: i64,
     usage: Option<Value>,
+    tool_calls: Vec<ToolCall>,
 }
 
 impl<R: Read> ResponsesToChatStream<R> {
@@ -369,7 +485,120 @@ impl<R: Read> ResponsesToChatStream<R> {
             model: String::new(),
             created: now_unix(),
             usage: None,
+            tool_calls: Vec::new(),
         }
+    }
+
+    /// One Chat Completions chunk.
+    fn chunk(&self, delta: Value, finish_reason: Value) -> Vec<u8> {
+        let chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        });
+        encode_event(&chunk)
+    }
+
+    /// The tool call with this item id, if there is one.
+    fn tool_call_index(&self, item_id: Option<&str>) -> Option<usize> {
+        let item_id = item_id?;
+        self.tool_calls
+            .iter()
+            .position(|call| call.item_id == item_id)
+    }
+
+    /// Note a tool call, and answer the index it is known by.
+    ///
+    /// A call that has not been seen before is given the next index; the
+    /// Chat Completions shape numbers the calls in the order they arrive.
+    fn register_tool_call(&mut self, item_id: &str, call_id: &str, name: &str) -> usize {
+        if let Some(index) = self.tool_call_index(Some(item_id)) {
+            return index;
+        }
+        self.tool_calls.push(ToolCall {
+            item_id: item_id.to_string(),
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            arguments: String::new(),
+            announced: false,
+        });
+        self.tool_calls.len() - 1
+    }
+
+    /// Tell the client about a tool call, once.
+    ///
+    /// The client needs the call's id and name before the arguments, so the
+    /// first chunk carries those and the arguments follow in their own chunks.
+    fn announce_tool_call(&mut self, index: usize) -> Vec<u8> {
+        let Some(call) = self.tool_calls.get(index) else {
+            return Vec::new();
+        };
+        if call.announced {
+            return Vec::new();
+        }
+        let delta = json!({
+            "tool_calls": [{
+                "index": index,
+                "id": call.call_id,
+                "type": "function",
+                "function": { "name": call.name, "arguments": "" },
+            }],
+        });
+        if let Some(call) = self.tool_calls.get_mut(index) {
+            call.announced = true;
+        }
+        self.chunk(delta, Value::Null)
+    }
+
+    /// Carry the arguments of a tool call across.
+    ///
+    /// The upstream sends the arguments twice: in pieces, and once whole. The
+    /// pieces are sent on as they arrive; the whole copy is only sent when
+    /// something is missing, so the client is not given the same arguments
+    /// twice.
+    fn carry_arguments(&mut self, index: usize, arguments: &str) -> Vec<u8> {
+        if arguments.is_empty() {
+            return Vec::new();
+        }
+
+        let seen = self
+            .tool_calls
+            .get(index)
+            .map(|call| call.arguments.clone())
+            .unwrap_or_default();
+
+        // What the client still needs to see.
+        let missing = if seen.is_empty() {
+            arguments.to_string()
+        } else if arguments.starts_with(&seen) {
+            arguments[seen.len()..].to_string()
+        } else {
+            // The upstream changed its mind about the arguments. There is no
+            // way to take the first copy back, so the first copy stands.
+            String::new()
+        };
+
+        if missing.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(call) = self.tool_calls.get_mut(index) {
+            call.arguments.push_str(&missing);
+        }
+
+        let delta = json!({
+            "tool_calls": [{
+                "index": index,
+                "function": { "arguments": missing },
+            }],
+        });
+        self.chunk(delta, Value::Null)
     }
 
     /// Translate one Responses event into the chunks it produces.
@@ -387,6 +616,84 @@ impl<R: Read> ResponsesToChatStream<R> {
         }
 
         match kind {
+            "response.output_item.added" => {
+                // A tool call starts. The name and the id come with it; the
+                // arguments arrive as their own events.
+                let Some(item) = event.get("item") else {
+                    return Vec::new();
+                };
+                if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                    return Vec::new();
+                }
+                let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                let index = self.register_tool_call(item_id, call_id, name);
+                self.announce_tool_call(index)
+            }
+            "response.function_call_arguments.delta" => {
+                let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                let Some(index) =
+                    self.tool_call_index(event.get("item_id").and_then(Value::as_str))
+                else {
+                    return Vec::new();
+                };
+                if let Some(call) = self.tool_calls.get_mut(index) {
+                    call.arguments.push_str(delta);
+                }
+                let chunk = json!({
+                    "tool_calls": [{
+                        "index": index,
+                        "function": { "arguments": delta },
+                    }],
+                });
+                self.chunk(chunk, Value::Null)
+            }
+            "response.function_call_arguments.done" => {
+                let Some(arguments) = event.get("arguments").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let Some(index) =
+                    self.tool_call_index(event.get("item_id").and_then(Value::as_str))
+                else {
+                    return Vec::new();
+                };
+                self.carry_arguments(index, arguments)
+            }
+            "response.output_item.done" => {
+                // The whole of a tool call.
+                //
+                // The upstream may finish a call without ever announcing it,
+                // so the call is registered here as well.
+                let Some(item) = event.get("item") else {
+                    return Vec::new();
+                };
+                if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                    return Vec::new();
+                }
+                let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                let index = self.register_tool_call(item_id, call_id, name);
+                let mut out = self.announce_tool_call(index);
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                out.extend_from_slice(&self.carry_arguments(index, arguments));
+                out
+            }
             "response.output_text.delta" => {
                 let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
                 if delta.is_empty() {
@@ -439,8 +746,11 @@ impl<R: Read> ResponsesToChatStream<R> {
                 }
                 let finish = if kind == "response.incomplete" {
                     "length"
-                } else {
+                } else if self.tool_calls.is_empty() {
                     "stop"
+                } else {
+                    // The model asked for a tool rather than for an answer.
+                    "tool_calls"
                 };
                 let mut chunk = json!({
                     "id": self.id,
@@ -819,6 +1129,154 @@ mod tests {
         let converted = responses_to_chat_completion(body).unwrap();
         let value: Value = serde_json::from_slice(&converted).unwrap();
         assert_eq!(value["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn a_tool_call_becomes_a_chat_tool_call() {
+        // The upstream's own shape for a tool call, taken from a live answer.
+        let body = br#"{
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-6-luna",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_00e0bbfd9f990eb1016af7e06f7b5887d1bbb0b1e181f9fe40",
+                    "call_id": "call_6738e7ba38504b03a7da80b2893ed7b6",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\"}",
+                    "status": "completed"
+                }
+            ]
+        }"#;
+
+        let converted = responses_to_chat_completion(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        let call = &value["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_6738e7ba38504b03a7da80b2893ed7b6");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn an_answer_with_no_tool_call_carries_no_tool_calls() {
+        let body = br#"{"id":"resp_1","status":"completed","model":"gpt-5","output":[]}"#;
+        let converted = responses_to_chat_completion(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        assert!(value["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn the_tool_call_is_carried_back_into_the_conversation() {
+        // The client sends the model's own tool call back with the tool's
+        // answer. The Responses API expects the call to be in the conversation
+        // before the answer, matched by their `call_id`.
+        let body = br#"{
+            "model": "gpt-6-luna",
+            "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_6738e7ba38504b03a7da80b2893ed7b6",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_6738e7ba38504b03a7da80b2893ed7b6", "content": "18C"}
+            ]
+        }"#;
+
+        let converted = chat_request_to_responses(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        let call = &value["input"][1];
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["call_id"], "call_6738e7ba38504b03a7da80b2893ed7b6");
+        assert_eq!(call["name"], "get_weather");
+        assert_eq!(call["arguments"], "{\"city\":\"Paris\"}");
+
+        // The tool's answer follows it.
+        let output = &value["input"][2];
+        assert_eq!(output["type"], "function_call_output");
+        assert_eq!(output["call_id"], "call_6738e7ba38504b03a7da80b2893ed7b6");
+        assert_eq!(output["output"], "18C");
+    }
+
+    #[test]
+    fn a_tool_call_is_streamed_as_it_arrives() {
+        // The upstream's own events for a tool call, taken from a live answer.
+        let events = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-luna\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"city\\\":\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"\\\"Paris\\\"}\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\",\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-luna\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}]}}\n\n",
+        );
+
+        let mut translator = ResponsesToChatStream::new(events.as_bytes());
+        let mut out = String::new();
+        translator.read_to_string(&mut out).unwrap();
+
+        // The call is announced with its id and name.
+        assert!(out.contains("\"id\":\"call_1\""), "{out}");
+        assert!(out.contains("\"name\":\"get_weather\""), "{out}");
+        assert!(out.contains("\"type\":\"function\""), "{out}");
+
+        // The arguments arrive in pieces, and are not sent twice: the upstream
+        // sends them once in pieces and once whole.
+        assert!(out.contains("\"arguments\":\"{\\\"city\\\":\""), "{out}");
+        assert!(out.contains("\"arguments\":\"\\\"Paris\\\"}\""), "{out}");
+        assert_eq!(out.matches("city").count(), 1, "{out}");
+        assert_eq!(out.matches("Paris").count(), 1, "{out}");
+
+        assert!(out.contains("\"finish_reason\":\"tool_calls\""), "{out}");
+        assert!(out.contains("data: [DONE]"), "{out}");
+    }
+
+    #[test]
+    fn a_tool_call_that_never_announced_itself_still_arrives() {
+        // Some upstreams finish a call without announcing it first.
+        let events = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\",\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
+        );
+
+        let mut translator = ResponsesToChatStream::new(events.as_bytes());
+        let mut out = String::new();
+        translator.read_to_string(&mut out).unwrap();
+
+        assert!(out.contains("\"id\":\"call_1\""), "{out}");
+        assert!(out.contains("\"name\":\"get_weather\""), "{out}");
+        assert!(out.contains("Paris"), "{out}");
+        assert!(out.contains("\"finish_reason\":\"tool_calls\""), "{out}");
+    }
+
+    #[test]
+    fn an_ordinary_answer_still_finishes_with_stop() {
+        // A message that also names a tool is not a tool call.
+        let events = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
+        );
+
+        let mut translator = ResponsesToChatStream::new(events.as_bytes());
+        let mut out = String::new();
+        translator.read_to_string(&mut out).unwrap();
+
+        assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+        assert!(!out.contains("tool_calls"), "{out}");
     }
 
     #[test]
