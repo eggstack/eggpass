@@ -6,6 +6,17 @@ Notable changes to eggpass are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-16
+
+### Added
+
+- Add Windows MSVC support to daemon process handling and release builds.
+
+### Fixed
+
+- Make HTTP test servers reliable on Windows by reading complete requests and
+  joining their server threads.
+
 ## [0.1.0] - 2026-11-14
 
 First release of the local OpenAI-compatible proxy for Grok and ChatGPT.
@@ -75,5 +86,6 @@ First release of the local OpenAI-compatible proxy for Grok and ChatGPT.
 - The project was renamed from `grokproxy` to `eggpass`. Existing data is
   copied to `~/.config/eggpass`; the old directory is left in place.
 
-[Unreleased]: https://github.com/eggstack/eggpass/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/eggstack/eggpass/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/eggstack/eggpass/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/eggstack/eggpass/releases/tag/v0.1.0
