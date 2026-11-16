@@ -8,8 +8,6 @@
 | [how-it-works.md](how-it-works.md) | Routing, translation, authentication, and streaming |
 | [updating.md](updating.md) | Update verification and rollback |
 | [troubleshooting.md](troubleshooting.md) | Common errors and fixes |
-| [releasing.md](releasing.md) | Maintainer release procedure |
-| [plans/](plans/) | Historical research and implementation notes |
 
 ## Choose a guide
 
@@ -20,4 +18,4 @@
 | Change providers or settings | [configuration.md](configuration.md) |
 | Understand routing and security | [how-it-works.md](how-it-works.md) |
 | Fix an error | [troubleshooting.md](troubleshooting.md) |
-| Update or release eggpass | [updating.md](updating.md) or [releasing.md](releasing.md) |
+| Update eggpass | [updating.md](updating.md) |

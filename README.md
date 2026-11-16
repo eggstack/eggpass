@@ -159,8 +159,6 @@ settings, timeouts, and files on disk.
 | [How it works](docs/how-it-works.md) | Routing, translation, authentication, and streaming |
 | [Updating](docs/updating.md) | Update verification and rollback |
 | [Troubleshooting](docs/troubleshooting.md) | Common errors and fixes |
-| [Releasing](docs/releasing.md) | Maintainer release procedure |
-| [Design notes](docs/plans/) | Historical research and implementation record |
 
 ## Development
 

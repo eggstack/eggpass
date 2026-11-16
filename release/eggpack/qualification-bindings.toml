@@ -1,0 +1,41 @@
+schema_version = 1
+
+[targets."aarch64-apple-darwin"]
+[targets."aarch64-apple-darwin".smoke]
+selector = { kind = "direct" }
+argv = ["--version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."aarch64-unknown-linux-gnu"]
+[targets."aarch64-unknown-linux-gnu".smoke]
+selector = { kind = "direct" }
+argv = ["--version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."x86_64-apple-darwin"]
+[targets."x86_64-apple-darwin".smoke]
+selector = { kind = "direct" }
+argv = ["--version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."x86_64-pc-windows-msvc"]
+[targets."x86_64-pc-windows-msvc".smoke]
+selector = { kind = "direct" }
+argv = ["--version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."x86_64-unknown-linux-gnu"]
+[targets."x86_64-unknown-linux-gnu".smoke]
+selector = { kind = "direct" }
+argv = ["--version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "owner": "eggstack",
+  "repository": "eggpass",
+  "title_prefix": "eggpass ",
+  "body": "Draft binary release staged by Eggpack. Review the five target binaries, release manifest, source revision, and checksum sidecars before publishing. This release remains a draft until a maintainer publishes it.",
+  "prerelease": false,
+  "token_env": "GITHUB_TOKEN",
+  "request_timeout_secs": 30,
+  "max_metadata_bytes": 1000000,
+  "max_list_pages": 16
+}

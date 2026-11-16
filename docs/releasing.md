@@ -12,6 +12,8 @@ release" that every installed `eggpass` then pulls.
 - The `CARGO_REGISTRY_TOKEN` repository secret, which must be a crates.io
   API token with the `publish` scope for this crate. Without it, the crates.io
   step fails, but the GitHub release is unaffected.
+- The release workflow is generated from `release/eggpack/`. Its pinned Eggpack
+  revision is in `github-policy.json`; CI checks the generated workflow for drift.
 
 ```sh
 gh secret set CARGO_REGISTRY_TOKEN --repo eggstack/eggpass
@@ -26,7 +28,7 @@ gh secret set CARGO_REGISTRY_TOKEN --repo eggstack/eggpass
 | Manifest `release_id` | `0.1.0` (**no `v`**) |
 | Manifest `product_id` | `eggpass` |
 | Manifest `source_revision` | the 40-character commit the tag peels to |
-| Manifest file name | `eggpass-release-manifest.json` |
+| Manifest file name | `release-manifest.json` |
 
 The `release_id` has no `v` because `eggpass update` compares it with the
 running build. A `v`-prefixed value makes that comparison fail. The Git tag
@@ -65,35 +67,33 @@ value is `eggpass`.
    git push origin v0.1.0
    ```
 
-   Pushing the tag starts `.github/workflows/release.yml`.
+   The release workflow does not create or push tags.
 
-3. **Wait for the workflow.** It verifies the tree, resolves the release
-   identity, builds the five binaries, writes the manifest, and stages a
-   **draft** release with every asset attached.
-
-   If the tag was pushed and the workflow missed it, run it by hand:
+3. **Run the release workflow.** It is triggered manually after the tag exists.
+   It verifies the source, builds and qualifies all five targets, writes the
+   manifest and checksum sidecars, then stages a **draft** release.
 
    ```sh
-   gh workflow run release.yml -f version=0.1.0
+   gh workflow run release.yml --repo eggstack/eggpass -f release_tag=v0.1.0
    ```
 
 4. **Check the draft.**
 
    ```sh
    gh release view v0.1.0 --repo eggstack/eggpass
-   gh release download v0.1.0 --repo eggstack/eggpass --pattern 'eggpass-*' --dir /tmp/eggpass-check
+   gh release download v0.1.0 --repo eggstack/eggpass --pattern '*' --dir /tmp/eggpass-check
    ```
 
    The manifest should name every asset with its exact size and digest:
 
    ```sh
-   python3 -c "import json;m=json.load(open('eggpass-release-manifest.json'));print(m['release_id'],len(m['targets']))"
+   python3 -c "import json;m=json.load(open('/tmp/eggpass-check/release-manifest.json'));print(m['release_id'],len(m['targets']))"
    ```
 
    To check a digest by hand, on macOS:
 
    ```sh
-   shasum -a 256 eggpass-aarch64-apple-darwin
+   shasum -a 256 -c /tmp/eggpass-check/eggpass-aarch64-apple-darwin.sha256
    ```
 
 5. **Publish the draft.** This is the human action.

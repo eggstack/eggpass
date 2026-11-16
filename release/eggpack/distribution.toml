@@ -1,0 +1,65 @@
+schema_version = 1
+
+[product]
+id = "eggpass"
+display_name = "Eggpass"
+
+[[targets]]
+triple = "aarch64-apple-darwin"
+aliases = ["macos-arm64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{target}"
+install = "eggpass"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "aarch64-unknown-linux-gnu"
+aliases = ["linux-arm64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{target}"
+install = "eggpass"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "x86_64-apple-darwin"
+aliases = ["macos-x64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{target}"
+install = "eggpass"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "x86_64-pc-windows-msvc"
+aliases = ["windows-x64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{target}.exe"
+install = "eggpass"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "x86_64-unknown-linux-gnu"
+aliases = ["linux-x64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{target}"
+install = "eggpass"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"

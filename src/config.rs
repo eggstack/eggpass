@@ -308,7 +308,7 @@ impl Default for UpdateSettings {
     fn default() -> UpdateSettings {
         UpdateSettings {
             repository: "eggstack/eggpass".to_string(),
-            manifest_name: "eggpass-release-manifest.json".to_string(),
+            manifest_name: "release-manifest.json".to_string(),
         }
     }
 }
@@ -407,7 +407,7 @@ write_timeout_seconds = 600
 # release manifest beside the binaries it names.
 [update]
 repository = "eggstack/eggpass"
-manifest_name = "eggpass-release-manifest.json"
+manifest_name = "release-manifest.json"
 
 # Which upstream serves x.ai requests.
 #   "api"   = https://api.x.ai/v1                    (full catalog, default)

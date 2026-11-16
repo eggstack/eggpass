@@ -35,3 +35,25 @@ jobs:
 
       - name: Build the release binary
         run: cargo build --release
+
+  release-drift:
+    name: check the generated release workflow
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Eggpack
+        run: |
+          revision="$(python3 -c "import json,sys;sys.stdout.write(json.load(open('release/eggpack/github-policy.json'))['eggpack_tool']['revision'])")"
+          cargo install --git https://github.com/eggstack/eggpack --rev "$revision" --locked eggpack-cli
+          eggpack --version
+
+      - name: Check generated release workflow
+        run: >-
+          eggpack ci check
+          --workflow-shape release/eggpack/workflow-shape.json
+          --contract release/eggpack/distribution.toml
+          --github-policy release/eggpack/github-policy.json
+          --workflow .github/workflows/release.yml

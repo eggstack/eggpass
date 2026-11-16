@@ -33,7 +33,7 @@ write_timeout_seconds = 600
 
 [update]
 repository = "eggstack/eggpass"
-manifest_name = "eggpass-release-manifest.json"
+manifest_name = "release-manifest.json"
 
 [providers.xai]
 enabled = true

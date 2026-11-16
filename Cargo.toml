@@ -15,7 +15,13 @@ categories = ["command-line-utilities", "api-bindings"]
 # else: no CI definitions, no live-verification script, no build output.
 include = [
     "/src",
-    "/docs",
+    "/docs/README.md",
+    "/docs/client-setup.md",
+    "/docs/commands.md",
+    "/docs/configuration.md",
+    "/docs/how-it-works.md",
+    "/docs/troubleshooting.md",
+    "/docs/updating.md",
     "/README.md",
     "/CHANGELOG.md",
     "/LICENSE",

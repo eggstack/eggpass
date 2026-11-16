@@ -1,0 +1,47 @@
+{
+  "aarch64-apple-darwin": {
+    "schema_version": 1,
+    "selector": { "kind": "direct" },
+    "interpreter": "python3",
+    "script": "scripts/validate-release-version.py",
+    "timeout_ms": 60000,
+    "stdout_limit": 8192,
+    "stderr_limit": 8192
+  },
+  "aarch64-unknown-linux-gnu": {
+    "schema_version": 1,
+    "selector": { "kind": "direct" },
+    "interpreter": "python3",
+    "script": "scripts/validate-release-version.py",
+    "timeout_ms": 60000,
+    "stdout_limit": 8192,
+    "stderr_limit": 8192
+  },
+  "x86_64-apple-darwin": {
+    "schema_version": 1,
+    "selector": { "kind": "direct" },
+    "interpreter": "python3",
+    "script": "scripts/validate-release-version.py",
+    "timeout_ms": 60000,
+    "stdout_limit": 8192,
+    "stderr_limit": 8192
+  },
+  "x86_64-pc-windows-msvc": {
+    "schema_version": 1,
+    "selector": { "kind": "direct" },
+    "interpreter": "python3",
+    "script": "scripts/validate-release-version.py",
+    "timeout_ms": 60000,
+    "stdout_limit": 8192,
+    "stderr_limit": 8192
+  },
+  "x86_64-unknown-linux-gnu": {
+    "schema_version": 1,
+    "selector": { "kind": "direct" },
+    "interpreter": "python3",
+    "script": "scripts/validate-release-version.py",
+    "timeout_ms": 60000,
+    "stdout_limit": 8192,
+    "stderr_limit": 8192
+  }
+}
