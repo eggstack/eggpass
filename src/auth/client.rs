@@ -773,25 +773,46 @@ mod tests {
 
     #[test]
     fn a_pending_device_authorization_is_not_an_error() {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
 
         // A token endpoint that always says the user has not approved yet.
         let listener = TcpListener::bind("127.0.0.1:0").expect("the stub binds");
         let port = listener.local_addr().expect("the stub address").port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut head = [0u8; 1024];
-                let _ = stream.read(&mut head);
-                let body = r#"{"error":"authorization_pending","error_description":"User has not yet authorized"}"#;
-                let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the client connects");
+            let mut request = BufReader::new(stream);
+            let mut content_length = 0;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                request
+                    .read_line(&mut line)
+                    .expect("the request header reads");
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().expect("content length");
+                }
             }
+            let mut request_body = vec![0; content_length];
+            request
+                .read_exact(&mut request_body)
+                .expect("the request body reads");
+
+            let body = r#"{"error":"authorization_pending","error_description":"User has not yet authorized"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            request
+                .into_inner()
+                .write_all(response.as_bytes())
+                .expect("the response writes");
         });
 
         let client = stub_client(&format!("http://127.0.0.1:{port}"));
@@ -802,6 +823,7 @@ mod tests {
             matches!(poll, DevicePoll::Pending),
             "a pending approval must not be an error"
         );
+        server.join().expect("the stub server finishes");
     }
 
     #[test]
