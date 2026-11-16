@@ -25,7 +25,7 @@
     {
       "os": "macos",
       "arch": "aarch64",
-      "label": "macos-14",
+      "label": "macos-15",
       "cargo_zigbuild": false,
       "zig": false
     },
