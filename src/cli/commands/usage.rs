@@ -849,23 +849,37 @@ mod tests {
     #[test]
     fn the_daemons_answer_is_read_over_http() {
         // A listener that answers the way the daemon does.
+        use std::io::{BufRead, BufReader, Write};
+
         let body = r#"{"providers":{"openai":429}}"#;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("the listener binds");
         let port = listener.local_addr().expect("the address").port();
         let answer = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            use std::io::Write;
-            let _ = stream.write_all(answer.as_bytes());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the client connects");
+            let mut request = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                request
+                    .read_line(&mut line)
+                    .expect("the request header reads");
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            request
+                .into_inner()
+                .write_all(answer.as_bytes())
+                .expect("the response writes");
         });
 
         let read = fetch_last_inferences("127.0.0.1", port);
         assert_eq!(read.get(&ProviderId::OpenAi), Some(&429));
+        server.join().expect("the stub server finishes");
     }
 
     #[test]

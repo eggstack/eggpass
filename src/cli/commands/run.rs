@@ -132,8 +132,12 @@ fn no_key() -> CommandError {
 fn start_daemon(context: &Context, quiet: bool) -> Result<(), CommandError> {
     check_port_allowed(context)?;
 
-    match daemon::spawn(&context.paths.log_file())
-        .map_err(|err| CommandError::new(err.to_string()))?
+    match daemon::spawn(
+        &context.paths.log_file(),
+        context.paths.config_file(),
+        context.cli.verbose,
+    )
+    .map_err(|err| CommandError::new(err.to_string()))?
     {
         SpawnOutcome::Child => {
             // We are the daemon.

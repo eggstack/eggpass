@@ -12,15 +12,30 @@
 //! A pid file written by an older build has only two lines — the process id
 //! and the port — and still parses.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::Pid;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CREATE_NO_WINDOW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, TerminateProcess,
+};
 
-/// How long `stop` waits for a graceful exit before sending `SIGKILL`.
+/// How long `stop` waits for the daemon to exit after requesting it to stop.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long `run` waits for the daemon to answer `/health`.
@@ -147,6 +162,7 @@ pub fn clear(pid_file: &Path) {
 }
 
 /// Whether a process is alive.
+#[cfg(unix)]
 pub fn is_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -157,6 +173,27 @@ pub fn is_alive(pid: i32) -> bool {
         Err(nix::errno::Errno::EPERM) => true,
         Err(_) => false,
     }
+}
+
+#[cfg(windows)]
+pub fn is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    // SAFETY: `pid` is positive and OpenProcess only queries this process handle.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+    if process.is_null() {
+        // Match Unix behavior: a process we cannot inspect is still considered alive.
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+    }
+
+    let mut exit_code = 0;
+    // SAFETY: `process` is a valid handle and `exit_code` is writable.
+    let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
+    // SAFETY: this function owns the handle returned by OpenProcess.
+    unsafe { CloseHandle(process) };
+    queried && exit_code == STILL_ACTIVE as u32
 }
 
 /// The address a health probe should use for a bound address.
@@ -241,11 +278,15 @@ pub enum SpawnOutcome {
     Child,
 }
 
-/// Fork into the background with the standard streams pointed at the log file.
+/// Start the server in the background with standard streams pointed at its log.
 ///
-/// The caller decides what to do next: the child starts the server, the parent
-/// waits for the health endpoint.
-pub fn spawn(log_file: &Path) -> Result<SpawnOutcome, DaemonError> {
+/// The caller waits for the health endpoint. Unix forks the current process;
+/// Windows starts a foreground child process with its output redirected.
+pub fn spawn(
+    log_file: &Path,
+    config_file: &Path,
+    verbose: bool,
+) -> Result<SpawnOutcome, DaemonError> {
     if let Some(parent) = log_file.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
@@ -270,12 +311,25 @@ pub fn spawn(log_file: &Path) -> Result<SpawnOutcome, DaemonError> {
         source,
     })?;
 
+    #[cfg(unix)]
+    {
+        let _ = (config_file, verbose);
+        spawn_unix(stdout, log)
+    }
+    #[cfg(windows)]
+    {
+        spawn_windows(log_file, config_file, verbose, stdout, log)
+    }
+}
+
+#[cfg(unix)]
+fn spawn_unix(stdout: File, stderr: File) -> Result<SpawnOutcome, DaemonError> {
     let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
 
     let daemon = daemonize::Daemonize::new()
         .working_directory(directory)
         .stdout(stdout)
-        .stderr(log)
+        .stderr(stderr)
         // 0o022 keeps the log readable, matching the documented 0644 mode.
         .umask(0o022u32);
 
@@ -287,10 +341,44 @@ pub fn spawn(log_file: &Path) -> Result<SpawnOutcome, DaemonError> {
     }
 }
 
+#[cfg(windows)]
+fn spawn_windows(
+    log_file: &Path,
+    config_file: &Path,
+    verbose: bool,
+    stdout: File,
+    stderr: File,
+) -> Result<SpawnOutcome, DaemonError> {
+    let executable = std::env::current_exe().map_err(|source| DaemonError::Io {
+        path: PathBuf::from("current executable"),
+        source,
+    })?;
+    let mut command = Command::new(&executable);
+    command.arg("--config").arg(config_file);
+    if verbose {
+        command.arg("--verbose");
+    }
+    command
+        .arg("run")
+        .arg("--foreground")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .creation_flags(CREATE_NO_WINDOW);
+
+    let child = command.spawn().map_err(|source| DaemonError::Io {
+        path: log_file.to_path_buf(),
+        source,
+    })?;
+    drop(child);
+    Ok(SpawnOutcome::Parent)
+}
+
 /// Stop a daemon.
 ///
-/// Sends `SIGTERM`, waits for a graceful exit, and escalates to `SIGKILL` if
-/// the daemon is still alive. Returns `true` when the daemon was running.
+/// Unix sends `SIGTERM`, waits for a graceful exit, and escalates to `SIGKILL`.
+/// Windows terminates the child process and waits for it to exit.
+#[cfg(unix)]
 pub fn stop(pid: i32, timeout: Duration) -> Result<bool, DaemonError> {
     if !is_alive(pid) {
         return Ok(false);
@@ -318,7 +406,55 @@ pub fn stop(pid: i32, timeout: Duration) -> Result<bool, DaemonError> {
     Ok(true)
 }
 
-/// Send a signal to a process.
+#[cfg(windows)]
+pub fn stop(pid: i32, timeout: Duration) -> Result<bool, DaemonError> {
+    if !is_alive(pid) {
+        return Ok(false);
+    }
+
+    // SAFETY: `pid` is positive and the requested access is limited to process termination.
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid as u32) };
+    if process.is_null() {
+        if !is_alive(pid) {
+            return Ok(false);
+        }
+        return Err(DaemonError::Signal(format!(
+            "could not open process {pid}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // Windows does not provide a portable signal equivalent for this detached
+    // child, so stop it explicitly. Capture the OS error before closing handle.
+    // SAFETY: `process` is a valid handle opened with PROCESS_TERMINATE.
+    let terminated = unsafe { TerminateProcess(process, 0) } != 0;
+    let error = terminated.then_some(()).map_or_else(
+        || Some(std::io::Error::last_os_error().to_string()),
+        |_| None,
+    );
+    // SAFETY: this function owns the handle returned by OpenProcess.
+    unsafe { CloseHandle(process) };
+    if let Some(error) = error {
+        return Err(DaemonError::Signal(format!(
+            "could not terminate process {pid}: {error}"
+        )));
+    }
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !is_alive(pid) {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(DaemonError::Signal(format!(
+        "timed out waiting for process {pid} to stop"
+    )))
+}
+
+/// Send a Unix signal to a process.
+#[cfg(unix)]
 pub fn send_signal(pid: i32, signal: Signal) -> Result<(), DaemonError> {
     kill(Pid::from_raw(pid), signal).map_err(|err| DaemonError::Signal(err.to_string()))
 }

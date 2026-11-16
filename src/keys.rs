@@ -335,9 +335,6 @@ fn stamp_of(path: &Path) -> Option<Stamp> {
         use std::os::unix::fs::MetadataExt;
         Some(metadata.ino())
     };
-    #[cfg(not(unix))]
-    let inode = None;
-
     Some(Stamp {
         len: metadata.len(),
         modified: metadata.modified().ok(),

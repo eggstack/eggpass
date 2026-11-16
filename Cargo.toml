@@ -29,7 +29,6 @@ include = [
 
 [dependencies]
 base64 = "0.23.1"
-daemonize = "0.5.0"
 dirs = "7.0.0"
 # Self-update mechanics. Acquisition, transport, release-manifest projection,
 # digest binding, staging, locking, and rollback are owned by the published
@@ -55,9 +54,6 @@ eggup-eggfetch = "0.2.0"
 # version churn. `nix`'s own `time` feature was checked and does not expose
 # `localtime_r`, so `nix` cannot do this.
 libc = "0.2.191"
-# `term` brings in `nix::sys::termios` and `nix::pty`, which the interactive
-# provider picker uses for raw mode and for its pseudoterminal tests.
-nix = { version = "0.31.3", features = ["signal", "process", "term"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -69,6 +65,14 @@ ureq = "3.5.2"
 # in Cargo.lock; the check is the parser, so do not bump it in passing.
 url = "=2.5.8"
 webbrowser = "1.2.7"
+
+[target.'cfg(unix)'.dependencies]
+# Unix-only process management and raw-terminal support.
+daemonize = "0.5.0"
+nix = { version = "0.31.3", features = ["signal", "process", "term"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

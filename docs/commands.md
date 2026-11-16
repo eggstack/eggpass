@@ -79,7 +79,7 @@ eggpass stop
 eggpass restart
 ```
 
-`run` and `restart` require at least one client key, either from `eggpass key add` or from `api_key` in the config file. `run` reports if the daemon is already running. The daemon uses a PID file and log file; it does not require launchd or systemd. `restart` checks for a key before stopping the current daemon.
+`run` and `restart` require at least one client key, either from `eggpass key add` or from `api_key` in the config file. `run` reports if the daemon is already running. The daemon uses a PID file and log file; it does not require launchd or systemd. On Unix, `stop` requests a graceful shutdown and force-stops the daemon if it does not exit within 10 seconds. On Windows, `stop` terminates the daemon process directly, so in-flight requests may be interrupted. `restart` checks for a key before stopping the current daemon.
 
 **Exit codes:** `run` and `restart` return `0` when running and `1` on failure. `stop` returns `0` if stopped or already stopped, and `1` if stopping fails.
 
