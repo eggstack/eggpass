@@ -36,6 +36,30 @@ jobs:
       - name: Build the release binary
         run: cargo build --release
 
+  windows-msvc:
+    name: Windows MSVC tests and release build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.89.0"
+          targets: "x86_64-pc-windows-msvc"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Windows tests
+        shell: bash
+        run: cargo +'1.89.0' test --all-targets --locked --target x86_64-pc-windows-msvc
+
+      - name: Build Windows release binary
+        shell: bash
+        run: cargo +'1.89.0' build --release --locked --target x86_64-pc-windows-msvc --package eggpass --bin eggpass
+
   release-drift:
     name: check the generated release workflow
     runs-on: ubuntu-latest
