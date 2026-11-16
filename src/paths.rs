@@ -70,12 +70,19 @@ pub struct Paths {
 impl Paths {
     /// Resolve every path, honouring `--config` for the configuration file only.
     pub fn resolve(config_override: Option<&Path>) -> Result<Self, PathError> {
-        let dir = resolve_dir()?;
-        let mut paths = Paths::in_directory(dir);
-        if let Some(path) = config_override {
-            paths.config_file = path.to_path_buf();
-        }
-        Ok(paths)
+        let eggpass_home = non_empty_env("EGGPASS_HOME");
+        let xdg_config_home = non_empty_env("XDG_CONFIG_HOME");
+        let home = if eggpass_home.is_none() && xdg_config_home.is_none() {
+            dirs::home_dir()
+        } else {
+            None
+        };
+        resolve_paths(
+            config_override,
+            eggpass_home.as_deref(),
+            xdg_config_home.as_deref(),
+            home.as_deref(),
+        )
     }
 
     /// Build paths rooted at a specific directory.
@@ -127,10 +134,13 @@ impl Paths {
     pub fn grok_cli_auth_file(&self) -> Option<PathBuf> {
         // A relocated installation is an isolated one: `EGGPASS_HOME` must
         // not reach back into the user's home for another tool's credentials.
-        if non_empty_env("EGGPASS_HOME").is_some() {
-            return None;
-        }
-        dirs::home_dir().map(|home| home.join(GROK_CLI_DIR).join(GROK_CLI_AUTH_FILE_NAME))
+        let eggpass_home_is_set = non_empty_env("EGGPASS_HOME").is_some();
+        let home = if eggpass_home_is_set {
+            None
+        } else {
+            dirs::home_dir()
+        };
+        grok_cli_auth_file_for(eggpass_home_is_set, home)
     }
 
     /// The directory this project used before the rename.
@@ -185,16 +195,36 @@ pub fn restrict_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
-/// Determine the configuration directory from the environment.
-fn resolve_dir() -> Result<PathBuf, PathError> {
-    if let Some(value) = non_empty_env("EGGPASS_HOME") {
-        return Ok(PathBuf::from(value));
+/// Resolve all paths from explicit environment values and an optional home directory.
+fn resolve_paths(
+    config_override: Option<&Path>,
+    eggpass_home: Option<&std::ffi::OsStr>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Result<Paths, PathError> {
+    let dir = if let Some(value) = eggpass_home.filter(|value| !value.is_empty()) {
+        PathBuf::from(value)
+    } else if let Some(value) = xdg_config_home.filter(|value| !value.is_empty()) {
+        PathBuf::from(value).join("eggpass")
+    } else {
+        home.ok_or(PathError::NoHomeDirectory)?
+            .join(".config")
+            .join("eggpass")
+    };
+
+    let mut paths = Paths::in_directory(dir);
+    if let Some(path) = config_override {
+        paths.config_file = path.to_path_buf();
     }
-    if let Some(value) = non_empty_env("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(value).join("eggpass"));
+    Ok(paths)
+}
+
+/// Resolve the official Grok CLI credential path unless the installation is relocated.
+fn grok_cli_auth_file_for(eggpass_home_is_set: bool, home: Option<PathBuf>) -> Option<PathBuf> {
+    if eggpass_home_is_set {
+        return None;
     }
-    let home = dirs::home_dir().ok_or(PathError::NoHomeDirectory)?;
-    Ok(home.join(".config").join("eggpass"))
+    home.map(|home| home.join(GROK_CLI_DIR).join(GROK_CLI_AUTH_FILE_NAME))
 }
 
 /// Read an environment variable, treating an empty value as unset.
@@ -211,12 +241,15 @@ mod tests {
 
     #[test]
     fn eggpass_home_wins_over_xdg() {
-        // SAFETY: single-threaded test with no other threads touching the env.
-        unsafe {
-            std::env::set_var("EGGPASS_HOME", "/tmp/eggpass-test-home");
-            std::env::set_var("XDG_CONFIG_HOME", "/tmp/eggpass-test-xdg");
-        }
-        let paths = Paths::resolve(None).unwrap();
+        use std::ffi::OsStr;
+
+        let paths = resolve_paths(
+            None,
+            Some(OsStr::new("/tmp/eggpass-test-home")),
+            Some(OsStr::new("/tmp/eggpass-test-xdg")),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             paths.credential_file("xai"),
             Path::new("/tmp/eggpass-test-home/credentials/xai.json")
@@ -226,26 +259,32 @@ mod tests {
             Path::new("/tmp/eggpass-test-home/config.toml")
         );
 
-        unsafe {
-            std::env::remove_var("EGGPASS_HOME");
-        }
-        let paths = Paths::resolve(None).unwrap();
+        let paths =
+            resolve_paths(None, None, Some(OsStr::new("/tmp/eggpass-test-xdg")), None).unwrap();
         assert_eq!(
             paths.credential_file("xai"),
             Path::new("/tmp/eggpass-test-xdg/eggpass/credentials/xai.json")
         );
 
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        let paths =
+            resolve_paths(None, None, None, Some(Path::new("/tmp/eggpass-test-user"))).unwrap();
+        assert_eq!(
+            paths.credential_file("xai"),
+            Path::new("/tmp/eggpass-test-user/.config/eggpass/credentials/xai.json")
+        );
     }
 
     #[test]
     fn config_override_only_moves_the_config_file() {
-        unsafe {
-            std::env::set_var("EGGPASS_HOME", "/tmp/eggpass-test-home");
-        }
-        let paths = Paths::resolve(Some(Path::new("/tmp/elsewhere/custom.toml"))).unwrap();
+        use std::ffi::OsStr;
+
+        let paths = resolve_paths(
+            Some(Path::new("/tmp/elsewhere/custom.toml")),
+            Some(OsStr::new("/tmp/eggpass-test-home")),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(paths.config_file(), Path::new("/tmp/elsewhere/custom.toml"));
         assert_eq!(
             paths.credential_file("xai"),
@@ -255,9 +294,6 @@ mod tests {
             paths.pid_file(),
             Path::new("/tmp/eggpass-test-home/eggpass.pid")
         );
-        unsafe {
-            std::env::remove_var("EGGPASS_HOME");
-        }
     }
 
     #[test]
@@ -289,17 +325,10 @@ mod tests {
 
     #[test]
     fn eggpass_home_skips_the_grok_cli_import() {
-        let directory = tempfile::tempdir().unwrap();
-        let paths = Paths::in_directory(directory.path());
-
-        // SAFETY: single-threaded test with no other threads touching the env.
-        unsafe {
-            std::env::set_var("EGGPASS_HOME", directory.path());
-        }
-        assert_eq!(paths.grok_cli_auth_file(), None);
-        unsafe {
-            std::env::remove_var("EGGPASS_HOME");
-        }
+        assert_eq!(
+            grok_cli_auth_file_for(true, Some(PathBuf::from("/tmp/eggpass-test-home"))),
+            None
+        );
     }
 
     #[test]
