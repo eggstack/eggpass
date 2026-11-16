@@ -26,11 +26,13 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::process::{Command, Stdio};
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE, STILL_ACTIVE, TerminateProcess,
+    PROCESS_TERMINATE, TerminateProcess,
 };
 
 /// How long `stop` waits for the daemon to exit after requesting it to stop.
@@ -191,7 +193,7 @@ pub fn is_alive(pid: i32) -> bool {
     let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
     // SAFETY: this function owns the handle returned by OpenProcess.
     unsafe { CloseHandle(process) };
-    queried && exit_code == STILL_ACTIVE
+    queried && exit_code == STILL_ACTIVE as u32
 }
 
 /// The address a health probe should use for a bound address.
