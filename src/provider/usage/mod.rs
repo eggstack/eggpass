@@ -22,6 +22,7 @@
 //! truth is "the provider did not say". Every percentage is therefore an
 //! [`Option`], and there is no `unwrap_or(0.0)` anywhere on this path.
 
+pub mod codex_app_server;
 pub mod openai;
 pub mod xai;
 

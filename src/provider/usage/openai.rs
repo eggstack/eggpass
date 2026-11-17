@@ -1,22 +1,10 @@
-//! The ChatGPT usage collector.
+//! The Sign in with ChatGPT (SIWC) usage fallback.
 //!
-//! ChatGPT has no usable quota endpoint for a Sign in with ChatGPT
-//! credential, and that is not a gap in this implementation — it is the
-//! documented shape of the thing.
-//!
-//! The Codex app-server does expose `account/rateLimits/read`, and the
-//! response shape is exactly right: `usedPercent` is an integer 0–100,
-//! `resetsAt` is unix seconds, `planType` enumerates the plans. But the
-//! app-server reads a *Codex-managed* ChatGPT login out of
-//! `$CODEX_HOME/auth.json`, and behind that call it reaches a private,
-//! undocumented consumer backend, `chatgpt.com/backend-api/wham/usage`, which
-//! needs a `chatgpt-account-id` header. A Sign in with ChatGPT credential
-//! carries no workspace id, and there is no documented way to read one out of
-//! it: the SIWC documentation says plainly that *"Email and `sub` are not
-//! workspace identifiers"* — the workspace is bound server-side to the issued
-//! client id. Refreshing there would break as well, because Codex refreshes
-//! with its own client id and a foreign refresh token does not refresh
-//! there.
+//! The optional Codex app-server source is queried separately by
+//! [`super::codex_app_server`]. This collector describes only what Eggpass's
+//! own SIWC credential can report: the SIWC API does not expose quota windows,
+//! so the honest fallback is an unavailable result with the provider's
+//! documented signals and usage page.
 //!
 //! The SIWC documentation enumerates every endpoint it defines, and none of
 //! them returns quota. The only quota signals it publishes are error codes,

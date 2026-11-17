@@ -66,7 +66,7 @@ eggpass usage --provider xai          # query one provider
 eggpass usage --json                 # machine-readable report
 ```
 
-Queries provider usage directly, without needing the daemon. This is a fresh request, not a cached or polled reading. The report describes usage as reported by each provider. On the default xAI `api` upstream, the reported consumer-subscription quota is separate from inference requests, which are billed to the xAI API tier. The report's caption reflects the configured upstream. If quota is unavailable, the report may include the latest inference HTTP status kept by the daemon in memory. That endpoint reports only per-provider client-facing HTTP status codes, not prompts or response bodies.
+Queries provider usage directly, without needing the daemon. This is a fresh request, not a cached or polled reading. Human-readable output shows the percentage and bar for the allowance left, plus each available reset time and countdown; JSON preserves the provider-reported fields. On the default xAI `api` upstream, the reported consumer-subscription quota is separate from inference requests, which are billed to the xAI API tier. The report's caption reflects the configured upstream. If quota is unavailable, the report may include the latest inference HTTP status kept by the daemon in memory. That endpoint reports only per-provider client-facing HTTP status codes, not prompts or response bodies.
 
 **Exit codes:** `0` if at least one provider is signed in and not every selected provider failed operationally, `1` if every selected provider failed operationally, `2` if none is signed in.
 
