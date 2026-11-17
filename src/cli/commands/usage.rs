@@ -21,14 +21,14 @@
 //! body carries the account's email, its user id and its balances; it goes
 //! to the provider and stops there.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::cli::{CommandError, Context};
 use crate::daemon::{self, DaemonState};
-use crate::provider::usage::{ProviderUsage, UsageReport};
+use crate::provider::usage::{ProviderUsage, UsageReport, WindowLabel};
 use crate::provider::{ProviderId, ProviderRuntime};
 use crate::timeutil;
 
@@ -50,7 +50,7 @@ const EMPTY: char = '░';
 /// How far past a reset time a window counts as stale, in seconds.
 const STALE_AFTER: i64 = 3_600;
 
-/// Show how much of the subscription allowance is used.
+/// Show how much of the subscription allowance remains.
 pub fn usage(
     context: &Context,
     provider: Option<ProviderId>,
@@ -68,16 +68,23 @@ pub fn usage(
 
     let entries: Vec<ProviderEntry> = providers
         .into_iter()
-        .map(|provider| ProviderEntry {
-            provider,
-            outcome: collect_one(context, provider),
-            // The caption travels with the report, in the JSON as well as in
-            // the bars: a machine-readable number without it is as misleading
-            // as a number without it on the terminal.
-            caption: caption_for(provider, &context.config),
-            // The last inference is the only evidence there is about a
-            // provider that publishes no quota of its own.
-            last_inference: inferences.get(&provider).copied(),
+        .map(|provider| {
+            let (outcome, source) = collect_one(context, provider);
+            ProviderEntry {
+                provider,
+                outcome,
+                // The source is distinct from `caption`: a source identifies
+                // which account supplied the snapshot, while a caption names
+                // the pool the quota belongs to.
+                source,
+                // The caption travels with the report, in the JSON as well as in
+                // the bars: a machine-readable number without it is as misleading
+                // as a number without it on the terminal.
+                caption: caption_for(provider, &context.config),
+                // The last inference is the only evidence there is about a
+                // provider that publishes no quota of its own.
+                last_inference: inferences.get(&provider).copied(),
+            }
         })
         .collect();
 
@@ -92,6 +99,11 @@ pub fn usage(
         print!("{}", render(&entries));
     }
 
+    usage_exit_result(&entries)
+}
+
+/// Decide the command status after output has been rendered.
+fn usage_exit_result(entries: &[ProviderEntry]) -> Result<(), CommandError> {
     // A provider that is not signed in still gets a block, so the output does
     // not change shape — but a run in which nobody is signed in has nothing
     // to report at all.
@@ -126,6 +138,9 @@ struct ProviderEntry {
     /// What it had to say.
     #[serde(flatten)]
     outcome: ProviderUsage,
+    /// Which account or local source supplied the usage snapshot, when relevant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
     /// Which pool the numbers belong to, when the provider reported any.
     caption: Option<String>,
     /// The HTTP status the last inference to this provider was answered with.
@@ -158,17 +173,51 @@ fn caption_for(provider: ProviderId, config: &crate::config::Config) -> Option<S
 
 /// Ask one provider what it can say.
 ///
-/// A provider that is not signed in is answered without a network call.
-fn collect_one(context: &Context, provider: ProviderId) -> ProviderUsage {
-    let runtime = ProviderRuntime::new(provider, &context.config, &context.paths);
+/// Codex is consulted only for OpenAI usage and before Eggpass's own
+/// credential check. If it cannot provide a report, the existing provider
+/// path below remains the fallback.
+fn collect_one(context: &Context, provider: ProviderId) -> (ProviderUsage, Option<&'static str>) {
+    let codex_report = (provider == ProviderId::OpenAi)
+        .then(crate::provider::usage::codex_app_server::collect)
+        .flatten();
+    collect_one_with_codex_result(context, provider, codex_report)
+}
 
-    match runtime.tokens.current() {
+/// Apply an optional Codex report, otherwise run the existing token/collector path.
+fn collect_one_with_codex_result(
+    context: &Context,
+    provider: ProviderId,
+    codex_report: Option<UsageReport>,
+) -> (ProviderUsage, Option<&'static str>) {
+    if let Some(codex_usage) = codex_outcome(provider, codex_report) {
+        return codex_usage;
+    }
+
+    let runtime = ProviderRuntime::new(provider, &context.config, &context.paths);
+    let outcome = match runtime.tokens.current() {
         Ok(None) => ProviderUsage::NotSignedIn,
         Ok(Some(_)) => runtime.usage(),
         Err(err) => ProviderUsage::Failed {
             reason: format!("could not read the stored credentials ({err})"),
         },
+    };
+    (outcome, None)
+}
+
+/// Use Codex's report only for the OpenAI usage entry.
+fn codex_outcome(
+    provider: ProviderId,
+    report: Option<UsageReport>,
+) -> Option<(ProviderUsage, Option<&'static str>)> {
+    if provider != ProviderId::OpenAi {
+        return None;
     }
+    report.map(|report| {
+        (
+            ProviderUsage::Reported { report },
+            Some(crate::provider::usage::codex_app_server::SOURCE_LABEL),
+        )
+    })
 }
 
 /// Render the whole report.
@@ -186,9 +235,13 @@ fn render(entries: &[ProviderEntry]) -> String {
 /// Render one provider's block.
 fn render_block(out: &mut String, entry: &ProviderEntry) {
     match &entry.outcome {
-        ProviderUsage::Reported { report } => {
-            render_reported(out, entry.provider, report, entry.caption.as_deref())
-        }
+        ProviderUsage::Reported { report } => render_reported(
+            out,
+            entry.provider,
+            report,
+            entry.caption.as_deref(),
+            entry.source,
+        ),
         ProviderUsage::NotSignedIn => {
             out.push_str(entry.provider.display_name());
             out.push('\n');
@@ -254,6 +307,15 @@ fn render_caption(out: &mut String, caption: Option<&str>) {
         return;
     };
     out.push_str(&format!("  {caption}\n"));
+}
+
+/// Render the account/source note when the reported snapshot came from Codex.
+fn render_source(out: &mut String, source: Option<&str>) {
+    let Some(source) = source else {
+        return;
+    };
+    out.push_str(&field("Source", source));
+    out.push('\n');
 }
 
 /// Render the row that says what the last inference was answered with.
@@ -334,6 +396,7 @@ fn render_reported(
     provider: ProviderId,
     report: &UsageReport,
     caption: Option<&str>,
+    source: Option<&str>,
 ) {
     // The heading names the plan when the provider named one.
     match &report.plan {
@@ -347,24 +410,47 @@ fn render_reported(
     out.push('\n');
 
     let now = timeutil::now_unix();
+    let buckets: BTreeSet<&str> = report
+        .windows
+        .iter()
+        .filter_map(|window| bucket_id(&window.label))
+        .collect();
+    let multiple_buckets = buckets.len() > 1;
 
     for window in &report.windows {
+        // Use the provider's window duration when it is known. This turns
+        // Codex's generic Primary/Secondary buckets into useful labels such as
+        // 5-hour and 7-day, while preserving named windows like Grok's Weekly
+        // when no duration is supplied. Keep bucket names when they are needed
+        // to distinguish multiple reported buckets.
+        let label = match (
+            window.duration_secs.filter(|duration| *duration > 0),
+            multiple_buckets.then(|| bucket_id(&window.label)).flatten(),
+        ) {
+            (Some(duration), Some(bucket)) => {
+                format!("{bucket} {}", duration_label(duration))
+            }
+            (Some(duration), None) => duration_label(duration),
+            (None, _) => window.label.display(),
+        };
+
         // An explicit state is the provider's answer, and it replaces the
         // percentage entirely.
         if let Some(state) = &report.state {
-            out.push_str(&field(&window.label.display(), state.display()));
+            out.push_str(&field(&label, state.display()));
             out.push('\n');
         } else {
             match window.used_percent {
                 Some(percent) => {
+                    let left = left_percent(percent);
                     out.push_str(&field(
-                        &window.label.display(),
-                        &format!("{}  {} used", bar(percent), percent_text(percent)),
+                        &label,
+                        &format!("{}  {} left", bar(left), percent_text(left)),
                     ));
                 }
                 // No bar at all: a bar with a question mark in it would be a
                 // number we do not have.
-                None => out.push_str(&field(&window.label.display(), "unavailable")),
+                None => out.push_str(&field(&label, "unavailable")),
             }
             out.push('\n');
         }
@@ -375,7 +461,12 @@ fn render_reported(
             // The offset is the one in force at the reset instant, so a
             // reset on the far side of a daylight-saving change is right.
             let offset = timeutil::local_offset_seconds(resets_at).unwrap_or(0);
-            out.push_str(&field("Resets", &reset_text(resets_at, now, offset)));
+            let mut reset = reset_text(resets_at, now, offset);
+            if let Some(remaining) = reset_countdown(resets_at, now) {
+                reset.push_str(" · in ");
+                reset.push_str(&remaining);
+            }
+            out.push_str(&field("Resets", &reset));
             out.push('\n');
         }
     }
@@ -387,11 +478,12 @@ fn render_reported(
         for product in &report.breakdown {
             match product.used_percent {
                 Some(percent) => {
+                    let left = left_percent(percent);
                     out.push_str(&format!(
-                        "  {:<width$}{}  {} used",
+                        "  {:<width$}{}  {} left",
                         product.product,
-                        bar(percent),
-                        percent_text(percent),
+                        bar(left),
+                        percent_text(left),
                         width = PRODUCT_WIDTH
                     ));
                 }
@@ -428,11 +520,17 @@ fn render_reported(
     // The caption says which pool the number belongs to. It is not optional:
     // on the `api` upstream the number is not what `eggpass` spends.
     render_caption(out, caption);
+    render_source(out, source);
 }
 
 /// A labelled line.
 fn field(label: &str, value: &str) -> String {
-    format!("  {label:<width$}{value}", width = LABEL_WIDTH)
+    let separator = if label.chars().count() >= LABEL_WIDTH {
+        " "
+    } else {
+        ""
+    };
+    format!("  {label:<width$}{separator}{value}", width = LABEL_WIDTH)
 }
 
 /// A continuation line, under the label column.
@@ -440,15 +538,14 @@ fn continuation(value: &str) -> String {
     format!("  {:<width$}{value}", "", width = LABEL_WIDTH)
 }
 
-/// The bar for a percentage.
+/// The bar for the percentage of allowance left.
 ///
 /// Twenty cells, fixed. A non-zero percentage never renders as an empty bar:
-/// at 1 % a bar of all `░` would read as "none used", and the number beside
-/// it would contradict that.
+/// at 1 % left, the bar must show at least one filled cell.
 ///
 /// The bar is drawn from the percentage as it is *printed*, so the two agree.
-/// A percentage that rounds to zero gets an empty bar and reads `0% used`;
-/// one that rounds to something above zero gets at least one cell.
+/// A percentage that rounds to zero gets an empty bar; one that rounds to
+/// something above zero gets at least one cell.
 fn bar(percent: f64) -> String {
     let rounded = round_percent(percent);
     let mut filled = (rounded / 100.0 * BAR_CELLS as f64).round() as i64;
@@ -483,6 +580,52 @@ fn percent_text(percent: f64) -> String {
     }
 }
 
+/// Convert the provider's used percentage into the percentage left.
+fn left_percent(used_percent: f64) -> f64 {
+    (100.0 - used_percent).clamp(0.0, 100.0)
+}
+
+/// A compact label for a quota-window duration.
+///
+/// Exact days and hours use the adjective form that fits beside the bar
+/// (`7-day`, `5-hour`). Unusual durations stay precise without a separate
+/// Duration row.
+fn duration_label(duration_secs: i64) -> String {
+    if duration_secs > 0 && duration_secs % 86_400 == 0 {
+        format!("{}-day", duration_secs / 86_400)
+    } else if duration_secs > 0 && duration_secs % 3_600 == 0 {
+        format!("{}-hour", duration_secs / 3_600)
+    } else if duration_secs > 0 && duration_secs % 60 == 0 {
+        format!("{}-min", duration_secs / 60)
+    } else {
+        let hours = duration_secs / 3_600;
+        let minutes = duration_secs % 3_600 / 60;
+        let seconds = duration_secs % 60;
+        match (hours, minutes, seconds) {
+            (hours, minutes, _) if hours > 0 && minutes > 0 => {
+                format!("{hours}h {minutes}m")
+            }
+            (hours, _, _) if hours > 0 => format!("{hours}h"),
+            (_, minutes, seconds) if minutes > 0 && seconds > 0 => {
+                format!("{minutes}m {seconds}s")
+            }
+            (_, minutes, _) if minutes > 0 => format!("{minutes}m"),
+            (_, _, seconds) => format!("{seconds}s"),
+        }
+    }
+}
+
+/// Extract a Codex bucket name from its `bucket Primary/Secondary` label.
+fn bucket_id(label: &WindowLabel) -> Option<&str> {
+    let WindowLabel::Other(label) = label else {
+        return None;
+    };
+    label
+        .strip_suffix(" Primary")
+        .or_else(|| label.strip_suffix(" Secondary"))
+        .filter(|bucket| !bucket.is_empty())
+}
+
 /// The reset time, in the local timezone, with its offset.
 ///
 /// The offset is printed because `Nov 18, 09:00` alone is ambiguous: a user
@@ -505,6 +648,36 @@ fn reset_text(resets_at: i64, now: i64, offset: i64) -> String {
     }
 
     text
+}
+
+/// Time remaining until a future reset, at a glance precision.
+fn reset_countdown(resets_at: i64, now: i64) -> Option<String> {
+    let seconds = resets_at.saturating_sub(now);
+    if seconds <= 0 {
+        return None;
+    }
+
+    let days = seconds / 86_400;
+    let hours = seconds % 86_400 / 3_600;
+    let minutes = seconds % 3_600 / 60;
+
+    Some(if days > 0 {
+        if hours > 0 {
+            format!("{days}d {hours}hr")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}hr {minutes}m")
+        } else {
+            format!("{hours}hr")
+        }
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "under 1m".to_string()
+    })
 }
 
 /// An amount in cents, as dollars.
@@ -552,6 +725,7 @@ mod tests {
         ProviderEntry {
             provider: ProviderId::Xai,
             outcome,
+            source: None,
             caption: None,
             last_inference: None,
         }
@@ -562,6 +736,7 @@ mod tests {
         ProviderEntry {
             provider: ProviderId::OpenAi,
             outcome,
+            source: None,
             caption: None,
             last_inference: Some(status),
         }
@@ -688,25 +863,28 @@ mod tests {
     }
 
     #[test]
-    fn a_tiny_percentage_does_not_contradict_its_bar() {
-        // A percentage that rounds to zero reads `0% used`, so its bar is
-        // empty. A filled cell beside `0% used` would say otherwise.
-        assert_eq!(percent_text(0.04), "0%");
-        assert_eq!(bar(0.04).chars().filter(|c| *c == FILLED).count(), 0);
-        assert_eq!(bar(0.04).chars().count(), 20);
+    fn a_tiny_remaining_percentage_does_not_contradict_its_bar() {
+        // When almost all the allowance is used, a remainder that rounds to
+        // zero reads `0% left` and has an empty bar.
+        let left = left_percent(99.96);
+        assert_eq!(percent_text(left), "0%");
+        assert_eq!(bar(left).chars().filter(|c| *c == FILLED).count(), 0);
+        assert_eq!(bar(left).chars().count(), 20);
 
-        // A percentage that rounds to something above zero gets a cell.
-        assert_eq!(percent_text(0.1), "0.1%");
-        assert_eq!(bar(0.1).chars().filter(|c| *c == FILLED).count(), 1);
-        assert_eq!(bar(0.1).chars().count(), 20);
+        // A remainder that rounds above zero gets a cell.
+        let left = left_percent(99.9);
+        assert_eq!(percent_text(left), "0.1%");
+        assert_eq!(bar(left).chars().filter(|c| *c == FILLED).count(), 1);
+        assert_eq!(bar(left).chars().count(), 20);
     }
 
     #[test]
     fn the_chatgpt_block_names_the_error_codes() {
         let entry = ProviderEntry {
             provider: ProviderId::OpenAi,
-            caption: None,
             outcome: chatgpt_unavailable(),
+            source: None,
+            caption: None,
             last_inference: None,
         };
 
@@ -911,11 +1089,10 @@ mod tests {
     }
 
     #[test]
-    fn the_percentage_reads_as_used() {
-        // The number is how much is *used*, never how much is left.
+    fn the_bar_and_percentage_show_remaining_allowance() {
         let text = render(&[entry(reported(Some(40.0)))]);
-        assert!(text.contains("40% used"), "{text}");
-        assert!(!text.contains("40% left"), "{text}");
+        assert!(text.contains(&format!("{}  60% left", bar(60.0))), "{text}");
+        assert!(!text.contains("40% used"), "{text}");
     }
 
     #[test]
@@ -934,9 +1111,9 @@ mod tests {
 
         let text = render(&[entry(ProviderUsage::Reported { report })]);
         assert!(text.contains("GrokBuild"), "{text}");
-        assert!(text.contains("50% used"), "{text}");
+        assert!(text.contains("50% left"), "{text}");
         assert!(text.contains("GrokChat"), "{text}");
-        assert!(text.contains("20% used"), "{text}");
+        assert!(text.contains("80% left"), "{text}");
     }
 
     #[test]
@@ -987,8 +1164,9 @@ mod tests {
     fn the_json_report_names_the_provider_and_the_status() {
         let entries = vec![ProviderEntry {
             provider: ProviderId::OpenAi,
-            caption: None,
             outcome: ProviderUsage::NotSignedIn,
+            source: None,
+            caption: None,
             last_inference: None,
         }];
 
@@ -998,5 +1176,254 @@ mod tests {
         let text = serde_json::to_string(&report).unwrap();
         assert!(text.contains("\"provider\":\"openai\""), "{text}");
         assert!(text.contains("\"status\":\"not_signed_in\""), "{text}");
+        assert!(!text.contains("\"source\":null"), "{text}");
+    }
+
+    fn context_for(directory: &std::path::Path) -> Context {
+        Context {
+            paths: crate::paths::Paths::in_directory(directory),
+            config: crate::config::Config::default(),
+            cli: crate::cli::args::Cli {
+                command: crate::cli::args::Command::Usage {
+                    provider: Some(ProviderId::OpenAi),
+                    json: false,
+                },
+                config_path: None,
+                verbose: false,
+            },
+        }
+    }
+
+    fn codex_report() -> UsageReport {
+        UsageReport {
+            provider: ProviderId::OpenAi,
+            plan: None,
+            windows: vec![QuotaWindow {
+                label: WindowLabel::Other("codex Primary".to_string()),
+                used_percent: Some(25.0),
+                resets_at: Some(1_800_000_000),
+                duration_secs: Some(18_000),
+            }],
+            breakdown: Vec::new(),
+            credits: None,
+            state: None,
+        }
+    }
+
+    #[test]
+    fn a_codex_report_precedes_the_missing_eggpass_credential_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = context_for(directory.path());
+        let (outcome, source) =
+            collect_one_with_codex_result(&context, ProviderId::OpenAi, Some(codex_report()));
+        let entry = ProviderEntry {
+            provider: ProviderId::OpenAi,
+            outcome,
+            source,
+            caption: None,
+            last_inference: None,
+        };
+
+        assert!(matches!(&entry.outcome, ProviderUsage::Reported { .. }));
+        assert_eq!(
+            entry.source,
+            Some(crate::provider::usage::codex_app_server::SOURCE_LABEL)
+        );
+        assert!(usage_exit_result(std::slice::from_ref(&entry)).is_ok());
+    }
+
+    #[test]
+    fn an_unavailable_codex_source_preserves_both_existing_fallbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = context_for(directory.path());
+        let (outcome, source) = collect_one_with_codex_result(&context, ProviderId::OpenAi, None);
+        assert!(matches!(&outcome, ProviderUsage::NotSignedIn));
+        assert_eq!(source, None);
+        let error = usage_exit_result(&[ProviderEntry {
+            provider: ProviderId::OpenAi,
+            outcome,
+            source,
+            caption: None,
+            last_inference: None,
+        }])
+        .unwrap_err();
+        assert_eq!(error.code, 2);
+        assert_eq!(
+            error.message.as_deref(),
+            Some("not signed in — run `eggpass login`")
+        );
+
+        let credential = crate::auth::store::StoredAuth {
+            access_token: "test-only-access-token".to_string(),
+            refresh_token: None,
+            id_token: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            client_id: "test-client".to_string(),
+            issuer: "https://auth.openai.com".to_string(),
+            expires_at: Some(crate::timeutil::now_unix() + 3_600),
+            obtained_at: crate::timeutil::now_unix(),
+            user_id: None,
+            email: None,
+            ext_agent_host_id: None,
+            plan_enabled: false,
+        };
+        crate::auth::store::save(
+            &context.paths.credential_file(ProviderId::OpenAi.as_str()),
+            &credential,
+        )
+        .unwrap();
+        let (outcome, source) = collect_one_with_codex_result(&context, ProviderId::OpenAi, None);
+        assert_eq!(source, None);
+        assert!(
+            matches!(
+                outcome,
+                ProviderUsage::Unavailable {
+                    ref reason,
+                    ref source,
+                    ref hint,
+                    ref signals,
+                } if reason == "Sign in with ChatGPT does not expose a quota API"
+                    && source.as_deref() == Some("not exposed by OAuth")
+                    && hint.as_deref() == Some("https://chatgpt.com/settings/usage")
+                    && signals.len() == 3
+            ),
+            "unexpected fallback: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn codex_source_and_bucket_are_visible_in_text_and_json_without_identity() {
+        let mut entry = ProviderEntry {
+            provider: ProviderId::OpenAi,
+            outcome: ProviderUsage::Reported {
+                report: codex_report(),
+            },
+            source: Some(crate::provider::usage::codex_app_server::SOURCE_LABEL),
+            caption: None,
+            last_inference: None,
+        };
+        let text = render(std::slice::from_ref(&entry));
+        assert!(text.contains("5-hour"), "{text}");
+        assert!(text.contains("75% left"), "{text}");
+        assert!(!text.contains("codex Primary"), "{text}");
+        assert!(!text.contains("Duration"), "{text}");
+        assert!(text.contains("Source      Codex app-server"), "{text}");
+        assert!(!text.contains("@"), "{text}");
+
+        let report = UsageReportJson {
+            providers: std::slice::from_ref(&entry),
+        };
+        let value = serde_json::to_value(report).unwrap();
+        let encoded = value.to_string();
+        assert!(
+            encoded.contains("\"source\":\"Codex app-server"),
+            "{encoded}"
+        );
+        assert!(encoded.contains("codex Primary"), "{encoded}");
+        assert!(encoded.contains("\"duration_secs\":18000"), "{encoded}");
+        assert!(!encoded.contains("@"), "{encoded}");
+
+        entry.source = None;
+        let legacy_json = serde_json::to_value(UsageReportJson {
+            providers: std::slice::from_ref(&entry),
+        })
+        .unwrap();
+        assert!(legacy_json["providers"][0].get("source").is_none());
+    }
+
+    #[test]
+    fn codex_usage_is_not_assigned_to_xai() {
+        assert!(codex_outcome(ProviderId::Xai, Some(codex_report())).is_none());
+    }
+
+    #[test]
+    fn durations_become_compact_window_labels() {
+        assert_eq!(duration_label(18_000), "5-hour");
+        assert_eq!(duration_label(604_800), "7-day");
+        assert_eq!(duration_label(300), "5-min");
+        assert_eq!(duration_label(5_400), "90-min");
+        assert_eq!(duration_label(3_661), "1h 1m");
+
+        let text = render(&[entry(reported(Some(40.0)))]);
+        assert!(text.contains("Weekly"), "{text}");
+        assert!(!text.contains("Duration"), "{text}");
+    }
+
+    #[test]
+    fn a_named_weekly_window_is_not_relabelled_or_expanded() {
+        let mut report = reported_report(Some(1.0));
+        report.windows[0].resets_at =
+            Some(timeutil::now_unix() + 3 * 86_400 + 15 * 3_600 + 30 * 60);
+        let text = render(&[entry(ProviderUsage::Reported { report })]);
+
+        assert!(text.contains("Weekly"), "{text}");
+        assert!(text.contains("99% left"), "{text}");
+        assert!(text.contains("in 3d 15hr"), "{text}");
+        assert!(!text.contains("5-hour"), "{text}");
+        assert!(!text.contains("7-day"), "{text}");
+    }
+
+    #[test]
+    fn reset_countdowns_are_compact_and_omit_past_resets() {
+        let now = timeutil::parse_rfc3339_to_unix("2026-11-14T12:00:00Z").unwrap();
+        assert_eq!(
+            reset_countdown(now + 3 * 86_400 + 15 * 3_600 + 42 * 60, now),
+            Some("3d 15hr".to_string())
+        );
+        assert_eq!(
+            reset_countdown(now + 3 * 3_600 + 21 * 60 + 12, now),
+            Some("3hr 21m".to_string())
+        );
+        assert_eq!(reset_countdown(now + 20, now), Some("under 1m".to_string()));
+        assert_eq!(reset_countdown(now, now), None);
+        assert_eq!(reset_countdown(now - 30, now), None);
+    }
+
+    #[test]
+    fn each_provider_window_shows_duration_left_and_its_reset_countdown() {
+        let now = timeutil::now_unix();
+        let mut report = codex_report();
+        report.windows = vec![
+            QuotaWindow {
+                label: WindowLabel::Other("codex Primary".to_string()),
+                used_percent: Some(69.0),
+                resets_at: Some(now + 3 * 3_600 + 21 * 60),
+                duration_secs: Some(18_000),
+            },
+            QuotaWindow {
+                label: WindowLabel::Other("codex Secondary".to_string()),
+                used_percent: Some(95.0),
+                resets_at: Some(now + 3 * 86_400 + 15 * 3_600 + 30 * 60),
+                duration_secs: Some(604_800),
+            },
+        ];
+        let text = render(&[entry(ProviderUsage::Reported { report })]);
+
+        assert!(text.contains("5-hour"), "{text}");
+        assert!(text.contains("31% left"), "{text}");
+        assert!(text.contains("7-day"), "{text}");
+        assert!(text.contains("5% left"), "{text}");
+        assert!(text.contains("in 3hr 21m"), "{text}");
+        assert!(text.contains("in 3d 15hr"), "{text}");
+        assert!(!text.contains("Primary"), "{text}");
+        assert!(!text.contains("Secondary"), "{text}");
+        assert!(!text.contains("Duration"), "{text}");
+    }
+
+    #[test]
+    fn multiple_codex_buckets_remain_distinguishable_with_duration_labels() {
+        let mut report = codex_report();
+        report.windows.push(QuotaWindow {
+            label: WindowLabel::Other("other-model Primary".to_string()),
+            used_percent: Some(50.0),
+            resets_at: None,
+            duration_secs: Some(18_000),
+        });
+        let text = render(&[entry(ProviderUsage::Reported { report })]);
+
+        assert!(text.contains("codex 5-hour"), "{text}");
+        assert!(text.contains("other-model 5-hour"), "{text}");
+        assert!(!text.contains("Primary"), "{text}");
     }
 }

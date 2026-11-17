@@ -658,7 +658,7 @@ be read or written, or the arguments were wrong.
 
 ## `eggpass usage`
 
-Report how much of the subscription allowance is used.
+Report how much of the subscription allowance remains.
 
 ```
 eggpass usage                  # every provider you are signed in to
@@ -690,9 +690,9 @@ between blocks, no colour:
 
 ```
 x.ai · SuperGrok
-  Weekly      ████░░░░░░░░░░░░░░░░  20% used
-  Resets      Nov 20, 03:07 (UTC)
-  Api             ██░░░░░░░░░░░░░░░░░░  10% used
+  Weekly      ████████████████░░░░  80% left
+  Resets      Nov 20, 03:07 (UTC) · in 2d 15hr
+  Api             ██████████████████░░  90% left
   Prepaid     $0.00
   This is your Grok subscription. `eggpass` requests are billed separately against the xAI API tier.
 
@@ -710,18 +710,25 @@ ChatGPT
 
 - **The label column is twelve characters wide**, so every value starts in the
   same place.
-- **The bar is twenty cells**, `█` filled and `░` empty. A non-zero
-  percentage always shows at least one cell, and the bar is omitted entirely
-  when the percentage is unavailable.
-- **The number is the amount *used*.** It reads `20% used`, never `20% left`.
+- **The bar is twenty cells**, `█` filled and `░` empty. It represents the
+  allowance left; a non-zero remainder always shows at least one cell, and the
+  bar is omitted entirely when the percentage is unavailable.
+- **The number is the amount remaining.** It reads `80% left`. The JSON report
+  still preserves the provider's `used_percent` field unchanged.
 - **Missing is not zero.** The Grok billing endpoint is proto3 JSON and omits
   zero-valued scalars, so an absent percentage means the provider did not
-  say. It reads `unavailable`, never `0% used`.
+  say. It reads `unavailable`, never `0% left`.
+- **A supplied duration labels its window**, such as `5-hour` or `7-day`, in
+  place of a generic `Primary` or `Secondary` label. Multiple Codex buckets keep
+  their bucket names when needed to distinguish otherwise identical windows.
+  A window is not invented when the provider does not report it, and there is
+  no separate Duration row.
 - **An explicit state replaces the percentage.** When the provider says the
   account is not eligible, that is the answer and no number is shown.
 - **The reset time is local**, with its offset, because `Nov 18, 09:00` alone
-  is ambiguous. The year appears only when it differs from the current year.
-  A reset more than an hour in the past is marked `(stale)`.
+  is ambiguous. Future resets also show a compact countdown (for example,
+  `in 3hr 21m` or `in 3d 15hr`); the year appears only when it differs from
+  the current year. A reset more than an hour in the past is marked `(stale)`.
 - **The caption is not optional.** On the default `api` upstream, `eggpass`'s
   inference is metered against the xAI API tier and does **not** draw from
   the consumer subscription the billing endpoint reports. The caption says

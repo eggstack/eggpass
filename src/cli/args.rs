@@ -28,7 +28,7 @@ pub enum Command {
     },
     /// Report account and daemon state.
     Status,
-    /// Report how much of the subscription allowance is used.
+    /// Report how much of the subscription allowance remains.
     Usage {
         /// The provider to ask, when it was named.
         provider: Option<ProviderId>,
@@ -529,7 +529,7 @@ pub fn global_help() -> String {
              login       Authenticate with a provider over OAuth\n    \
              logout      Revoke and remove stored credentials\n    \
              status      Show account and daemon state\n    \
-             usage       Show how much of the subscription allowance is used\n    \
+             usage       Show how much of the subscription allowance remains\n    \
              run         Start the server as a background daemon\n    \
              stop        Stop the running daemon\n    \
              restart     Stop the daemon, then start it again\n    \
@@ -567,7 +567,7 @@ pub fn command_help(name: &str) -> String {
         "status" => "eggpass status\n\nShow account state and daemon state.\n".to_string(),
         "usage" => {
             "eggpass usage [--json]\n\n\
-            Show how much of the subscription allowance is used. Each provider\n\
+            Show how much of the subscription allowance remains. Each provider\n\
             is asked once, on this run, and the answer is printed and the\n\
             command ends. Without --provider every provider you are signed in\n\
             to is asked.\n\n\
@@ -792,6 +792,17 @@ mod tests {
             panic!("expected help")
         };
         assert!(text.contains("--device"), "{text}");
+    }
+
+    #[test]
+    fn usage_help_describes_remaining_usage() {
+        assert!(
+            global_help()
+                .contains("usage       Show how much of the subscription allowance remains")
+        );
+        let usage = command_help("usage");
+        assert!(usage.contains("allowance remains"), "{usage}");
+        assert!(!usage.contains("allowance is used"), "{usage}");
     }
 
     #[test]
