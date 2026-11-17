@@ -200,7 +200,7 @@ fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> io::Result<Opti
 
         let newline = available.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(available.len(), |index| index + 1);
-        let content_len = newline.map_or(consumed, |index| index);
+        let content_len = newline.unwrap_or(consumed);
         if line
             .len()
             .checked_add(content_len)
