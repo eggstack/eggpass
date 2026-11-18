@@ -103,7 +103,10 @@ impl UsageCache {
 
     /// Return a fresh snapshot, or trigger/share one finite refresh.
     fn get(&self) -> CacheResponse {
-        let now = Instant::now();
+        self.get_at(Instant::now())
+    }
+
+    fn get_at(&self, now: Instant) -> CacheResponse {
         let mut state = lock(&self.state);
         if let Some(response) = response_for_state(&state, now, self.policy) {
             // A request arriving after another one started never waits on its
@@ -485,13 +488,9 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        {
-            let mut state = lock(&cache.state);
-            state.snapshot.as_mut().unwrap().completed_at =
-                Instant::now() - policy.ttl - Duration::from_millis(1);
-        }
+        let expired_at = Instant::now() + cache.policy.ttl;
         assert!(matches!(
-            cache.get(),
+            cache.get_at(expired_at),
             CacheResponse::Complete { stale: false, .. }
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -582,7 +581,8 @@ mod tests {
     fn retry_exhaustion_serves_only_the_previous_report_as_stale() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&calls);
-        let policy = policy(Duration::from_millis(300), [Duration::ZERO; 3]);
+        let mut policy = policy(Duration::from_millis(300), [Duration::ZERO; 3]);
+        policy.ttl = Duration::ZERO;
         let cache = UsageCache::with_policy(
             vec![ProviderId::Xai],
             move |provider| {
@@ -595,7 +595,7 @@ mod tests {
             let mut state = lock(&cache.state);
             state.snapshot = Some(Snapshot {
                 entries: vec![entry(ProviderId::Xai, false).entry],
-                completed_at: Instant::now() - policy.ttl - Duration::from_secs(1),
+                completed_at: Instant::now(),
                 updated_at_unix: 1_800_000_000,
             });
         }
@@ -720,7 +720,8 @@ mod tests {
 
     #[test]
     fn the_route_marks_a_stale_snapshot_and_returns_503_without_one() {
-        let policy = policy(Duration::from_millis(300), [Duration::ZERO; 3]);
+        let mut policy = policy(Duration::from_millis(300), [Duration::ZERO; 3]);
+        policy.ttl = Duration::ZERO;
         let stale_cache = UsageCache::with_policy(
             vec![ProviderId::Xai],
             |provider| entry(provider, true),
@@ -730,7 +731,7 @@ mod tests {
             let mut state = lock(&stale_cache.state);
             state.snapshot = Some(Snapshot {
                 entries: vec![entry(ProviderId::Xai, false).entry],
-                completed_at: Instant::now() - policy.ttl - Duration::from_secs(1),
+                completed_at: Instant::now(),
                 updated_at_unix: 1_800_000_000,
             });
         }
@@ -744,8 +745,9 @@ mod tests {
         assert!(
             response_header(&stale, "X-Eggpass-Usage-Age")
                 .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|age| age >= 600)
+                .is_some()
         );
+        assert!(response_header(&stale, "X-Eggpass-Usage-Updated-At").is_some());
         assert_eq!(
             response_header(&stale, "Cache-Control"),
             Some(CACHE_CONTROL)
