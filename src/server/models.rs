@@ -71,7 +71,7 @@ fn merged_catalogue(context: &ServerContext) -> Result<Option<Value>, String> {
 
         let mut response = match upstream::send_with_auth(
             &handle.upstream,
-            &handle.tokens,
+            handle.tokens.as_ref(),
             Method::Get,
             "/v1/models",
             &[],

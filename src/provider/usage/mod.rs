@@ -24,11 +24,21 @@
 
 pub mod codex_app_server;
 pub mod openai;
+pub mod report;
 pub mod xai;
 
 use serde::Serialize;
 
-use crate::provider::{ProviderId, ProviderRuntime};
+use crate::provider::ProviderId;
+
+/// One provider usage attempt and whether it ended because of a timeout.
+#[derive(Debug, Clone)]
+pub struct ProviderCollection {
+    /// The provider's structured answer.
+    pub outcome: ProviderUsage,
+    /// Whether a bounded attempt timed out and should be retried.
+    pub timed_out: bool,
+}
 
 /// What a provider can say about its own allowance.
 #[derive(Debug, Clone, Serialize)]
@@ -215,17 +225,6 @@ impl std::fmt::Display for UsageError {
 }
 
 impl std::error::Error for UsageError {}
-
-/// Ask a provider what it can say about its allowance.
-///
-/// The caller decides which providers to ask; this only routes the question
-/// to the provider that can answer it.
-pub fn collect(provider: ProviderId, runtime: &ProviderRuntime) -> ProviderUsage {
-    match provider {
-        ProviderId::Xai => xai::collect(runtime),
-        ProviderId::OpenAi => openai::collect(runtime),
-    }
-}
 
 /// Strip the proto enum prefix from a period type.
 ///

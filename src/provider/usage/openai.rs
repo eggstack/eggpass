@@ -23,7 +23,6 @@
 //! honest answer is that the number is unavailable, with the reasons and the
 //! codes the provider does publish.
 
-use crate::provider::ProviderRuntime;
 use crate::provider::usage::ProviderUsage;
 
 /// The page OpenAI points users at for their own usage.
@@ -51,7 +50,8 @@ pub const SIGNALS: &[&str] = &[
 /// a quota API. It does not say "ChatGPT has no usage information": the user
 /// has usage information, OpenAI just does not publish a way to read it with
 /// this credential.
-pub fn collect(_runtime: &ProviderRuntime) -> ProviderUsage {
+/// The structured fallback when no Codex usage report is available.
+pub fn unavailable() -> ProviderUsage {
     ProviderUsage::Unavailable {
         reason: "Sign in with ChatGPT does not expose a quota API".to_string(),
         source: Some(SOURCE.to_string()),
@@ -63,7 +63,6 @@ pub fn collect(_runtime: &ProviderRuntime) -> ProviderUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderId;
 
     #[test]
     fn the_signals_name_the_documented_codes() {
@@ -85,13 +84,7 @@ mod tests {
 
     #[test]
     fn the_answer_names_the_source_and_the_place_to_look() {
-        let runtime = crate::provider::ProviderRuntime::new(
-            ProviderId::OpenAi,
-            &crate::config::Config::default(),
-            &crate::paths::Paths::in_directory(std::path::Path::new(".")),
-        );
-
-        match collect(&runtime) {
+        match unavailable() {
             ProviderUsage::Unavailable {
                 reason,
                 source,

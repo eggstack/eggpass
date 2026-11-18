@@ -15,6 +15,7 @@ pub mod models;
 pub mod router;
 pub mod sse;
 pub mod translate;
+pub mod usage;
 
 #[cfg(test)]
 mod tests;
@@ -27,6 +28,7 @@ mod keep_body_tests {
     fn health_does_not_keep_a_body() {
         assert!(!keep_body_for("/health"));
         assert!(!keep_body_for("/healthz"));
+        assert!(!keep_body_for("/v1/usage"));
         assert!(keep_body_for("/v1/chat/completions"));
         assert!(keep_body_for("/v1/models"));
     }
@@ -54,7 +56,7 @@ pub struct ProviderHandle {
     /// The client the requests go out through.
     pub upstream: UpstreamClient,
     /// Hands out access tokens, refreshing them when needed.
-    pub tokens: TokenManager,
+    pub tokens: Arc<TokenManager>,
 }
 
 /// Everything a request handler needs.
@@ -91,6 +93,8 @@ pub struct ServerContext {
     /// It is kept in memory and nowhere else: `eggpass usage` reports it for
     /// a provider that does not publish a quota of its own.
     pub inferences: Arc<crate::inference::InferenceState>,
+    /// One in-memory on-demand usage snapshot and its refresh coordinator.
+    pub usage_cache: Arc<usage::UsageCache>,
 }
 
 impl ServerContext {
@@ -244,7 +248,7 @@ fn gate_decision(request: &Request, context: &ServerContext) -> http::GateDecisi
 fn keep_body_for(path: &str) -> bool {
     !matches!(
         router::route(path),
-        router::Route::Health | router::Route::LastInference
+        router::Route::Health | router::Route::LastInference | router::Route::Usage
     )
 }
 
@@ -313,6 +317,10 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
         },
         router::Route::LastInference => match method {
             "GET" => inference::handle(context),
+            _ => method_not_allowed(method, "GET"),
+        },
+        router::Route::Usage => match method {
+            "GET" => usage::handle(context),
             _ => method_not_allowed(method, "GET"),
         },
         router::Route::Models => match method {
@@ -486,6 +494,9 @@ mod authorisation_tests {
             upstream_in_flight: Arc::new(AtomicUsize::new(0)),
             max_upstream_requests: DEFAULT_MAX_UPSTREAM_REQUESTS,
             inferences: Arc::new(crate::inference::InferenceState::new()),
+            usage_cache: Arc::new(usage::UsageCache::new(Vec::new(), |_| {
+                unreachable!("no providers")
+            })),
         }
     }
 
@@ -674,6 +685,9 @@ mod authorisation_tests {
             upstream_in_flight: Arc::new(AtomicUsize::new(0)),
             max_upstream_requests: 2,
             inferences: Arc::new(crate::inference::InferenceState::new()),
+            usage_cache: Arc::new(usage::UsageCache::new(Vec::new(), |_| {
+                unreachable!("no providers")
+            })),
         };
 
         assert!(context.take_upstream_slot());

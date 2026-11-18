@@ -18,7 +18,6 @@
 
 use serde_json::Value;
 
-use crate::provider::ProviderRuntime;
 use crate::provider::usage::{
     Credits, ProductUsage, ProviderUsage, QuotaState, QuotaWindow, UsageError, UsageReport,
     WindowLabel,
@@ -68,62 +67,48 @@ pub fn caption(upstream: crate::config::Upstream) -> &'static str {
     }
 }
 
-/// Ask x.ai what it can say about the allowance.
-pub fn collect(runtime: &ProviderRuntime) -> ProviderUsage {
-    // The request goes to the URL the docs above name. The assertion catches
-    // a path that drifted away from it.
+/// Collect usage with an explicit timeout and endpoint, preserving timeout
+/// classification for the daemon's finite retry policy.
+pub fn collect_detailed(
+    tokens: &crate::auth::refresh::TokenManager,
+    timeouts: crate::config::Timeouts,
+    base_url: &str,
+) -> crate::provider::usage::ProviderCollection {
     debug_assert_eq!(format!("{BILLING_BASE_URL}{BILLING_PATH}"), BILLING_URL);
     debug_assert_eq!(format!("{BILLING_BASE_URL}{SETTINGS_PATH}"), SETTINGS_URL);
 
-    let client =
-        UpstreamClient::for_endpoint(BILLING_BASE_URL, &headers(runtime), runtime.timeouts);
-
-    let mut response = match send_with_auth(
-        &client,
-        &runtime.tokens,
-        Method::Get,
-        BILLING_PATH,
-        &[],
-        None,
-    ) {
+    let client = UpstreamClient::for_endpoint(base_url, &headers(tokens), timeouts);
+    let mut response = match send_with_auth(&client, tokens, Method::Get, BILLING_PATH, &[], None) {
         Ok(response) => response,
-        Err(err) => {
-            return ProviderUsage::Failed {
-                reason: describe(&err),
-            };
-        }
+        Err(err) => return failed(describe(&err), is_timeout(&err)),
     };
 
     match response.status {
         200 => {}
-        401 => {
-            return ProviderUsage::Failed {
-                reason: "the provider rejected the token".to_string(),
-            };
-        }
+        401 => return failed("the provider rejected the token".to_string(), false),
         404 => {
-            return ProviderUsage::Failed {
-                reason: "the endpoint is not available (HTTP 404)".to_string(),
-            };
+            return failed(
+                "the endpoint is not available (HTTP 404)".to_string(),
+                false,
+            );
         }
         429 => {
-            return ProviderUsage::Failed {
-                reason: "the provider is rate-limiting this account".to_string(),
-            };
+            return failed(
+                "the provider is rate-limiting this account".to_string(),
+                false,
+            );
         }
-        status => {
-            return ProviderUsage::Failed {
-                reason: format!("the provider answered HTTP {status}"),
-            };
-        }
+        status => return failed(format!("the provider answered HTTP {status}"), false),
     }
 
     let body = match response.read_to_vec() {
         Ok(body) => body,
         Err(err) => {
-            return ProviderUsage::Failed {
-                reason: format!("could not read the provider's answer ({err})"),
-            };
+            let timed_out = err.kind() == std::io::ErrorKind::TimedOut;
+            return failed(
+                format!("could not read the provider's answer ({err})"),
+                timed_out,
+            );
         }
     };
 
@@ -131,26 +116,50 @@ pub fn collect(runtime: &ProviderRuntime) -> ProviderUsage {
         Ok(report) => report,
         Err(err) => {
             crate::logging::warn(&format!("billing response: {err}"));
-            return ProviderUsage::Failed {
-                reason: err.to_string(),
-            };
+            return failed(err.to_string(), false);
         }
     };
 
-    // The plan name is enrichment, not the feature. A failure here omits the
-    // label; the usage still prints.
-    report.plan = fetch_plan(&client, runtime);
+    // Plan lookup is best-effort enrichment. A settings timeout does not make
+    // an otherwise complete billing report incomplete or retryable.
+    report.plan = fetch_plan(&client, tokens);
 
-    if report.says_nothing() {
-        return ProviderUsage::Unavailable {
+    let outcome = if report.says_nothing() {
+        ProviderUsage::Unavailable {
             reason: "the provider reported no usage information".to_string(),
             source: None,
             hint: None,
             signals: Vec::new(),
-        };
+        }
+    } else {
+        ProviderUsage::Reported { report }
+    };
+    crate::provider::usage::ProviderCollection {
+        outcome,
+        timed_out: false,
     }
+}
 
-    ProviderUsage::Reported { report }
+fn failed(reason: String, timed_out: bool) -> crate::provider::usage::ProviderCollection {
+    crate::provider::usage::ProviderCollection {
+        outcome: ProviderUsage::Failed { reason },
+        timed_out,
+    }
+}
+
+fn is_timeout(err: &UpstreamError) -> bool {
+    match err {
+        UpstreamError::Network(message) => is_timeout_message(message),
+        UpstreamError::Token(crate::auth::refresh::TokenError::Auth(err)) => {
+            is_timeout_message(&err.to_string())
+        }
+        _ => false,
+    }
+}
+
+fn is_timeout_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("timed out") || message.contains("timeout")
 }
 
 /// The headers the billing request carries.
@@ -160,7 +169,7 @@ pub fn collect(runtime: &ProviderRuntime) -> ProviderUsage {
 /// `x-grok-client-identifier` or `x-authenticateresponse`: those belong to
 /// proxy-routed inference, not to billing, and `eggpass`'s own provider spec
 /// attaches the identifier to inference requests.
-fn headers(runtime: &ProviderRuntime) -> Vec<(&'static str, String)> {
+fn headers(tokens: &crate::auth::refresh::TokenManager) -> Vec<(&'static str, String)> {
     let mut headers = vec![
         (TOKEN_AUTH_HEADER, TOKEN_AUTH_VALUE.to_string()),
         ("Accept", "application/json".to_string()),
@@ -172,8 +181,7 @@ fn headers(runtime: &ProviderRuntime) -> Vec<(&'static str, String)> {
 
     // The official client sends the user id; it is not required here, but it
     // costs nothing and the proxy is happier with it.
-    if let Some(user_id) = runtime
-        .tokens
+    if let Some(user_id) = tokens
         .current()
         .ok()
         .flatten()
@@ -188,16 +196,12 @@ fn headers(runtime: &ProviderRuntime) -> Vec<(&'static str, String)> {
 /// The plan name, from the settings endpoint.
 ///
 /// Best effort: any failure means no plan name, not a failed report.
-fn fetch_plan(client: &UpstreamClient, runtime: &ProviderRuntime) -> Option<String> {
-    let mut response = send_with_auth(
-        client,
-        &runtime.tokens,
-        Method::Get,
-        SETTINGS_PATH,
-        &[],
-        None,
-    )
-    .ok()?;
+fn fetch_plan(
+    client: &UpstreamClient,
+    tokens: &crate::auth::refresh::TokenManager,
+) -> Option<String> {
+    let mut response =
+        send_with_auth(client, tokens, Method::Get, SETTINGS_PATH, &[], None).ok()?;
     if response.status != 200 {
         return None;
     }
@@ -690,5 +694,20 @@ mod tests {
 
         let build = caption(crate::config::Upstream::Build);
         assert!(build.contains("draws from"), "{build}");
+    }
+
+    #[test]
+    fn only_transport_or_oauth_deadlines_are_retryable_timeouts() {
+        assert!(is_timeout(&UpstreamError::Network(
+            "operation timed out".to_string()
+        )));
+        assert!(!is_timeout(&UpstreamError::Network(
+            "connection refused".to_string()
+        )));
+        assert!(is_timeout_message("OAuth HTTP request timed out"));
+        assert!(!is_timeout_message("OAuth network request failed"));
+        assert!(!is_timeout(&UpstreamError::Protocol(
+            "invalid response".to_string()
+        )));
     }
 }
