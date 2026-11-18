@@ -223,6 +223,7 @@ struct Harness {
     inferences: Arc<crate::inference::InferenceState>,
     /// The provider the harness serves.
     provider: ProviderId,
+    usage_calls: Arc<AtomicUsize>,
     _directory: tempfile::TempDir,
 }
 
@@ -358,7 +359,7 @@ fn harness_with_spec(
         ProviderHandle {
             spec: spec.clone(),
             upstream,
-            tokens,
+            tokens: Arc::new(tokens),
         },
     );
 
@@ -367,6 +368,35 @@ fn harness_with_spec(
     let port = server.address().port();
 
     let inferences = Arc::new(crate::inference::InferenceState::new());
+
+    let usage_calls = Arc::new(AtomicUsize::new(0));
+    let usage_calls_for_collector = Arc::clone(&usage_calls);
+    let usage_tokens = Arc::clone(
+        &providers
+            .get(&spec.id)
+            .expect("provider is registered")
+            .tokens,
+    );
+    let usage_base_url = stub.base_url();
+    let usage_timeouts = crate::config::Timeouts {
+        connect_seconds: 1,
+        global_seconds: 1,
+        body_seconds: 1,
+    };
+    let usage_cache = Arc::new(crate::server::usage::UsageCache::new(
+        vec![spec.id],
+        move |provider| {
+            usage_calls_for_collector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::provider::usage::report::collect_entry(
+                provider,
+                crate::config::Upstream::Api,
+                usage_tokens.as_ref(),
+                usage_timeouts,
+                None,
+                &usage_base_url,
+            )
+        },
+    ));
 
     let context = Arc::new(ServerContext {
         host: "127.0.0.1".to_string(),
@@ -379,6 +409,7 @@ fn harness_with_spec(
         upstream_in_flight: Arc::new(AtomicUsize::new(0)),
         max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
         inferences: Arc::clone(&inferences),
+        usage_cache,
     });
 
     let running = Arc::clone(&server);
@@ -392,6 +423,7 @@ fn harness_with_spec(
         keys,
         inferences,
         provider: spec.id,
+        usage_calls,
         _directory: directory,
     }
 }
@@ -1188,6 +1220,142 @@ fn a_streamed_response_without_a_content_type_reaches_a_streaming_client() {
     assert!(text.contains(r#""content":"hi""#), "{text}");
     assert!(text.contains(r#""finish_reason":"stop""#), "{text}");
     assert!(text.contains("[DONE]"), "{text}");
+}
+
+#[test]
+fn usage_route_is_authenticated_cached_and_attaches_fresh_inference_state() {
+    let stub = Stub::start(|request| {
+        if request.path == crate::provider::usage::xai::BILLING_PATH {
+            Reply::json(
+                200,
+                r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-11-13T03:07:08Z","end":"2026-11-20T03:07:08Z"},"creditUsagePercent":42.0,"productUsage":[{"product":"GrokChat","usagePercent":42.0}]}}"#,
+            )
+        } else if request.path == crate::provider::usage::xai::SETTINGS_PATH {
+            Reply::json(200, r#"{"plan":"SuperGrok"}"#)
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    let unauthorized = agent()
+        .get(harness.url("/usage"))
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(unauthorized.status(), 401);
+    assert_eq!(
+        harness
+            .usage_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(
+        stub.requests().is_empty(),
+        "unauthorized requests must not collect"
+    );
+
+    let first = agent()
+        .get(harness.url("/usage"))
+        .header("Authorization", "Bearer secret-key")
+        .call()
+        .expect("the usage route answers");
+    assert_eq!(first.status(), 200);
+    let headers = first.headers();
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-store")
+    );
+    assert!(
+        headers
+            .get("x-eggpass-usage-age")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some(),
+        "age header must be integer seconds"
+    );
+    assert!(
+        headers
+            .get("x-eggpass-usage-updated-at")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.ends_with('Z')),
+        "updated-at must be an RFC 3339 UTC timestamp"
+    );
+    let first_body = read_json_body(first);
+    assert_eq!(first_body["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(first_body["providers"][0]["provider"], "xai");
+    assert_eq!(first_body["providers"][0]["status"], "reported");
+    assert_eq!(
+        first_body["providers"][0]["last_inference"],
+        serde_json::Value::Null
+    );
+    assert!(!first_body.to_string().contains("user@example.com"));
+    assert!(!first_body.to_string().contains("grok-token"));
+
+    let upstream = stub.requests();
+    assert_eq!(
+        upstream.len(),
+        2,
+        "cold collection calls billing and settings once"
+    );
+    assert!(
+        upstream
+            .iter()
+            .any(|request| request.path == crate::provider::usage::xai::BILLING_PATH)
+    );
+    assert!(
+        upstream
+            .iter()
+            .any(|request| request.path == crate::provider::usage::xai::SETTINGS_PATH)
+    );
+    assert_eq!(
+        harness
+            .usage_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    harness.inferences.record(ProviderId::Xai, 429);
+    let cached = agent()
+        .get(harness.url("/v1/usage"))
+        .header("Authorization", "Bearer secret-key")
+        .call()
+        .expect("the cached report answers");
+    assert_eq!(cached.status(), 200);
+    let cached_body = read_json_body(cached);
+    assert_eq!(cached_body["providers"][0]["last_inference"], 429);
+    assert_eq!(
+        harness
+            .usage_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        stub.requests().len(),
+        2,
+        "a fresh cache hit must not query upstream"
+    );
+
+    let method = agent()
+        .post(harness.url("/v1/usage"))
+        .header("Authorization", "Bearer secret-key")
+        .send("{}")
+        .expect("the route reports its allowed method");
+    assert_eq!(method.status(), 405);
+    assert_eq!(
+        method
+            .headers()
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("GET")
+    );
+    assert_eq!(
+        harness
+            .usage_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 }
 
 #[test]

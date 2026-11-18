@@ -73,11 +73,9 @@ Streaming responses are forwarded as chunks arrive. The proxy does not buffer
 the full answer before sending it to the client. Provider errors keep their
 status codes and error details where supported.
 
-The `eggpass usage` command fetches current usage where a provider exposes it.
-For ChatGPT, the OAuth flow has no quota endpoint, so the command reports usage
-as unavailable rather than estimating it. The daemon keeps only the most recent
-client-facing inference status for each provider in memory. It is not written
-to a file and disappears when the daemon stops.
+The `eggpass usage` command fetches current usage where a provider exposes it, and both it and the daemon endpoint query only providers enabled in configuration. For ChatGPT, the OAuth flow has no quota endpoint, so usage is unavailable rather than estimated; when OpenAI is enabled, the optional local Codex app-server may provide a report from a separate account.
+
+The authenticated `GET /v1/usage` endpoint returns the CLI-compatible JSON report. It caches one complete snapshot in memory for 10 minutes, starts at most one demand-triggered refresh, and never polls or writes usage data to disk. Its initiating request waits up to 30 seconds; if that deadline expires it gets `504` while the finite refresh continues. Concurrent requests get `202` with `Retry-After`. A refresh retries only timed-out providers, up to three times at 5/15/30-second intervals. Each xAI billing/settings request is capped at 15 seconds; OAuth refresh has a 60-second total deadline and Codex has an 8-second session deadline. Success adds age and update-time headers; after retry exhaustion, a previous successful snapshot is marked stale during a 10-minute cooldown, or `503` is returned if no good snapshot exists. A daemon restart clears the cache. The latest inference status is read afresh for every report response.
 
 ## Updates
 

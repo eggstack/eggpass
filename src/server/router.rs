@@ -15,6 +15,8 @@ pub enum Route {
     Model(String),
     /// `GET /v1/last-inference`
     LastInference,
+    /// `GET /v1/usage`
+    Usage,
     /// `GET /health`
     Health,
     /// Anything else.
@@ -37,6 +39,7 @@ pub fn route(path: &str) -> Route {
         "/v1/responses" => Route::Responses,
         "/v1/models" => Route::Models,
         "/v1/last-inference" => Route::LastInference,
+        "/v1/usage" => Route::Usage,
         other => match other.strip_prefix("/v1/models/") {
             Some(id) if !id.is_empty() => Route::Model(id.to_string()),
             _ => Route::NotFound,
@@ -63,6 +66,8 @@ mod tests {
         assert_eq!(route("/healthz"), Route::Health);
         assert_eq!(route("/v1/last-inference"), Route::LastInference);
         assert_eq!(route("/last-inference"), Route::LastInference);
+        assert_eq!(route("/v1/usage"), Route::Usage);
+        assert_eq!(route("/usage"), Route::Usage);
     }
 
     #[test]

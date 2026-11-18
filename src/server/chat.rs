@@ -90,7 +90,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
 
     let mut response = match upstream::send_with_auth(
         &handle.upstream,
-        &handle.tokens,
+        handle.tokens.as_ref(),
         Method::Post,
         &target,
         &forwarded,

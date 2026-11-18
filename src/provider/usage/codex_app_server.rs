@@ -30,11 +30,28 @@ const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 /// A small bounded queue prevents a noisy child from buffering unlimited lines.
 const QUEUED_LINES: usize = 16;
 
-/// Query the installed Codex CLI, returning `None` for every optional-source failure.
-pub fn collect() -> Option<UsageReport> {
+/// A Codex usage read, distinguishing an elapsed session deadline from other
+/// optional-source failures so the daemon retries only an actual timeout.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexCollection {
+    pub report: Option<UsageReport>,
+    pub timed_out: bool,
+}
+
+/// Query Codex and retain whether its bounded session deadline elapsed.
+pub(crate) fn collect_detailed() -> CodexCollection {
     let mut command = Command::new("codex");
     command.arg("app-server");
-    collect_with_command(command, SESSION_TIMEOUT)
+    collect_detailed_with_command(command, SESSION_TIMEOUT)
+}
+
+fn collect_detailed_with_command(command: Command, timeout: Duration) -> CodexCollection {
+    let started = Instant::now();
+    let report = collect_with_command(command, timeout);
+    CodexCollection {
+        timed_out: report.is_none() && started.elapsed() >= timeout,
+        report,
+    }
 }
 
 /// Run one app-server session. Kept injectable so tests can use a fake process.

@@ -24,10 +24,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use serde::Serialize;
-
 use crate::cli::{CommandError, Context};
 use crate::daemon::{self, DaemonState};
+#[cfg(test)]
+use crate::provider::usage::report::codex_outcome;
+use crate::provider::usage::report::{ProviderEntry, UsageReportJson, enabled_provider_ids};
 use crate::provider::usage::{ProviderUsage, UsageReport, WindowLabel};
 use crate::provider::{ProviderId, ProviderRuntime};
 use crate::timeutil;
@@ -56,10 +57,7 @@ pub fn usage(
     provider: Option<ProviderId>,
     json: bool,
 ) -> Result<(), CommandError> {
-    let providers: Vec<ProviderId> = match provider {
-        Some(provider) => vec![provider],
-        None => ProviderId::all().to_vec(),
-    };
+    let providers = selected_provider_ids(provider, &context.config)?;
 
     // What the last inference to each provider was answered with. The daemon
     // keeps it in memory, so there is nothing to read when it is not
@@ -102,6 +100,30 @@ pub fn usage(
     usage_exit_result(&entries)
 }
 
+/// Resolve the CLI's explicit provider choice against the enabled-provider policy.
+fn selected_provider_ids(
+    requested: Option<ProviderId>,
+    config: &crate::config::Config,
+) -> Result<Vec<ProviderId>, CommandError> {
+    match requested {
+        Some(provider) if config.providers.get(provider).enabled => Ok(vec![provider]),
+        Some(provider) => Err(CommandError::new(format!(
+            "provider {} is disabled in configuration",
+            provider.as_str()
+        ))),
+        None => {
+            let enabled = enabled_provider_ids(config);
+            if enabled.is_empty() {
+                Err(CommandError::new(
+                    "no providers are enabled in configuration",
+                ))
+            } else {
+                Ok(enabled)
+            }
+        }
+    }
+}
+
 /// Decide the command status after output has been rendered.
 fn usage_exit_result(entries: &[ProviderEntry]) -> Result<(), CommandError> {
     // A provider that is not signed in still gets a block, so the output does
@@ -130,34 +152,6 @@ fn usage_exit_result(entries: &[ProviderEntry]) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// One provider's answer, with the provider it belongs to.
-#[derive(Serialize)]
-struct ProviderEntry {
-    /// The provider.
-    provider: ProviderId,
-    /// What it had to say.
-    #[serde(flatten)]
-    outcome: ProviderUsage,
-    /// Which account or local source supplied the usage snapshot, when relevant.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<&'static str>,
-    /// Which pool the numbers belong to, when the provider reported any.
-    caption: Option<String>,
-    /// The HTTP status the last inference to this provider was answered with.
-    ///
-    /// It is here for every provider, including the ones that reported a
-    /// quota: a machine-readable report should carry the facts, not only the
-    /// ones that happen to be printed.
-    last_inference: Option<u16>,
-}
-
-/// The machine-readable form of the report.
-#[derive(Serialize)]
-struct UsageReportJson<'a> {
-    /// One entry per provider.
-    providers: &'a [ProviderEntry],
-}
-
 /// The note that says which pool a provider's numbers belong to.
 ///
 /// Only x.ai has one: the billing endpoint reports the consumer
@@ -171,53 +165,45 @@ fn caption_for(provider: ProviderId, config: &crate::config::Config) -> Option<S
     }
 }
 
-/// Ask one provider what it can say.
-///
-/// Codex is consulted only for OpenAI usage and before Eggpass's own
-/// credential check. If it cannot provide a report, the existing provider
-/// path below remains the fallback.
+/// Ask one enabled provider for its usage. Codex is optional and queried only
+/// for OpenAI, before Eggpass credentials are inspected.
 fn collect_one(context: &Context, provider: ProviderId) -> (ProviderUsage, Option<&'static str>) {
-    let codex_report = (provider == ProviderId::OpenAi)
-        .then(crate::provider::usage::codex_app_server::collect)
-        .flatten();
-    collect_one_with_codex_result(context, provider, codex_report)
+    let codex = (provider == ProviderId::OpenAi)
+        .then(crate::provider::usage::codex_app_server::collect_detailed);
+    collect_one_with_codex_collection(context, provider, codex)
 }
 
-/// Apply an optional Codex report, otherwise run the existing token/collector path.
+/// Compatibility wrapper used by the existing CLI collector tests.
+#[cfg(test)]
 fn collect_one_with_codex_result(
     context: &Context,
     provider: ProviderId,
     codex_report: Option<UsageReport>,
 ) -> (ProviderUsage, Option<&'static str>) {
-    if let Some(codex_usage) = codex_outcome(provider, codex_report) {
-        return codex_usage;
-    }
-
-    let runtime = ProviderRuntime::new(provider, &context.config, &context.paths);
-    let outcome = match runtime.tokens.current() {
-        Ok(None) => ProviderUsage::NotSignedIn,
-        Ok(Some(_)) => runtime.usage(),
-        Err(err) => ProviderUsage::Failed {
-            reason: format!("could not read the stored credentials ({err})"),
+    let codex = (provider == ProviderId::OpenAi).then_some(
+        crate::provider::usage::codex_app_server::CodexCollection {
+            report: codex_report,
+            timed_out: false,
         },
-    };
-    (outcome, None)
+    );
+    collect_one_with_codex_collection(context, provider, codex)
 }
 
-/// Use Codex's report only for the OpenAI usage entry.
-fn codex_outcome(
+fn collect_one_with_codex_collection(
+    context: &Context,
     provider: ProviderId,
-    report: Option<UsageReport>,
-) -> Option<(ProviderUsage, Option<&'static str>)> {
-    if provider != ProviderId::OpenAi {
-        return None;
-    }
-    report.map(|report| {
-        (
-            ProviderUsage::Reported { report },
-            Some(crate::provider::usage::codex_app_server::SOURCE_LABEL),
-        )
-    })
+    codex: Option<crate::provider::usage::codex_app_server::CodexCollection>,
+) -> (ProviderUsage, Option<&'static str>) {
+    let runtime = ProviderRuntime::new(provider, &context.config, &context.paths);
+    let collected = crate::provider::usage::report::collect_entry(
+        provider,
+        context.config.providers.xai.upstream,
+        &runtime.tokens,
+        context.config.timeouts,
+        codex,
+        crate::provider::usage::xai::BILLING_BASE_URL,
+    );
+    (collected.entry.outcome, collected.entry.source)
 }
 
 /// Render the whole report.
@@ -1177,6 +1163,33 @@ mod tests {
         assert!(text.contains("\"provider\":\"openai\""), "{text}");
         assert!(text.contains("\"status\":\"not_signed_in\""), "{text}");
         assert!(!text.contains("\"source\":null"), "{text}");
+    }
+
+    #[test]
+    fn usage_selects_only_enabled_providers_and_rejects_disabled_selections() {
+        let mut config = crate::config::Config::default();
+        config.providers.xai.enabled = false;
+        assert_eq!(
+            selected_provider_ids(None, &config).unwrap(),
+            vec![ProviderId::OpenAi]
+        );
+
+        let error = selected_provider_ids(Some(ProviderId::Xai), &config).unwrap_err();
+        assert!(
+            error
+                .message
+                .unwrap_or_default()
+                .contains("xai is disabled")
+        );
+
+        config.providers.openai.enabled = false;
+        let error = selected_provider_ids(None, &config).unwrap_err();
+        assert!(
+            error
+                .message
+                .unwrap_or_default()
+                .contains("no providers are enabled")
+        );
     }
 
     fn context_for(directory: &std::path::Path) -> Context {

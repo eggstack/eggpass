@@ -185,8 +185,6 @@ pub struct ProviderRuntime {
     pub client: crate::auth::OAuthClient,
     /// The token manager.
     pub tokens: crate::auth::TokenManager,
-    /// How long a request to this provider may take.
-    pub timeouts: crate::config::Timeouts,
 }
 
 impl ProviderRuntime {
@@ -211,13 +209,7 @@ impl ProviderRuntime {
             spec,
             client,
             tokens,
-            timeouts: config.timeouts,
         }
-    }
-
-    /// What this provider can say about its own allowance.
-    pub fn usage(&self) -> usage::ProviderUsage {
-        usage::collect(self.spec.id, self)
     }
 }
 
