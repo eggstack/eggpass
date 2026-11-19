@@ -664,6 +664,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 8484,
             api_key: "route-test-key".to_string(),
+            usage_key: String::new(),
             keys,
             providers: std::collections::HashMap::new(),
             default_provider: ProviderId::Xai,

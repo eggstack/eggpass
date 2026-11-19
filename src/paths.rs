@@ -3,12 +3,12 @@
 //! Resolution order for the configuration directory:
 //!
 //! 1. `$EGGPASS_HOME` when set — relocates *every* file (config, credentials,
-//!    pid, log). Useful for tests and for running a second instance.
+//!    usage key, pid, log). Useful for tests and for running a second instance.
 //! 2. `$XDG_CONFIG_HOME/eggpass` when set.
 //! 3. `~/.config/eggpass`.
 //!
 //! The `--config <path>` flag overrides only the configuration *file*; the
-//! credential, pid and log files stay in the resolved directory.
+//! credential, usage-key, pid and log files stay in the resolved directory.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +22,8 @@ pub const LOG_FILE_NAME: &str = "eggpass.log";
 pub const CREDENTIALS_DIR_NAME: &str = "credentials";
 /// Name of the file holding the keys `eggpass` issues to its clients.
 pub const KEY_STORE_FILE_NAME: &str = "keys.json";
+/// Name of the daemon-managed CLI-only usage credential file.
+pub const USAGE_KEY_FILE_NAME: &str = "usage.key";
 /// The legacy single-provider credential file, kept for the migration.
 pub const LEGACY_AUTH_FILE_NAME: &str = "auth.json";
 /// The name this project had before the rename.
@@ -118,6 +120,11 @@ impl Paths {
     /// The file holding the keys `eggpass` issues to its clients.
     pub fn key_store_file(&self) -> PathBuf {
         self.dir.join(KEY_STORE_FILE_NAME)
+    }
+
+    /// The daemon-managed usage-only credential (not moved by `--config`).
+    pub fn usage_key_file(&self) -> PathBuf {
+        self.dir.join(USAGE_KEY_FILE_NAME)
     }
 
     /// The daemon pid file.
@@ -293,6 +300,10 @@ mod tests {
         assert_eq!(
             paths.pid_file(),
             Path::new("/tmp/eggpass-test-home/eggpass.pid")
+        );
+        assert_eq!(
+            paths.usage_key_file(),
+            Path::new("/tmp/eggpass-test-home/usage.key")
         );
     }
 

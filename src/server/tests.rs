@@ -402,6 +402,7 @@ fn harness_with_spec(
         host: "127.0.0.1".to_string(),
         port,
         api_key: api_key.to_string(),
+        usage_key: "server-test-usage-key".to_string(),
         keys: Arc::clone(&keys),
         providers,
         default_provider: spec.id,
@@ -1355,6 +1356,39 @@ fn usage_route_is_authenticated_cached_and_attaches_fresh_inference_state() {
             .usage_calls
             .load(std::sync::atomic::Ordering::SeqCst),
         1
+    );
+}
+
+#[test]
+fn the_daemon_usage_credential_cannot_authorize_other_routes() {
+    let stub = Stub::start(|_| Reply::json(404, "{}"));
+    let harness = harness(&stub, "regular-client-key", "provider-token");
+    let secret = "server-test-usage-key";
+
+    let usage = agent()
+        .get(harness.url("/v1/usage"))
+        .header("Authorization", &format!("Bearer {secret}"))
+        .call()
+        .expect("the scoped usage request answers");
+    assert_eq!(usage.status(), 200);
+
+    let models = agent()
+        .get(harness.url("/v1/models"))
+        .header("Authorization", &format!("Bearer {secret}"))
+        .call()
+        .expect("the proxy rejects out-of-scope credentials");
+    assert_eq!(models.status(), 401);
+
+    let inference = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", &format!("Bearer {secret}"))
+        .header("Content-Type", "application/json")
+        .send(chat_body().to_string())
+        .expect("the proxy rejects the scoped credential");
+    assert_eq!(inference.status(), 401);
+    assert!(
+        harness.keys.is_empty(),
+        "the runtime secret is not an issued client key"
     );
 }
 

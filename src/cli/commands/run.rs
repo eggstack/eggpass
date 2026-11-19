@@ -259,10 +259,18 @@ fn serve(context: &Context) -> Result<(), CommandError> {
         },
     ));
 
+    let usage_key =
+        crate::usage_key::UsageKey::create(context.paths.usage_key_file()).map_err(|err| {
+            CommandError::new(format!(
+                "could not create the private daemon usage credential: {err}"
+            ))
+        })?;
+
     let server_context = Arc::new(ServerContext {
         host: context.config.host.clone(),
         port: context.config.port,
         api_key: context.config.api_key.clone(),
+        usage_key: usage_key.token().to_string(),
         keys,
         providers,
         default_provider,

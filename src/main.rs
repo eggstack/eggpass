@@ -19,6 +19,7 @@ mod server;
 mod timeutil;
 mod update;
 mod upstream;
+mod usage_key;
 
 use cli::args::ParseOutcome;
 
