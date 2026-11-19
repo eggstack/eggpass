@@ -17,11 +17,10 @@ use std::time::{Duration, Instant};
 
 use url::Url;
 
-use super::client::{AuthError, DevicePoll, OAuthClient, TokenSet, UserInfo};
-use super::pkce;
+use super::client::{AuthError, OAuthClient, UserInfo};
 use super::store::StoredAuth;
 use crate::provider::ProviderSpec;
-use crate::timeutil;
+use eggpass_auth::Credentials;
 
 /// Errors raised while running a login flow.
 #[derive(Debug)]
@@ -114,14 +113,32 @@ pub struct LoginOutcome {
 }
 
 /// What the callback carried.
-#[derive(Debug)]
 pub struct Callback {
-    /// The authorization code.
+    /// The authorization code, when copied by the user or parsed from a callback.
     pub code: String,
     /// The client id the provider issued, when it issued one.
     pub issued_client_id: Option<String>,
     /// The scope the provider reported, when it reported one.
     pub scope: Option<String>,
+    /// Raw callback request target, retained for library-side callback validation.
+    pub callback_target: Option<String>,
+}
+
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Callback")
+            .field("code", &"<redacted>")
+            .field(
+                "issued_client_id",
+                &self.issued_client_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scope", &self.scope)
+            .field(
+                "callback_target",
+                &self.callback_target.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Run the browser-based authorization code flow.
@@ -143,39 +160,23 @@ pub fn login_loopback(
         .port();
 
     // The path has to match the provider's allow-list exactly; only the port
-    // may vary.
+    // may vary. The shared library owns PKCE, state, nonce, and provider params.
     let redirect_uri = format!("http://127.0.0.1:{port}{}", spec.callback_path);
-    let verifier = pkce::random_verifier();
-    let challenge = pkce::challenge_for(&verifier);
-    let state = pkce::random_state();
-    let nonce = pkce::random_nonce();
+    let pending = client.begin_authorization(&redirect_uri, existing)?;
+    let authorize_url = Url::parse(pending.authorization_url())
+        .map_err(|_| FlowError::Auth(AuthError::InvalidResponse))?;
+    let mut states = authorize_url
+        .query_pairs()
+        .filter(|(name, _)| name == "state")
+        .map(|(_, value)| value.into_owned());
+    let state = states
+        .next()
+        .filter(|_| states.next().is_none())
+        .ok_or(FlowError::Auth(AuthError::InvalidResponse))?;
+    let url = pending.authorization_url().to_string();
 
-    // A provider that issues its own client id needs the registration
-    // parameters the first time round, and the saved id afterwards.
-    let registering = spec.id == crate::provider::ProviderId::OpenAi
-        && existing.is_none_or(|auth| auth.client_id.is_empty());
-
-    // A pasted code can only be exchanged when the client id is fixed.
+    // A pasted code can only be completed for a fixed-client-ID provider.
     let allow_pasted_code = !spec.issues_client_id;
-
-    let mut extra: Vec<(String, String)> = Vec::new();
-    if !registering
-        && let Some(auth) = existing
-        && let Some(id_token) = &auth.id_token
-    {
-        // The hint identifies the account, so the user does not have to pick
-        // it again.
-        extra.push(("id_token_hint".to_string(), id_token.clone()));
-    }
-
-    let url = client.authorize_url_with(
-        &redirect_uri,
-        &challenge,
-        &state,
-        &nonce,
-        registering,
-        &extra,
-    );
 
     println!("Opening your browser to complete the login.");
     println!("If it does not open, visit this URL yourself:\n\n  {url}\n");
@@ -200,33 +201,22 @@ pub fn login_loopback(
     };
 
     let callback = wait_for_callback(listener, &state, spec.callback_path, pasted)?;
+    let credentials = if let Some(target) = &callback.callback_target {
+        let callback_url = format!("http://127.0.0.1:{port}{target}");
+        client.complete_authorization(pending, &callback_url)?
+    } else {
+        client.complete_authorization_with_code(pending, &callback.code)?
+    };
 
-    // The token exchange has to present the id the provider issued, not the
-    // entrypoint we started from.
-    let exchange_client_id = callback
-        .issued_client_id
-        .clone()
-        .unwrap_or_else(|| client.client_id().to_string());
-
-    let tokens = client.exchange_code_as(
-        &callback.code,
-        &redirect_uri,
-        &verifier,
-        &exchange_client_id,
-    )?;
-
-    Ok(finish(
-        spec,
-        client,
-        tokens,
-        callback.issued_client_id,
-        callback.scope,
-        existing,
-    ))
+    Ok(finish(spec, client, credentials, existing))
 }
 
 /// Run the device-code flow.
-pub fn login_device(spec: &ProviderSpec, client: &OAuthClient) -> Result<LoginOutcome, FlowError> {
+pub fn login_device(
+    spec: &ProviderSpec,
+    client: &OAuthClient,
+    existing: Option<&StoredAuth>,
+) -> Result<LoginOutcome, FlowError> {
     if !spec.supports_device_flow {
         return Err(FlowError::Unsupported("the device-code flow"));
     }
@@ -235,75 +225,52 @@ pub fn login_device(spec: &ProviderSpec, client: &OAuthClient) -> Result<LoginOu
         Ok(device) => device,
         // xAI does not publish the device-code endpoint to every client. A
         // 404 there means "use the browser instead", not "the login failed".
-        Err(AuthError::Http { status: 404, .. }) => return Err(FlowError::DeviceUnavailable),
+        Err(AuthError::Http { status: 404 }) => return Err(FlowError::DeviceUnavailable),
         Err(err) => return Err(err.into()),
     };
 
-    require_trusted_verification_url(&device.verification_uri, spec.trusted_device_hosts)?;
-    if let Some(complete) = &device.verification_uri_complete {
+    // The shared library validates these URLs before returning them. Retain the
+    // host-side check as a defense in depth before presenting/opening them.
+    require_trusted_verification_url(device.verification_uri(), spec.trusted_device_hosts)?;
+    if let Some(complete) = device.verification_uri_complete() {
         require_trusted_verification_url(complete, spec.trusted_device_hosts)?;
     }
 
     let open_url = device
-        .verification_uri_complete
-        .clone()
-        .unwrap_or_else(|| device.verification_uri.clone());
+        .verification_uri_complete()
+        .unwrap_or_else(|| device.verification_uri());
 
     println!(
         "Open this page to approve the login:\n\n  {}\n",
-        device.verification_uri
+        device.verification_uri()
     );
-    println!("Your code is: {}\n", device.user_code);
-    let _ = webbrowser::open(&open_url);
+    println!("Your code is: {}\n", device.user_code());
+    let _ = webbrowser::open(open_url);
 
-    let mut interval = device.interval.max(1);
-    let deadline = Instant::now() + Duration::from_secs(device.expires_in.max(60) as u64);
-
-    loop {
-        if Instant::now() >= deadline {
-            return Err(FlowError::Timeout);
+    let credentials = match client.poll_device_authorization(&device, device.expires_in()) {
+        Ok(credentials) => credentials,
+        Err(AuthError::DeviceExpired) => return Err(FlowError::Timeout),
+        Err(AuthError::ProviderDenied(error)) => {
+            return Err(FlowError::Provider {
+                error,
+                description: None,
+            });
         }
-
-        // The official CLI sleeps before the first poll: an immediate poll
-        // returns `authorization_pending` and risks a `slow_down` penalty.
-        std::thread::sleep(Duration::from_secs(interval as u64));
-
-        match client.poll_device_code(&device.device_code)? {
-            DevicePoll::Complete(tokens) => {
-                println!("Approved.");
-                return Ok(finish(spec, client, tokens, None, None, None));
-            }
-            DevicePoll::Pending => {}
-            DevicePoll::SlowDown => {
-                interval += 1;
-            }
-            DevicePoll::Denied(error) => {
-                return Err(FlowError::Provider {
-                    error,
-                    description: None,
-                });
-            }
-            DevicePoll::Expired => return Err(FlowError::Timeout),
-        }
-    }
+        Err(err) => return Err(err.into()),
+    };
+    println!("Approved.");
+    Ok(finish(spec, client, credentials, existing))
 }
 
 /// Turn a token set into stored credentials, fetching the account details.
 fn finish(
     spec: &ProviderSpec,
     client: &OAuthClient,
-    tokens: TokenSet,
-    issued_client_id: Option<String>,
-    callback_scope: Option<String>,
+    credentials: Credentials,
     existing: Option<&StoredAuth>,
 ) -> LoginOutcome {
-    let now = timeutil::now_unix();
-
-    let mut account = None;
-    if let Ok(info) = client.userinfo(&tokens.access_token) {
-        account = Some(info);
-    }
-    if let Some(id_token) = &tokens.id_token {
+    let mut account = client.userinfo(credentials.access_token()).ok();
+    if let Some(id_token) = credentials.id_token() {
         let claims = super::client::claims_from_id_token(id_token);
         let account = account.get_or_insert_with(UserInfo::default);
         if account.email.is_none() {
@@ -314,24 +281,12 @@ fn finish(
         }
     }
 
-    // The scope the provider actually granted wins over the one it reported
-    // in the callback, and the callback's scope wins over the one we asked
-    // for. The scope decides whether ChatGPT plan usage is enabled, so the
-    // most authoritative one we have is the one we keep.
-    let scope = tokens
-        .scope
-        .clone()
-        .or(callback_scope)
+    // The token response is authoritative. Keep an existing scope only when
+    // the provider did not return one during this transaction.
+    let scope = credentials
+        .scope()
+        .map(str::to_string)
         .or_else(|| existing.and_then(|auth| auth.scope.clone()));
-
-    let client_id = issued_client_id
-        .or_else(|| {
-            existing
-                .filter(|auth| !auth.client_id.is_empty())
-                .map(|auth| auth.client_id.clone())
-        })
-        .unwrap_or_else(|| client.client_id().to_string());
-
     let ext_agent_host_id = existing
         .and_then(|auth| auth.ext_agent_host_id.clone())
         .or_else(|| {
@@ -342,19 +297,15 @@ fn finish(
         });
 
     let mut auth = StoredAuth {
-        access_token: tokens.access_token.clone(),
-        refresh_token: tokens.refresh_token.clone(),
-        id_token: tokens.id_token.clone(),
-        token_type: if tokens.token_type.is_empty() {
-            "Bearer".to_string()
-        } else {
-            tokens.token_type.clone()
-        },
+        access_token: credentials.access_token().to_string(),
+        refresh_token: credentials.refresh_token().map(str::to_string),
+        id_token: credentials.id_token().map(str::to_string),
+        token_type: credentials.token_type().to_string(),
         scope,
-        client_id,
-        issuer: client.issuer().to_string(),
-        expires_at: tokens.expires_at,
-        obtained_at: now,
+        client_id: credentials.client_id().to_string(),
+        issuer: credentials.issuer().to_string(),
+        expires_at: credentials.expires_at(),
+        obtained_at: credentials.obtained_at(),
         user_id: account.as_ref().and_then(|info| info.user_id.clone()),
         email: account.as_ref().and_then(|info| info.email.clone()),
         ext_agent_host_id,
@@ -398,6 +349,7 @@ fn wait_for_callback(
                     code: candidate.to_string(),
                     issued_client_id: None,
                     scope: None,
+                    callback_target: None,
                 });
             }
             println!("That does not look like an authorization code. Ignoring it.");
@@ -467,6 +419,7 @@ fn wait_for_callback(
                     code: code.clone(),
                     issued_client_id: params.get("client_id").cloned(),
                     scope: params.get("scope").cloned(),
+                    callback_target: Some(target.to_string()),
                 });
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {

@@ -27,7 +27,7 @@ pub mod openai;
 pub mod report;
 pub mod xai;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderId;
 
@@ -41,7 +41,7 @@ pub struct ProviderCollection {
 }
 
 /// What a provider can say about its own allowance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsageReport {
     /// The provider the report is about.
     pub provider: ProviderId,
@@ -71,7 +71,7 @@ impl UsageReport {
 }
 
 /// One quota window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuotaWindow {
     /// The label the window is printed under.
     pub label: WindowLabel,
@@ -86,7 +86,7 @@ pub struct QuotaWindow {
 }
 
 /// The name of a quota window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 // The normalised model names every window kind a provider may report, so a
 // second provider does not have to change the model to add one. Only the
 // kinds a provider actually reports are built today.
@@ -119,7 +119,7 @@ impl WindowLabel {
 }
 
 /// A product's share of the same allowance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProductUsage {
     /// The product id, as the provider spells it.
     pub product: String,
@@ -130,7 +130,7 @@ pub struct ProductUsage {
 }
 
 /// Purchased credit.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Credits {
     /// A prepaid balance, in cents.
     pub prepaid_cents: Option<i64>,
@@ -144,7 +144,7 @@ pub struct Credits {
 ///
 /// An explicit state is the provider's answer, and it takes precedence over
 /// a calculated percentage.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 // The mechanism names every state a provider may report. Only the ones the
 // providers report today are built; the rest wait for a field that says so.
@@ -170,7 +170,7 @@ impl QuotaState {
 }
 
 /// What one provider had to say.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProviderUsage {
     /// The provider reported usage.
@@ -193,7 +193,7 @@ pub enum ProviderUsage {
         /// Where the user can see it, when there is such a place.
         hint: Option<String>,
         /// The error codes the provider does publish, when it publishes any.
-        signals: Vec<&'static str>,
+        signals: Vec<String>,
     },
     /// The attempt failed.
     Failed {

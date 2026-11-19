@@ -56,7 +56,7 @@ pub fn unavailable() -> ProviderUsage {
         reason: "Sign in with ChatGPT does not expose a quota API".to_string(),
         source: Some(SOURCE.to_string()),
         hint: Some(USAGE_PAGE.to_string()),
-        signals: SIGNALS.to_vec(),
+        signals: SIGNALS.iter().map(|signal| (*signal).to_string()).collect(),
     }
 }
 

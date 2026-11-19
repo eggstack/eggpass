@@ -6,7 +6,20 @@ Notable changes to eggpass are listed here. The format follows
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-11-16
+### Added
+
+- Add a cached `GET /v1/usage` endpoint and let `eggpass usage` reuse the
+  daemon's report through a separate usage-only runtime credential.
+- Add the independently versioned async `eggpass-auth` Rust library and its
+  Python `asyncio` bindings.
+
+### Security
+
+- Restrict the usage-only runtime credential to a bodyless
+  `GET /v1/usage`; it cannot authorize inference or satisfy the regular client
+  key required to start the server.
+
+## [0.1.1] - 2026-11-17
 
 ### Added
 

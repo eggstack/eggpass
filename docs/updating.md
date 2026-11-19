@@ -2,7 +2,7 @@
 
 ```sh
 eggpass update            # install the latest published release
-eggpass update 0.2.0      # install an exact version
+eggpass update 0.1.0      # install an exact version
 eggpass update --check    # show the proposed update without changing anything
 ```
 
@@ -32,17 +32,19 @@ update process.
 
 ## Cargo installations
 
-If you installed with Cargo, update with Cargo instead. The updater prints the
-appropriate command. For a local checkout:
+If you installed with Cargo, the updater refuses to replace that binary and
+prints a command with `--locked --force --root` set to the detected Cargo
+installation. Run that command unchanged so Cargo updates the correct
+installation. For a default crates.io installation, the equivalent is:
 
 ```sh
-cargo install --path .
+cargo install eggpass --locked --force
 ```
 
-For the Git repository:
+To reinstall from the current repository checkout instead:
 
 ```sh
-cargo install eggpass --git https://github.com/eggstack/eggpass
+cargo install --path . --locked --force
 ```
 
 ## Exact versions and rollback

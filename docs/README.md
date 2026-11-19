@@ -19,3 +19,4 @@
 | Understand routing and security | [how-it-works.md](how-it-works.md) |
 | Fix an error | [troubleshooting.md](troubleshooting.md) |
 | Update eggpass | [updating.md](updating.md) |
+| Use the Python `eggpass-auth` library | [Python auth guide](https://github.com/eggstack/eggpass/blob/main/python/eggpass-auth/README.md) |

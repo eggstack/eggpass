@@ -42,7 +42,7 @@ impl std::fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 /// The credentials we keep on disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredAuth {
     /// The bearer token used against the API.
     pub access_token: String,
@@ -85,6 +85,32 @@ pub struct StoredAuth {
     /// Whether the token may spend the user's ChatGPT plan.
     #[serde(default)]
     pub plan_enabled: bool,
+}
+
+impl std::fmt::Debug for StoredAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredAuth")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .field("client_id", &"<redacted>")
+            .field("issuer", &self.issuer)
+            .field("expires_at", &self.expires_at)
+            .field("obtained_at", &self.obtained_at)
+            .field("user_id", &self.user_id)
+            .field("email", &self.email)
+            .field(
+                "ext_agent_host_id",
+                &self.ext_agent_host_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("plan_enabled", &self.plan_enabled)
+            .finish()
+    }
 }
 
 fn default_token_type() -> String {
@@ -392,6 +418,24 @@ mod tests {
             email: Some("a@b.c".to_string()),
             ext_agent_host_id: None,
             plan_enabled: false,
+        }
+    }
+
+    #[test]
+    fn debug_redacts_all_secret_bearing_fields() {
+        let mut auth = sample();
+        auth.access_token = "access-secret-value".to_string();
+        auth.refresh_token = Some("refresh-secret-value".to_string());
+        auth.id_token = Some("id-secret-value".to_string());
+        auth.client_id = "issued-client-id-value".to_string();
+        let debug = format!("{auth:?}");
+        for secret in [
+            "access-secret-value",
+            "refresh-secret-value",
+            "id-secret-value",
+            "issued-client-id-value",
+        ] {
+            assert!(!debug.contains(secret), "unexpected secret in {debug}");
         }
     }
 

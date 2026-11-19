@@ -22,6 +22,12 @@
 //! to the provider and stops there.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, IsTerminal, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::cli::{CommandError, Context};
@@ -32,6 +38,8 @@ use crate::provider::usage::report::{ProviderEntry, UsageReportJson, enabled_pro
 use crate::provider::usage::{ProviderUsage, UsageReport, WindowLabel};
 use crate::provider::{ProviderId, ProviderRuntime};
 use crate::timeutil;
+use crate::usage_key::UsageKey;
+use serde::Deserialize;
 
 /// The width of the label column, so every value starts in the same place.
 const LABEL_WIDTH: usize = 12;
@@ -51,6 +59,74 @@ const EMPTY: char = '░';
 /// How far past a reset time a window counts as stale, in seconds.
 const STALE_AFTER: i64 = 3_600;
 
+/// Shows progress while provider usage requests are in flight.
+///
+/// The spinner is deliberately sent to an interactive stderr only, so piping
+/// either output format remains clean. Its worker erases only its own line
+/// before returning control to the report output.
+struct UsageSpinner {
+    running: Option<Arc<AtomicBool>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl UsageSpinner {
+    fn start(message: &'static str) -> Self {
+        if !io::stderr().is_terminal() {
+            return Self {
+                running: None,
+                worker: None,
+            };
+        }
+
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_running = Arc::clone(&running);
+        let worker = thread::Builder::new()
+            .name("eggpass-usage-spinner".to_string())
+            .spawn(move || {
+                const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+                // Avoid flashing the spinner when a request finishes quickly.
+                thread::sleep(Duration::from_millis(120));
+
+                let mut stderr = io::stderr().lock();
+                let mut frame = 0;
+                let mut displayed = false;
+                while thread_running.load(Ordering::Acquire) {
+                    if write!(stderr, "\r\x1b[2K{} {message}", FRAMES[frame]).is_err()
+                        || stderr.flush().is_err()
+                    {
+                        break;
+                    }
+                    displayed = true;
+                    frame = (frame + 1) % FRAMES.len();
+                    thread::sleep(Duration::from_millis(80));
+                }
+
+                if displayed {
+                    let _ = write!(stderr, "\r\x1b[2K");
+                    let _ = stderr.flush();
+                }
+            })
+            .ok();
+
+        Self {
+            running: Some(running),
+            worker,
+        }
+    }
+}
+
+impl Drop for UsageSpinner {
+    fn drop(&mut self) {
+        if let Some(running) = self.running.take() {
+            running.store(false, Ordering::Release);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Show how much of the subscription allowance remains.
 pub fn usage(
     context: &Context,
@@ -59,33 +135,30 @@ pub fn usage(
 ) -> Result<(), CommandError> {
     let providers = selected_provider_ids(provider, &context.config)?;
 
-    // What the last inference to each provider was answered with. The daemon
-    // keeps it in memory, so there is nothing to read when it is not
-    // running.
-    let inferences = last_inferences(context);
+    let spinner = UsageSpinner::start("Fetching usage metrics");
 
-    let entries: Vec<ProviderEntry> = providers
-        .into_iter()
-        .map(|provider| {
+    let cached = try_cached_usage(context, &providers);
+    let (entries, stale) = report_with_fallback(
+        &providers,
+        cached,
+        || last_inferences(context),
+        |provider| {
             let (outcome, source) = collect_one(context, provider);
             ProviderEntry {
                 provider,
                 outcome,
-                // The source is distinct from `caption`: a source identifies
-                // which account supplied the snapshot, while a caption names
-                // the pool the quota belongs to.
+                // A source identifies which account supplied the snapshot; the caption names the quota pool.
                 source,
-                // The caption travels with the report, in the JSON as well as in
-                // the bars: a machine-readable number without it is as misleading
-                // as a number without it on the terminal.
                 caption: caption_for(provider, &context.config),
-                // The last inference is the only evidence there is about a
-                // provider that publishes no quota of its own.
-                last_inference: inferences.get(&provider).copied(),
+                last_inference: None,
             }
-        })
-        .collect();
+        },
+    )?;
 
+    drop(spinner);
+    if stale {
+        let _ = write_stale_cache_notice(&mut io::stderr().lock(), true);
+    }
     if json {
         let report = UsageReportJson {
             providers: &entries,
@@ -124,6 +197,252 @@ fn selected_provider_ids(
     }
 }
 
+#[derive(Deserialize)]
+struct UsageReportResponse {
+    providers: Vec<ProviderEntry>,
+}
+
+#[derive(Debug)]
+struct CachedUsageReport {
+    entries: Vec<ProviderEntry>,
+    stale: bool,
+}
+
+enum DaemonUsageResponse {
+    Cached(CachedUsageReport),
+    NotFound,
+    Status {
+        status: u16,
+        retry_after: Option<u64>,
+    },
+}
+
+enum DaemonFetchError {
+    Transport,
+    InvalidResponse,
+}
+
+const MAX_DAEMON_USAGE_BODY: u64 = 1024 * 1024;
+
+/// Try the daemon's report before collecting directly from providers.
+fn try_cached_usage(
+    context: &Context,
+    providers: &[ProviderId],
+) -> Result<Option<CachedUsageReport>, CommandError> {
+    let state = daemon::state(
+        &context.paths.pid_file(),
+        &context.config.host,
+        context.config.port,
+    );
+    try_cached_usage_with(
+        state,
+        &context.paths.usage_key_file(),
+        providers,
+        fetch_daemon_usage,
+        || {
+            daemon::state(
+                &context.paths.pid_file(),
+                &context.config.host,
+                context.config.port,
+            )
+        },
+    )
+}
+
+/// State machine kept injectable so all fallback branches can be tested locally.
+fn try_cached_usage_with<F, S>(
+    initial_state: DaemonState,
+    key_path: &std::path::Path,
+    providers: &[ProviderId],
+    mut fetch: F,
+    mut recheck_state: S,
+) -> Result<Option<CachedUsageReport>, CommandError>
+where
+    F: FnMut(&str, u16, &str, &[ProviderId]) -> Result<DaemonUsageResponse, DaemonFetchError>,
+    S: FnMut() -> DaemonState,
+{
+    let DaemonState::Running { host, port, .. } = initial_state else {
+        return Ok(None);
+    };
+    let Ok(secret) = UsageKey::read(key_path) else {
+        // A missing or unreadable runtime secret cannot authorize the daemon
+        // request. Preserve the direct collector as the safe compatibility path.
+        return Ok(None);
+    };
+
+    match fetch(daemon::probe_host(&host), port, &secret, providers) {
+        Ok(DaemonUsageResponse::Cached(report)) => Ok(Some(report)),
+        Ok(DaemonUsageResponse::NotFound) => Ok(None),
+        Ok(DaemonUsageResponse::Status {
+            status,
+            retry_after,
+        }) => Err(daemon_status_error(status, retry_after)),
+        Err(DaemonFetchError::InvalidResponse) => Err(CommandError::new(
+            "the daemon returned an invalid usage report; direct provider checks were not run",
+        )),
+        Err(DaemonFetchError::Transport) => match recheck_state() {
+            DaemonState::Stopped | DaemonState::Stale { .. } => Ok(None),
+            DaemonState::Running { .. } => Err(CommandError::new(
+                "the daemon still appears to be running but its usage endpoint could not be reached; check `eggpass status` or restart the daemon",
+            )),
+        },
+    }
+}
+
+fn daemon_status_error(status: u16, retry_after: Option<u64>) -> CommandError {
+    let retry = retry_after.map_or_else(String::new, |seconds| {
+        format!("; retry after at least {seconds} second(s)")
+    });
+    if matches!(status, 202 | 503 | 504) {
+        return CommandError::new(format!(
+            "the daemon has no completed usage report available (HTTP {status}){retry}; direct provider checks were not run"
+        ));
+    }
+    if matches!(status, 401 | 403) {
+        return CommandError::new(format!(
+            "the daemon rejected the usage-only credential (HTTP {status}); restart the daemon and retry `eggpass usage`"
+        ));
+    }
+    CommandError::new(format!(
+        "the daemon usage request failed with HTTP {status}{retry}; direct provider checks were not run"
+    ))
+}
+
+fn fetch_daemon_usage(
+    host: &str,
+    port: u16,
+    secret: &str,
+    providers: &[ProviderId],
+) -> Result<DaemonUsageResponse, DaemonFetchError> {
+    fetch_daemon_usage_with_timeouts(
+        host,
+        port,
+        secret,
+        providers,
+        Duration::from_secs(2),
+        Duration::from_secs(35),
+    )
+}
+
+/// Fetch with injectable deadlines so the response timeout is testable locally.
+fn fetch_daemon_usage_with_timeouts(
+    host: &str,
+    port: u16,
+    secret: &str,
+    providers: &[ProviderId],
+    connect_timeout: Duration,
+    total_timeout: Duration,
+) -> Result<DaemonUsageResponse, DaemonFetchError> {
+    let url = format!("http://{host}:{port}/v1/usage");
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .proxy(None)
+        .timeout_connect(Some(connect_timeout))
+        // The production total deadline includes the server's cold-cache wait.
+        .timeout_global(Some(total_timeout))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let authorization = format!("Bearer {secret}");
+    let response = agent
+        .get(&url)
+        .header("Authorization", &authorization)
+        .call()
+        .map_err(|_| DaemonFetchError::Transport)?;
+    let status = response.status().as_u16();
+    if status == 404 {
+        return Ok(DaemonUsageResponse::NotFound);
+    }
+    let retry_after = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0);
+    if status != 200 {
+        return Ok(DaemonUsageResponse::Status {
+            status,
+            retry_after,
+        });
+    }
+    let stale = response
+        .headers()
+        .get("X-Eggpass-Usage-Stale")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let body = response
+        .into_body()
+        .with_config()
+        .limit(MAX_DAEMON_USAGE_BODY + 1)
+        .read_to_vec()
+        .map_err(|_| DaemonFetchError::Transport)?;
+    if body.len() as u64 > MAX_DAEMON_USAGE_BODY {
+        return Err(DaemonFetchError::InvalidResponse);
+    }
+    let response: UsageReportResponse =
+        serde_json::from_slice(&body).map_err(|_| DaemonFetchError::InvalidResponse)?;
+    let entries = select_cached_entries(response.providers, providers)
+        .map_err(|_| DaemonFetchError::InvalidResponse)?;
+    Ok(DaemonUsageResponse::Cached(CachedUsageReport {
+        entries,
+        stale,
+    }))
+}
+
+fn select_cached_entries(
+    entries: Vec<ProviderEntry>,
+    selected: &[ProviderId],
+) -> Result<Vec<ProviderEntry>, ()> {
+    let mut by_provider = BTreeMap::new();
+    for entry in entries {
+        if let ProviderUsage::Reported { report } = &entry.outcome
+            && report.provider != entry.provider
+        {
+            return Err(());
+        }
+        if by_provider.insert(entry.provider, entry).is_some() {
+            return Err(());
+        }
+    }
+    selected
+        .iter()
+        .map(|provider| by_provider.remove(provider).ok_or(()))
+        .collect()
+}
+
+fn report_with_fallback<C>(
+    providers: &[ProviderId],
+    cached: Result<Option<CachedUsageReport>, CommandError>,
+    direct_inferences: impl FnOnce() -> BTreeMap<ProviderId, u16>,
+    mut direct_collect: C,
+) -> Result<(Vec<ProviderEntry>, bool), CommandError>
+where
+    C: FnMut(ProviderId) -> ProviderEntry,
+{
+    if let Some(report) = cached? {
+        return Ok((report.entries, report.stale));
+    }
+    let inferences = direct_inferences();
+    let entries = providers
+        .iter()
+        .copied()
+        .map(|provider| {
+            let mut entry = direct_collect(provider);
+            entry.last_inference = inferences.get(&provider).copied();
+            entry
+        })
+        .collect();
+    Ok((entries, false))
+}
+
+fn write_stale_cache_notice(writer: &mut impl Write, stale: bool) -> io::Result<()> {
+    if stale {
+        writeln!(
+            writer,
+            "warning: daemon usage cache is stale; showing its last successful report"
+        )?;
+    }
+    Ok(())
+}
 /// Decide the command status after output has been rendered.
 fn usage_exit_result(entries: &[ProviderEntry]) -> Result<(), CommandError> {
     // A provider that is not signed in still gets a block, so the output does
@@ -167,7 +486,7 @@ fn caption_for(provider: ProviderId, config: &crate::config::Config) -> Option<S
 
 /// Ask one enabled provider for its usage. Codex is optional and queried only
 /// for OpenAI, before Eggpass credentials are inspected.
-fn collect_one(context: &Context, provider: ProviderId) -> (ProviderUsage, Option<&'static str>) {
+fn collect_one(context: &Context, provider: ProviderId) -> (ProviderUsage, Option<String>) {
     let codex = (provider == ProviderId::OpenAi)
         .then(crate::provider::usage::codex_app_server::collect_detailed);
     collect_one_with_codex_collection(context, provider, codex)
@@ -179,7 +498,7 @@ fn collect_one_with_codex_result(
     context: &Context,
     provider: ProviderId,
     codex_report: Option<UsageReport>,
-) -> (ProviderUsage, Option<&'static str>) {
+) -> (ProviderUsage, Option<String>) {
     let codex = (provider == ProviderId::OpenAi).then_some(
         crate::provider::usage::codex_app_server::CodexCollection {
             report: codex_report,
@@ -193,7 +512,7 @@ fn collect_one_with_codex_collection(
     context: &Context,
     provider: ProviderId,
     codex: Option<crate::provider::usage::codex_app_server::CodexCollection>,
-) -> (ProviderUsage, Option<&'static str>) {
+) -> (ProviderUsage, Option<String>) {
     let runtime = ProviderRuntime::new(provider, &context.config, &context.paths);
     let collected = crate::provider::usage::report::collect_entry(
         provider,
@@ -226,7 +545,7 @@ fn render_block(out: &mut String, entry: &ProviderEntry) {
             entry.provider,
             report,
             entry.caption.as_deref(),
-            entry.source,
+            entry.source.as_deref(),
         ),
         ProviderUsage::NotSignedIn => {
             out.push_str(entry.provider.display_name());
@@ -262,7 +581,7 @@ fn render_block(out: &mut String, entry: &ProviderEntry) {
                 out.push('\n');
             }
             if !signals.is_empty() {
-                out.push_str(&field("Signals", signals[0]));
+                out.push_str(&field("Signals", &signals[0]));
                 out.push('\n');
                 for signal in &signals[1..] {
                     out.push_str(&continuation(signal));
@@ -735,9 +1054,9 @@ mod tests {
             source: Some("not exposed by OAuth".to_string()),
             hint: Some("https://chatgpt.com/settings/usage".to_string()),
             signals: vec![
-                "429 subscription_sharing_usage_limit_exceeded",
-                "503 subscription_sharing_usage_unavailable",
-                "403 subscription_sharing_user_not_eligible",
+                "429 subscription_sharing_usage_limit_exceeded".to_string(),
+                "503 subscription_sharing_usage_unavailable".to_string(),
+                "403 subscription_sharing_user_not_eligible".to_string(),
             ],
         }
     }
@@ -1240,7 +1559,7 @@ mod tests {
         assert!(matches!(&entry.outcome, ProviderUsage::Reported { .. }));
         assert_eq!(
             entry.source,
-            Some(crate::provider::usage::codex_app_server::SOURCE_LABEL)
+            Some(crate::provider::usage::codex_app_server::SOURCE_LABEL.to_string())
         );
         assert!(usage_exit_result(std::slice::from_ref(&entry)).is_ok());
     }
@@ -1312,7 +1631,7 @@ mod tests {
             outcome: ProviderUsage::Reported {
                 report: codex_report(),
             },
-            source: Some(crate::provider::usage::codex_app_server::SOURCE_LABEL),
+            source: Some(crate::provider::usage::codex_app_server::SOURCE_LABEL.to_string()),
             caption: None,
             last_inference: None,
         };
@@ -1438,5 +1757,422 @@ mod tests {
         assert!(text.contains("codex 5-hour"), "{text}");
         assert!(text.contains("other-model 5-hour"), "{text}");
         assert!(!text.contains("Primary"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod daemon_cache_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Receiver};
+
+    struct HttpStub {
+        port: u16,
+        request: Receiver<String>,
+    }
+
+    fn http_stub(status: u16, body: String, headers: &[(&str, &str)]) -> HttpStub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local stub");
+        let port = listener.local_addr().expect("local stub address").port();
+        let (send, request) = mpsc::channel();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept local request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut raw_request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request head");
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                raw_request.push_str(&line);
+            }
+            let _ = send.send(raw_request);
+            let mut response =
+                format!("HTTP/1.1 {status} Stub\r\nContent-Type: application/json\r\n");
+            for (name, value) in headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str(&format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ));
+            stream
+                .write_all(response.as_bytes())
+                .expect("write stub response");
+            stream.flush().expect("flush stub response");
+        });
+        HttpStub { port, request }
+    }
+
+    fn running(port: u16) -> DaemonState {
+        DaemonState::Running {
+            pid: 1,
+            host: "127.0.0.1".to_string(),
+            port,
+        }
+    }
+
+    fn sample_entry(provider: ProviderId, last_inference: Option<u16>) -> ProviderEntry {
+        ProviderEntry {
+            provider,
+            outcome: ProviderUsage::Reported {
+                report: UsageReport {
+                    provider,
+                    plan: Some("test plan".to_string()),
+                    windows: Vec::new(),
+                    breakdown: Vec::new(),
+                    credits: None,
+                    state: None,
+                },
+            },
+            source: None,
+            caption: None,
+            last_inference,
+        }
+    }
+
+    fn report_body(entries: &[ProviderEntry]) -> String {
+        serde_json::to_string(&UsageReportJson { providers: entries }).expect("serialize fixture")
+    }
+
+    fn usage_key_path(directory: &tempfile::TempDir) -> (PathBuf, UsageKey) {
+        let path = directory.path().join("usage.key");
+        let key = UsageKey::create(&path).expect("create test usage key");
+        (path, key)
+    }
+
+    fn fetch_local(
+        host: &str,
+        port: u16,
+        secret: &str,
+        selected: &[ProviderId],
+    ) -> Result<DaemonUsageResponse, DaemonFetchError> {
+        fetch_daemon_usage(host, port, secret, selected)
+    }
+
+    #[test]
+    fn a_fresh_daemon_report_uses_the_bearer_header_and_skips_direct_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key_path, key) = usage_key_path(&directory);
+        let body = report_body(&[sample_entry(ProviderId::Xai, Some(429))]);
+        let stub = http_stub(200, body, &[]);
+        let cached = try_cached_usage_with(
+            running(stub.port),
+            &key_path,
+            &[ProviderId::Xai],
+            fetch_local,
+            || running(stub.port),
+        )
+        .expect("daemon response parses");
+
+        let raw_request = stub.request.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut lines = raw_request.lines();
+        assert_eq!(lines.next(), Some("GET /v1/usage HTTP/1.1"));
+        let authorization = lines
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then_some(value.trim())
+            })
+            .unwrap_or_default();
+        let expected = format!("Bearer {}", key.token());
+        assert!(crate::keys::constant_time_eq(
+            authorization.as_bytes(),
+            expected.as_bytes()
+        ));
+        assert!(
+            !raw_request
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains(key.token())
+        );
+
+        let direct_calls = AtomicUsize::new(0);
+        let (entries, stale) = report_with_fallback(
+            &[ProviderId::Xai],
+            Ok(cached),
+            || panic!("cache hit must not fetch last-inference separately"),
+            |provider| {
+                direct_calls.fetch_add(1, Ordering::SeqCst);
+                sample_entry(provider, None)
+            },
+        )
+        .expect("cached report selected");
+        assert!(!stale);
+        assert_eq!(direct_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(entries[0].last_inference, Some(429));
+    }
+
+    #[test]
+    fn a_stale_cached_report_warns_on_stderr_without_changing_json_stdout() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key_path, _key) = usage_key_path(&directory);
+        let body = report_body(&[sample_entry(ProviderId::Xai, Some(503))]);
+        let stub = http_stub(200, body, &[("X-Eggpass-Usage-Stale", "true")]);
+        let cached = try_cached_usage_with(
+            running(stub.port),
+            &key_path,
+            &[ProviderId::Xai],
+            fetch_local,
+            || running(stub.port),
+        )
+        .expect("stale response is valid");
+        assert!(stub.request.recv_timeout(Duration::from_secs(2)).is_ok());
+
+        let (entries, stale) = report_with_fallback(
+            &[ProviderId::Xai],
+            Ok(cached),
+            BTreeMap::new,
+            sample_entry_with_no_inference,
+        )
+        .unwrap();
+        let mut stderr = Vec::new();
+        write_stale_cache_notice(&mut stderr, stale).unwrap();
+        let stdout = serde_json::to_string_pretty(&UsageReportJson {
+            providers: &entries,
+        })
+        .unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("cache is stale"));
+        assert!(!stdout.contains("cache is stale"));
+        let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["providers"][0]["last_inference"], 503);
+    }
+
+    fn sample_entry_with_no_inference(provider: ProviderId) -> ProviderEntry {
+        sample_entry(provider, None)
+    }
+
+    #[test]
+    fn route_404_falls_back_but_pending_cooldown_and_auth_errors_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key_path, _key) = usage_key_path(&directory);
+
+        let not_found = http_stub(404, "{}".to_string(), &[]);
+        let fallback = try_cached_usage_with(
+            running(not_found.port),
+            &key_path,
+            &[ProviderId::Xai],
+            fetch_local,
+            || running(not_found.port),
+        )
+        .unwrap();
+        assert!(fallback.is_none());
+        assert!(
+            not_found
+                .request
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok()
+        );
+
+        for (status, retry_after) in [
+            (202, Some("3")),
+            (503, Some("7")),
+            (504, Some("11")),
+            (401, None),
+            (403, None),
+        ] {
+            let headers: Vec<(&str, &str)> = retry_after
+                .into_iter()
+                .map(|value| ("Retry-After", value))
+                .collect();
+            let stub = http_stub(status, "{}".to_string(), &headers);
+            let result = try_cached_usage_with(
+                running(stub.port),
+                &key_path,
+                &[ProviderId::Xai],
+                fetch_local,
+                || running(stub.port),
+            );
+            let error = result.expect_err("non-404 statuses are surfaced");
+            let message = error.message.unwrap_or_default();
+            assert!(message.contains(&status.to_string()));
+            if let Some(seconds) = retry_after {
+                assert!(message.contains(seconds));
+            }
+            assert!(!message.contains("usage.key"));
+            assert!(stub.request.recv_timeout(Duration::from_secs(2)).is_ok());
+
+            let direct_calls = AtomicUsize::new(0);
+            let direct_error = report_with_fallback(
+                &[ProviderId::Xai],
+                Err(CommandError::new(message)),
+                || panic!("error must not query the direct fallback"),
+                |provider| {
+                    direct_calls.fetch_add(1, Ordering::SeqCst);
+                    sample_entry(provider, None)
+                },
+            );
+            assert!(direct_error.is_err());
+            assert_eq!(direct_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn malformed_success_is_visible_and_never_bypassed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key_path, _key) = usage_key_path(&directory);
+        let stub = http_stub(200, "provider identity secret".to_string(), &[]);
+        let result = try_cached_usage_with(
+            running(stub.port),
+            &key_path,
+            &[ProviderId::Xai],
+            fetch_local,
+            || running(stub.port),
+        );
+        let error = result.expect_err("malformed JSON must fail");
+        let message = error.message.unwrap_or_default();
+        assert!(message.contains("invalid usage report"));
+        assert!(!message.contains("provider identity secret"));
+        assert!(stub.request.recv_timeout(Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn a_silent_daemon_response_hits_the_configured_deadline() {
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent local stub");
+        let port = listener.local_addr().expect("silent stub address").port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept local request");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).expect("read request head");
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let started = Instant::now();
+        let result = fetch_daemon_usage_with_timeouts(
+            "127.0.0.1",
+            port,
+            "test-only-secret",
+            &[ProviderId::Xai],
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        );
+        assert!(matches!(result, Err(DaemonFetchError::Transport)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().expect("silent stub finishes");
+    }
+
+    #[test]
+    fn direct_fallback_occurs_only_for_missing_state_or_stale_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.key");
+        let fetch_calls = AtomicUsize::new(0);
+        let mut rechecks = 0;
+        let absent_key = try_cached_usage_with(
+            running(1),
+            &missing,
+            &[ProviderId::Xai],
+            |_, _, _, _| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                Err(DaemonFetchError::Transport)
+            },
+            || {
+                rechecks += 1;
+                DaemonState::Stopped
+            },
+        )
+        .unwrap();
+        assert!(absent_key.is_none());
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rechecks, 0);
+
+        let malformed = directory.path().join("malformed.key");
+        std::fs::write(&malformed, "not-a-usage-token").unwrap();
+        let unreadable_key = try_cached_usage_with(
+            running(1),
+            &malformed,
+            &[ProviderId::Xai],
+            |_, _, _, _| panic!("an invalid key file must not reach the daemon"),
+            || panic!("an invalid key file does not need a daemon-state recheck"),
+        )
+        .unwrap();
+        assert!(unreadable_key.is_none());
+        let direct_calls = AtomicUsize::new(0);
+        let (entries, _) = report_with_fallback(
+            &[ProviderId::Xai],
+            Ok(unreadable_key),
+            BTreeMap::new,
+            |provider| {
+                direct_calls.fetch_add(1, Ordering::SeqCst);
+                sample_entry_with_no_inference(provider)
+            },
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(direct_calls.load(Ordering::SeqCst), 1);
+
+        let (key_path, _key) = usage_key_path(&directory);
+        let stale = try_cached_usage_with(
+            running(1),
+            &key_path,
+            &[ProviderId::Xai],
+            |_, _, _, _| Err(DaemonFetchError::Transport),
+            || DaemonState::Stale { pid: 1 },
+        )
+        .unwrap();
+        assert!(stale.is_none());
+
+        let still_running = try_cached_usage_with(
+            running(1),
+            &key_path,
+            &[ProviderId::Xai],
+            |_, _, _, _| Err(DaemonFetchError::Transport),
+            || running(1),
+        );
+        assert!(still_running.is_err());
+
+        for state in [DaemonState::Stopped, DaemonState::Stale { pid: 1 }] {
+            let fallback = try_cached_usage_with(
+                state,
+                &key_path,
+                &[ProviderId::Xai],
+                |_, _, _, _| panic!("no request when daemon is not running"),
+                || DaemonState::Stopped,
+            )
+            .unwrap();
+            let direct_calls = AtomicUsize::new(0);
+            let (entries, _) = report_with_fallback(
+                &[ProviderId::Xai],
+                Ok(fallback),
+                BTreeMap::new,
+                |provider| {
+                    direct_calls.fetch_add(1, Ordering::SeqCst);
+                    sample_entry_with_no_inference(provider)
+                },
+            )
+            .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(direct_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn provider_selection_is_applied_to_the_cached_report() {
+        let entries = vec![
+            sample_entry(ProviderId::Xai, Some(200)),
+            sample_entry(ProviderId::OpenAi, Some(429)),
+        ];
+        let selected = select_cached_entries(entries, &[ProviderId::OpenAi]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].provider, ProviderId::OpenAi);
+        assert_eq!(selected[0].last_inference, Some(429));
     }
 }

@@ -74,9 +74,9 @@ The advanced `[oauth.xai]` settings are `client_id`, `issuer`, `scopes`, and `re
 
 A client key is required to start the server, including when it listens only on loopback. Use `eggpass key add` to create a numbered, revocable key, or set `api_key` for one static key. The static key is readable in the config. Issued keys are shown once and stored as salted hashes. Clients may send either as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
 
-The server listens on loopback by default. Binding to a non-loopback address exposes the proxy and the provider accounts it can use to the network. A key is required for that bind. The `GET /health` and `GET /v1/last-inference` probes are unauthenticated: health returns a JSON object with `status`, `service`, and a version string; last-inference returns only per-provider client-facing HTTP status codes. `GET /v1/usage` is not an unauthenticated probe: it requires a valid Eggpass client key like every other data endpoint. It returns quota data for enabled providers, so do not expose it without protecting the server.
+The server listens on loopback by default. Binding to a non-loopback address exposes the proxy and the provider accounts it can use to the network. A key is required for that bind. The `GET /health` and `GET /v1/last-inference` probes are unauthenticated: health returns a JSON object with `status`, `service`, and a version string; last-inference returns only per-provider client-facing HTTP status codes. `GET /v1/usage` is not an unauthenticated probe: it accepts a regular client key with its normal scope, or the daemon's separate usage-only runtime credential as an `Authorization: Bearer` token on the exact bodyless GET. The runtime credential is generated for each daemon start and stored in `usage.key` under the resolved data directory; it is not a configured or issued client key and cannot replace the regular key required at startup. Usage reports are sensitive account data. It returns quota data for enabled providers, so do not expose it without protecting the server.
 
-Eggpass runs locally, but inference requests are sent to the provider selected by routing. Prompts and request content are transmitted to xAI or ChatGPT for inference; they do not stay on this machine. `eggpass usage` also contacts providers directly to query usage, and `eggpass status` may contact them to count available models.
+Eggpass runs locally, but inference requests are sent to the provider selected by routing. Prompts and request content are transmitted to xAI or ChatGPT for inference; they do not stay on this machine. `eggpass usage` prefers the running daemon's cached report and directly queries providers only when the daemon is stopped or stale, the runtime usage credential file is missing or unreadable, or an older daemon returns `404`. A rejected credential or daemon refresh/cooldown status is surfaced rather than bypassed. `eggpass status` may contact providers to count available models.
 
 Use `eggpass host` and `eggpass port` to change a live server's address. These commands update the config and restart the server when needed. Manual config edits take effect when the server next starts. See [commands.md](commands.md) for the commands and an SSH tunnel example.
 
@@ -86,12 +86,13 @@ Use `eggpass host` and `eggpass port` to change a live server's address. These c
 | --- | --- |
 | `config.toml` | Settings, possibly including the readable `api_key`. Normally mode `0600`. |
 | `keys.json` | Issued-key numbers, labels, visible prefixes, salts, and hashes. It does not contain the full keys. Mode `0600`. |
+| `usage.key` | Random daemon runtime Bearer credential, restricted to bodyless `GET /v1/usage`; rotated at each start and removed on graceful shutdown when it still matches. Never a regular client key. |
 | `credentials/xai.json` | xAI OAuth credentials, including tokens. Mode `0600`. |
 | `credentials/openai.json` | ChatGPT OAuth credentials, including tokens. Mode `0600`. |
 | `eggpass.pid` | Daemon process ID and the address and port it serves. |
 | `eggpass.log` | Daemon log. |
 
-The data directory and `credentials` directory are restricted to mode `0700`; credential and key files use `0600` on Unix-like systems. Keep any custom config file containing `api_key` private too.
+The data directory and `credentials` directory are restricted to mode `0700`; credential and key files use `0600` on Unix-like systems. On Windows, daemon startup applies protected current-user-only ACLs to the data directory and `usage.key`, and fails closed if that protection cannot be established. A crash or forced termination may leave a stale `usage.key`; the next daemon start replaces it before serving. Keep any custom config file containing `api_key` private too.
 
 With the default data directory, xAI credentials may be read from `~/.grok/auth.json` when `credentials/xai.json` is absent. If an imported refresh token is rotated, eggpass stores its replacement in its own credential file; the Grok CLI's original file is not updated. Setting `EGGPASS_HOME` disables this import to keep the relocated installation isolated.
 
