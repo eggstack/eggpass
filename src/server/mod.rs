@@ -15,6 +15,7 @@ pub mod models;
 pub mod router;
 pub mod sse;
 pub mod translate;
+pub mod usage;
 
 #[cfg(test)]
 mod tests;
@@ -27,6 +28,7 @@ mod keep_body_tests {
     fn health_does_not_keep_a_body() {
         assert!(!keep_body_for("/health"));
         assert!(!keep_body_for("/healthz"));
+        assert!(!keep_body_for("/v1/usage"));
         assert!(keep_body_for("/v1/chat/completions"));
         assert!(keep_body_for("/v1/models"));
     }
@@ -54,7 +56,7 @@ pub struct ProviderHandle {
     /// The client the requests go out through.
     pub upstream: UpstreamClient,
     /// Hands out access tokens, refreshing them when needed.
-    pub tokens: TokenManager,
+    pub tokens: Arc<TokenManager>,
 }
 
 /// Everything a request handler needs.
@@ -71,6 +73,10 @@ pub struct ServerContext {
     /// Empty means there is no such key. The keys `eggpass` issued are
     /// accepted as well.
     pub api_key: String,
+    /// The exact runtime bearer secret authorized only for bodyless `GET /v1/usage`.
+    ///
+    /// This is never counted as a configured client key.
+    pub usage_key: String,
     /// The keys `eggpass` issued to its clients.
     pub keys: Arc<crate::keys::KeyStore>,
     /// The providers that are available.
@@ -91,6 +97,8 @@ pub struct ServerContext {
     /// It is kept in memory and nowhere else: `eggpass usage` reports it for
     /// a provider that does not publish a quota of its own.
     pub inferences: Arc<crate::inference::InferenceState>,
+    /// One in-memory on-demand usage snapshot and its refresh coordinator.
+    pub usage_cache: Arc<usage::UsageCache>,
 }
 
 impl ServerContext {
@@ -244,7 +252,7 @@ fn gate_decision(request: &Request, context: &ServerContext) -> http::GateDecisi
 fn keep_body_for(path: &str) -> bool {
     !matches!(
         router::route(path),
-        router::Route::Health | router::Route::LastInference
+        router::Route::Health | router::Route::LastInference | router::Route::Usage
     )
 }
 
@@ -315,6 +323,10 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
             "GET" => inference::handle(context),
             _ => method_not_allowed(method, "GET"),
         },
+        router::Route::Usage => match method {
+            "GET" => usage::handle(context),
+            _ => method_not_allowed(method, "GET"),
+        },
         router::Route::Models => match method {
             "GET" => models::list(&request, context),
             _ => method_not_allowed(method, "GET"),
@@ -382,7 +394,40 @@ pub fn is_authorized(context: &ServerContext, request: &Request) -> bool {
         }
     }
 
-    false
+    usage_key_authorized(context, request)
+}
+
+/// Whether the dedicated runtime secret is presented for its sole allowed request.
+fn usage_key_authorized(context: &ServerContext, request: &Request) -> bool {
+    if context.usage_key.is_empty()
+        || request.method != "GET"
+        || request.target != "/v1/usage"
+        || !request.body.is_empty()
+        || request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return false;
+    }
+
+    if request
+        .headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("content-length") && value.trim() != "0")
+    {
+        return false;
+    }
+
+    request.headers.iter().any(|(name, value)| {
+        if !name.eq_ignore_ascii_case("authorization") {
+            return false;
+        }
+        let Some(token) = strip_bearer(value.trim()) else {
+            return false;
+        };
+        crate::keys::constant_time_eq(token.as_bytes(), context.usage_key.as_bytes())
+    })
 }
 
 /// The keys a request presents.
@@ -479,6 +524,7 @@ mod authorisation_tests {
             host: "127.0.0.1".to_string(),
             port: 8484,
             api_key: key.to_string(),
+            usage_key: "usage-only-secret".to_string(),
             keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,
@@ -486,6 +532,9 @@ mod authorisation_tests {
             upstream_in_flight: Arc::new(AtomicUsize::new(0)),
             max_upstream_requests: DEFAULT_MAX_UPSTREAM_REQUESTS,
             inferences: Arc::new(crate::inference::InferenceState::new()),
+            usage_cache: Arc::new(usage::UsageCache::new(Vec::new(), |_| {
+                unreachable!("no providers")
+            })),
         }
     }
 
@@ -502,6 +551,19 @@ mod authorisation_tests {
         }
     }
 
+    fn request_at(method: &str, target: &str, headers: Vec<(&str, &str)>, body: &[u8]) -> Request {
+        Request {
+            method: method.to_string(),
+            target: target.to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: body.to_vec(),
+        }
+    }
+
     fn health_request() -> Request {
         Request {
             method: "GET".to_string(),
@@ -510,6 +572,118 @@ mod authorisation_tests {
             headers: Vec::new(),
             body: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_usage_secret_is_limited_to_the_exact_bearer_usage_get() {
+        let context = context_with_key("regular-secret");
+        let valid = request_at(
+            "GET",
+            "/v1/usage",
+            vec![("Authorization", "Bearer usage-only-secret")],
+            &[],
+        );
+        assert!(is_authorized(&context, &valid));
+
+        for request in [
+            request_at(
+                "POST",
+                "/v1/usage",
+                vec![("Authorization", "Bearer usage-only-secret")],
+                &[],
+            ),
+            request_at("GET", "/v1/usage?key=usage-only-secret", vec![], &[]),
+            request_at(
+                "GET",
+                "/usage",
+                vec![("Authorization", "Bearer usage-only-secret")],
+                &[],
+            ),
+            request_at(
+                "GET",
+                "/v1/models",
+                vec![("Authorization", "Bearer usage-only-secret")],
+                &[],
+            ),
+            request_at(
+                "GET",
+                "/v1/usage",
+                vec![("X-Api-Key", "usage-only-secret")],
+                &[],
+            ),
+            request_at(
+                "GET",
+                "/v1/usage",
+                vec![("Authorization", "Bearer usage-only-secretx")],
+                &[],
+            ),
+            request_at(
+                "GET",
+                "/v1/usage",
+                vec![("Authorization", "Bearer sage-only-secret")],
+                &[],
+            ),
+            request_at(
+                "GET",
+                "/v1/usage",
+                vec![
+                    ("Authorization", "Bearer usage-only-secret"),
+                    ("Content-Length", "1"),
+                ],
+                &[],
+            ),
+            request_at(
+                "GET",
+                "/v1/usage",
+                vec![
+                    ("Authorization", "Bearer usage-only-secret"),
+                    ("Transfer-Encoding", "chunked"),
+                ],
+                &[],
+            ),
+            request_at(
+                "GET",
+                "/v1/usage",
+                vec![("Authorization", "Bearer usage-only-secret")],
+                b"body",
+            ),
+        ] {
+            assert!(
+                !is_authorized(&context, &request),
+                "scoped credential accepted an out-of-scope request"
+            );
+        }
+
+        // The same regular key keeps its existing full route scope and accepted presentations.
+        assert!(is_authorized(
+            &context,
+            &request_at(
+                "GET",
+                "/v1/models",
+                vec![("Authorization", "Bearer regular-secret")],
+                &[]
+            ),
+        ));
+    }
+
+    #[test]
+    fn the_usage_secret_does_not_count_as_a_configured_client_key() {
+        let context = context_with_key("");
+        let request = request_at(
+            "GET",
+            "/v1/usage",
+            vec![("Authorization", "Bearer usage-only-secret")],
+            &[],
+        );
+        assert!(!keys_configured(&context));
+        assert!(!is_authorized(&context, &request));
+        assert_eq!(
+            pre_authorize(&request, &context)
+                .expect("no regular key")
+                .status,
+            401
+        );
+        assert!(context.keys.is_empty());
     }
 
     #[test]
@@ -667,6 +841,7 @@ mod authorisation_tests {
             host: "127.0.0.1".to_string(),
             port: 8484,
             api_key: String::new(),
+            usage_key: String::new(),
             keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,
@@ -674,6 +849,9 @@ mod authorisation_tests {
             upstream_in_flight: Arc::new(AtomicUsize::new(0)),
             max_upstream_requests: 2,
             inferences: Arc::new(crate::inference::InferenceState::new()),
+            usage_cache: Arc::new(usage::UsageCache::new(Vec::new(), |_| {
+                unreachable!("no providers")
+            })),
         };
 
         assert!(context.take_upstream_slot());

@@ -22,15 +22,26 @@
 //! truth is "the provider did not say". Every percentage is therefore an
 //! [`Option`], and there is no `unwrap_or(0.0)` anywhere on this path.
 
+pub mod codex_app_server;
 pub mod openai;
+pub mod report;
 pub mod xai;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::provider::{ProviderId, ProviderRuntime};
+use crate::provider::ProviderId;
+
+/// One provider usage attempt and whether it ended because of a timeout.
+#[derive(Debug, Clone)]
+pub struct ProviderCollection {
+    /// The provider's structured answer.
+    pub outcome: ProviderUsage,
+    /// Whether a bounded attempt timed out and should be retried.
+    pub timed_out: bool,
+}
 
 /// What a provider can say about its own allowance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsageReport {
     /// The provider the report is about.
     pub provider: ProviderId,
@@ -60,7 +71,7 @@ impl UsageReport {
 }
 
 /// One quota window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuotaWindow {
     /// The label the window is printed under.
     pub label: WindowLabel,
@@ -75,7 +86,7 @@ pub struct QuotaWindow {
 }
 
 /// The name of a quota window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 // The normalised model names every window kind a provider may report, so a
 // second provider does not have to change the model to add one. Only the
 // kinds a provider actually reports are built today.
@@ -108,7 +119,7 @@ impl WindowLabel {
 }
 
 /// A product's share of the same allowance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProductUsage {
     /// The product id, as the provider spells it.
     pub product: String,
@@ -119,7 +130,7 @@ pub struct ProductUsage {
 }
 
 /// Purchased credit.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Credits {
     /// A prepaid balance, in cents.
     pub prepaid_cents: Option<i64>,
@@ -133,7 +144,7 @@ pub struct Credits {
 ///
 /// An explicit state is the provider's answer, and it takes precedence over
 /// a calculated percentage.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 // The mechanism names every state a provider may report. Only the ones the
 // providers report today are built; the rest wait for a field that says so.
@@ -159,7 +170,7 @@ impl QuotaState {
 }
 
 /// What one provider had to say.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProviderUsage {
     /// The provider reported usage.
@@ -182,7 +193,7 @@ pub enum ProviderUsage {
         /// Where the user can see it, when there is such a place.
         hint: Option<String>,
         /// The error codes the provider does publish, when it publishes any.
-        signals: Vec<&'static str>,
+        signals: Vec<String>,
     },
     /// The attempt failed.
     Failed {
@@ -214,17 +225,6 @@ impl std::fmt::Display for UsageError {
 }
 
 impl std::error::Error for UsageError {}
-
-/// Ask a provider what it can say about its allowance.
-///
-/// The caller decides which providers to ask; this only routes the question
-/// to the provider that can answer it.
-pub fn collect(provider: ProviderId, runtime: &ProviderRuntime) -> ProviderUsage {
-    match provider {
-        ProviderId::Xai => xai::collect(runtime),
-        ProviderId::OpenAi => openai::collect(runtime),
-    }
-}
 
 /// Strip the proto enum prefix from a period type.
 ///

@@ -66,9 +66,17 @@ eggpass usage --provider xai          # query one provider
 eggpass usage --json                 # machine-readable report
 ```
 
-Queries provider usage directly, without needing the daemon. This is a fresh request, not a cached or polled reading. The report describes usage as reported by each provider. On the default xAI `api` upstream, the reported consumer-subscription quota is separate from inference requests, which are billed to the xAI API tier. The report's caption reflects the configured upstream. If quota is unavailable, the report may include the latest inference HTTP status kept by the daemon in memory. That endpoint reports only per-provider client-facing HTTP status codes, not prompts or response bodies.
+Queries provider usage directly, without needing the daemon. By default it queries only providers enabled in configuration. `--provider` can select one enabled provider; selecting a disabled provider, or running the command when none are enabled, returns an actionable configuration error. Human-readable output shows the percentage and bar for the allowance left, plus each available reset time and countdown; JSON preserves the provider-reported fields. On the default xAI `api` upstream, the reported consumer-subscription quota is separate from inference requests, which are billed to the xAI API tier. The report's caption reflects the configured upstream. If quota is unavailable, the report may include the latest inference HTTP status kept by the daemon in memory. That endpoint reports only per-provider client-facing HTTP status codes, not prompts or response bodies.
 
 **Exit codes:** `0` if at least one provider is signed in and not every selected provider failed operationally, `1` if every selected provider failed operationally, `2` if none is signed in.
+
+### Authenticated daemon endpoint: GET /v1/usage
+
+The daemon also serves `GET /v1/usage` for clients that need a usage report over HTTP. Send the configured or issued Eggpass client key in `Authorization: Bearer <key>` or `X-Api-Key: <key>`. The response body uses the same `{"providers":[...]}` JSON structure as `eggpass usage --json`; it includes only enabled providers. If every provider is disabled, the endpoint returns a completed empty list. OpenAI/ChatGPT usage is queried only when that provider is enabled; the optional Codex app-server result may describe a different account from Eggpass's inference credential.
+
+A complete report is retained only in daemon memory for 600 seconds from completion. Cache hits do not contact providers. A cold or expired request starts one shared refresh and its initiating client waits at most 30 seconds; if still running, that client receives `504` and the refresh continues. Other requests while it is active receive `202` with `Retry-After`. Timed-out providers alone are retried, for at most three retries after the initial attempt, spaced 5, 15, and 30 seconds apart. xAI usage HTTP requests have bounded 15-second request/body timeouts (and a 5-second connect cap); OAuth refresh requests have a 60-second total deadline, and the optional local Codex session has an 8-second deadline.
+
+On success, responses include `Cache-Control: private, no-store`, `X-Eggpass-Usage-Age` (integer seconds), and `X-Eggpass-Usage-Updated-At` (RFC 3339 UTC). `last_inference` is attached from the daemon's current in-memory state on each response. After all timeout retries fail, the last successful report is returned with `X-Eggpass-Usage-Stale: true` during a 600-second cooldown; if no successful report exists, the endpoint returns `503` with `Retry-After`. A process restart clears the snapshot and cooldown. There is no polling, disk persistence, or force-refresh operation.
 
 ## `run`, `stop`, and `restart`
 

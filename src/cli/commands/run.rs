@@ -210,7 +210,7 @@ fn serve(context: &Context) -> Result<(), CommandError> {
             ProviderHandle {
                 spec: runtime.spec,
                 upstream,
-                tokens: runtime.tokens,
+                tokens: std::sync::Arc::new(runtime.tokens),
             },
         );
     }
@@ -229,10 +229,48 @@ fn serve(context: &Context) -> Result<(), CommandError> {
             .map_err(|err| CommandError::new(err.to_string()))?,
     );
 
+    let usage_provider_ids: Vec<ProviderId> = ProviderId::all()
+        .into_iter()
+        .filter(|provider| providers.contains_key(provider))
+        .collect();
+    let usage_tokens: HashMap<ProviderId, std::sync::Arc<crate::auth::refresh::TokenManager>> =
+        providers
+            .iter()
+            .map(|(provider, handle)| (*provider, std::sync::Arc::clone(&handle.tokens)))
+            .collect();
+    let usage_xai_upstream = context.config.providers.xai.upstream;
+    let usage_timeouts = crate::provider::usage::report::bounded_timeouts(context.config.timeouts);
+    let usage_cache = std::sync::Arc::new(crate::server::usage::UsageCache::new(
+        usage_provider_ids,
+        move |provider| {
+            let tokens = usage_tokens
+                .get(&provider)
+                .expect("the usage provider is enabled in the daemon");
+            let codex = (provider == ProviderId::OpenAi)
+                .then(crate::provider::usage::codex_app_server::collect_detailed);
+            crate::provider::usage::report::collect_entry(
+                provider,
+                usage_xai_upstream,
+                tokens,
+                usage_timeouts,
+                codex,
+                crate::provider::usage::xai::BILLING_BASE_URL,
+            )
+        },
+    ));
+
+    let usage_key =
+        crate::usage_key::UsageKey::create(context.paths.usage_key_file()).map_err(|err| {
+            CommandError::new(format!(
+                "could not create the private daemon usage credential: {err}"
+            ))
+        })?;
+
     let server_context = Arc::new(ServerContext {
         host: context.config.host.clone(),
         port: context.config.port,
         api_key: context.config.api_key.clone(),
+        usage_key: usage_key.token().to_string(),
         keys,
         providers,
         default_provider,
@@ -242,6 +280,7 @@ fn serve(context: &Context) -> Result<(), CommandError> {
         // The status of the last inference to each provider, kept in memory
         // for `eggpass usage` to report.
         inferences: Arc::new(crate::inference::InferenceState::new()),
+        usage_cache,
     });
 
     daemon::write_info(
