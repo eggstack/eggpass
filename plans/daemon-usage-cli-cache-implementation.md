@@ -1,6 +1,6 @@
 # Reuse the daemon usage cache from the CLI
 
-**Status:** Local implementation and validation are complete. The latest Windows CI job passed on the prior commit, but the ACL implementation is not on that commit; ACL-specific CI validation remains pending.
+**Status:** Local implementation and validation are complete. Windows MSVC tests (including the current-user-only usage-key ACL test) and the Windows release build passed in [CI run #44588788169](https://github.com/eggstack/eggpass/actions/runs/44588788169) at commit `34ec6f52a2d42d10fbdef07e3d5ad5ef01f75162`.
 
 ## Goal
 
@@ -83,9 +83,9 @@ Refactor `eggpass usage` into a daemon-attempt phase followed by the existing di
 
 - Document that `eggpass usage` uses the daemon cache when available, that a separate private usage-only runtime key is generated/rotated, that it is not a regular API key, and that regular keys remain unchanged. Document stale/pending/cooldown and direct fallback behavior without exposing implementation tokens or implying that usage data is non-sensitive.
 - Update current daemon usage/auth and CLI command documentation; keep API response docs consistent with the already-implemented cache route.
-- Run formatting, workspace tests, strict Clippy, and `git diff --check`; add targeted server/auth/CLI tests. The existing Windows MSVC all-target job passed on commit `a626ef7561e096342a4d83f7d2ca452b9b52b873`, but `src/usage_key.rs` was absent from that commit, so the ACL test did not run there. Run the Windows job on a ref containing this implementation before checking the Windows acceptance item. Review only the scoped diff and preserve unrelated worktree changes; do not stage or commit unrelated files.
+- Run formatting, workspace tests, strict Clippy, and `git diff --check`; add targeted server/auth/CLI tests. The earlier Windows run #25 lacked `src/usage_key.rs`; the current run #44588788169 at `34ec6f52a2d42d10fbdef07e3d5ad5ef01f75162` passed the Windows ACL test and release build. Review only the scoped diff and preserve unrelated worktree changes; do not include unrelated files.
 
-**Exit:** docs match actual behavior; local formatting, workspace tests, Clippy, and diff checks pass. The prior Windows job passed, but Windows CI for the ACL implementation remains the final platform validation.
+**Exit:** docs match actual behavior; local formatting, workspace tests, Clippy, and diff checks pass. Windows ACL validation is complete: the Windows MSVC tests and release build passed on CI run #44588788169 for commit `34ec6f52a2d42d10fbdef07e3d5ad5ef01f75162`.
 
 ## Acceptance checklist
 
@@ -95,16 +95,16 @@ Refactor `eggpass usage` into a daemon-attempt phase followed by the existing di
 - [x] The usage-only secret is random, private, rotated per daemon start, and separate from config and regular keys.
 - [x] Exact secret grants only GET usage; it cannot authorize inference, another route, or wrong method, even if any illustrative prefix/suffix is removed.
 - [x] Regular client-key scope/behavior, key listing/revocation, startup key requirement, and loopback/authority protections are unchanged.
-- [ ] Windows file/directory access is protected by a current-user-only ACL; inability to protect the secret fails closed.
+- [x] Windows file/directory access is protected by a current-user-only ACL; inability to protect the secret fails closed.
 - [x] CLI text and JSON stdout remain compatible; stale-cache information is written to stderr only.
 - [x] Tests cover security and fallback behavior without live provider access; docs describe credential storage, scope, rotation, and fallback.
-- [x] Unrelated worktree changes remain untouched and unstaged.
+- [x] Unrelated auth/release work remained excluded from the clean PR branch.
 
 ## Completion record
 
-- Local macOS validation passed: cargo fmt --all -- --check; cargo test --workspace --all-targets --locked (422 tests); cargo clippy --workspace --all-targets --locked -- -D warnings; git diff --check.
-- GitHub Actions run [#25](https://github.com/eggstack/eggpass/actions/runs/44387410491) succeeded, including the [Windows MSVC tests and release build](https://github.com/eggstack/eggpass/actions/runs/44387410491/job/135095608545), at commit `a626ef7561e096342a4d83f7d2ca452b9b52b873`. The untracked `src/usage_key.rs` was absent from that SHA, so this run does not validate the usage-key ACL implementation. Local Windows cross-compilation also could not complete because this machine lacks the Windows target/toolchain headers; ACL-specific CI validation remains pending.
-- No changes were staged or committed; unrelated worktree changes were preserved.
+- Prior local macOS validation passed: cargo fmt --all -- --check; cargo test --workspace --all-targets --locked (422 tests); cargo clippy --workspace --all-targets --locked -- -D warnings; git diff --check. The clean PR worktree at `34ec6f52a2d42d10fbdef07e3d5ad5ef01f75162` separately passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --all-targets --locked` (391 tests), plus `git diff --check`.
+- Earlier Actions run [#25](https://github.com/eggstack/eggpass/actions/runs/44387410491) passed at `a626ef7561e096342a4d83f7d2ca452b9b52b873` but did not include `src/usage_key.rs`, so it was not ACL validation. Current [CI run #44588788169](https://github.com/eggstack/eggpass/actions/runs/44588788169) on draft PR [#5](https://github.com/eggstack/eggpass/pull/5), at `34ec6f52a2d42d10fbdef07e3d5ad5ef01f75162`, passed all jobs: release-workflow drift, Linux formatting/Clippy/tests/release build, and Windows MSVC tests/release build. The Windows log confirms `usage_key::tests::the_directory_and_secret_file_have_current_user_only_dacls ... ok`; the Windows test suite reported 378 passed. The first draft run caught missing CLI deserialization integration and Windows ACL test import/type errors; these were fixed before this successful run.
+- Draft PR [#5](https://github.com/eggstack/eggpass/pull/5) contains the usage CLI/cache feature stack and scoped usage credential; unrelated local auth/release work was excluded. No release was published or PR merged.
 
 ## Out of scope
 
