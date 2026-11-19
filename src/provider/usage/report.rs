@@ -1,6 +1,6 @@
 //! Shared machine-readable usage report assembly for the CLI and daemon API.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::refresh::TokenManager;
 use crate::config::{Timeouts, Upstream};
@@ -8,13 +8,13 @@ use crate::provider::usage::{ProviderUsage, UsageReport, xai};
 use crate::provider::{ProviderId, usage::codex_app_server::CodexCollection};
 
 /// One provider's answer, with the provider it belongs to.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ProviderEntry {
     pub provider: ProviderId,
     #[serde(flatten)]
     pub outcome: ProviderUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<&'static str>,
+    pub source: Option<String>,
     pub caption: Option<String>,
     pub last_inference: Option<u16>,
 }
@@ -102,7 +102,7 @@ pub(crate) fn collect_entry(
         entry: ProviderEntry {
             provider,
             outcome,
-            source,
+            source: source.map(str::to_owned),
             caption: (provider == ProviderId::Xai).then(|| xai::caption(xai_upstream).to_string()),
             last_inference: None,
         },

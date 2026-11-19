@@ -30,6 +30,16 @@ impl serde::Serialize for ProviderId {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for ProviderId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| serde::de::Error::custom("unknown provider"))
+    }
+}
+
 impl ProviderId {
     /// The identifier used in configuration and on disk.
     pub fn as_str(self) -> &'static str {

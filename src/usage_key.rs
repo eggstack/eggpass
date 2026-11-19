@@ -188,7 +188,7 @@ fn protect_path(path: &Path, directory: bool) -> io::Result<()> {
     use std::ffi::OsStr;
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
-    use std::ptr::{null, null_mut};
+    use std::ptr::null_mut;
 
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
@@ -196,8 +196,8 @@ fn protect_path(path: &Path, directory: bool) -> io::Result<()> {
         SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, EqualSid, GetTokenInformation,
-        PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
+        SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -407,15 +407,18 @@ mod tests {
 
     #[cfg(windows)]
     fn windows_acl_is_current_user_only(path: &Path, directory: bool) -> bool {
+        // ACCESS_ALLOWED_ACE_TYPE is 0 in the Win32 security API.
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
         use std::iter::once;
         use std::os::windows::ffi::OsStrExt;
         use std::ptr::null_mut;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::{
-            ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACL_SIZE_INFORMATION, AclSizeInformation,
-            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-            GetFileSecurityW, GetSecurityDescriptorDacl, GetTokenInformation, OBJECT_INHERIT_ACE,
-            TOKEN_QUERY, TOKEN_USER, TokenUser,
+            ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE,
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetFileSecurityW,
+            GetSecurityDescriptorDacl, GetTokenInformation, OBJECT_INHERIT_ACE, TOKEN_QUERY,
+            TOKEN_USER, TokenUser,
         };
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -523,8 +526,8 @@ mod tests {
         let user = unsafe { &*user_buffer.as_ptr().cast::<TOKEN_USER>() };
         let same_user = unsafe { EqualSid(ace_sid, user.User.Sid) } != 0;
         unsafe { CloseHandle(token) };
-        let expected_flags = if directory {
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        let expected_flags: u8 = if directory {
+            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
         } else {
             0
         };
