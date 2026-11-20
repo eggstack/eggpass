@@ -36,7 +36,7 @@ let _ = url_for_external_browser;
 - `OAuthProviderConfig::openai()` uses the `dynamic_agent_client` registration entrypoint, OpenAI resource parameters, and registration-only `agent_name_hint=eggpass`. OpenAI's issued ID is returned in `Credentials::client_id()` and should be persisted/reused. `openai_with_host_id(...)` adds a caller-owned stable `ext_agent_host_id`.
 - `OAuthProviderConfig::custom(...)` starts a builder for custom endpoints and scopes. Endpoints require HTTPS, except localhost/loopback HTTP for local tests. Add verification hosts before using device flow.
 
-Custom parameters should contain OAuth protocol parameters, not secrets. Profile and pending-authorization `Debug` output redacts IDs, parameter values, URLs, verifier, state, and nonce.
+Custom parameters should contain OAuth protocol parameters, not secrets. `Debug` output redacts client IDs and custom parameter values. `PendingAuthorization` also redacts its authorization URL, verifier, state, and nonce; provider issuer/endpoint URLs, configured scopes, callback paths, and the pending redirect URI are printed.
 
 ## Explicit token operations
 

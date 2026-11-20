@@ -8,7 +8,9 @@ publication.
 ## Prerequisites
 
 - Push access to `eggstack/eggpass` and permission to run GitHub Actions.
-- The repository secret `CARGO_REGISTRY_TOKEN` must contain a crates.io API token with the `publish` scope for `eggpass`. Do not put the token in a file, command line, or log.
+- The repository secret `CARGO_REGISTRY_TOKEN` must authorize publishing the
+  crates.io package being released (`eggpass` or `eggpass-auth`). Do not put
+  the token in a file, command line, or log.
 - The release workflow is generated from `release/eggpack/`. Its pinned Eggpack revision is in `release/eggpack/github-policy.json`; CI checks the generated workflow for drift.
 
 ## Release identity and assets
@@ -134,3 +136,25 @@ sign the manifest or binaries.
   manifest checks.
 - Never move or overwrite an existing published tag or release. A published
   crate version cannot be replaced; fixes require a new version.
+
+## Independently versioned auth releases
+
+### Rust crate
+
+`eggpass-auth` in `crates/eggpass-auth/Cargo.toml` is versioned separately from
+the Eggpass CLI. Its release tag is `eggpass-auth-vX.Y.Z`. The
+`publish-eggpass-auth.yml` workflow checks the tag against the crate version
+and runs `cargo package`. A manual dispatch on an auth tag is verification-only;
+crates.io publication runs only after a human publishes a GitHub release for
+that exact tag. Publish the crate before the next Eggpass crates.io release
+that depends on it, so Cargo can resolve the dependency.
+
+### Python distribution
+
+The Python package in `python/eggpass-auth` has its own version and uses the
+`eggpass-auth-python-vX.Y.Z` tag. Keep `pyproject.toml` and its `Cargo.toml`
+versions equal. The PyPI workflow validates five stable-ABI wheels (Linux
+x86_64/aarch64, macOS x86_64/arm64, Windows x86_64) and an sdist; CI tests
+them on CPython 3.11–3.15. Configure the PyPI Trusted Publisher and protected
+GitHub `pypi` environment before first publication. A published matching GitHub
+release triggers the verified-files publish job using PyPI Trusted Publishing.

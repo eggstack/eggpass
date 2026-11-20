@@ -6,6 +6,11 @@ Notable changes to eggpass are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Add the independently versioned async `eggpass-auth` Rust library and its
+  Python `asyncio` bindings.
+
 ## [0.1.2] - 2026-11-20
 
 ### Added
