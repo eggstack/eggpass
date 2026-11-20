@@ -29,7 +29,10 @@
 //! The [`PendingAuthorization`] value keeps the PKCE verifier, state, and nonce
 //! private and redacts them in `Debug`. Call [`OAuthClient::complete_authorization`]
 //! with the full callback URL to validate origin, exact path, state, and the
-//! returned ID-token nonce before credentials are released.
+//! returned ID-token nonce before credentials are released. Interactive callers
+//! that may retry user input can first call
+//! [`OAuthClient::validate_authorization_callback`] with a borrowed pending
+//! transaction; invalid input then leaves the transaction available.
 //!
 //! # Device authorization
 //!
