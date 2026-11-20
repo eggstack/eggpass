@@ -1,0 +1,23 @@
+[package]
+name = "eggpass-auth-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Python asyncio bindings for eggpass-auth"
+license = "MIT"
+repository = "https://github.com/eggstack/eggpass"
+documentation = "https://github.com/eggstack/eggpass/tree/main/python/eggpass-auth"
+
+[workspace]
+members = [".", "vendor/eggpass-auth"]
+resolver = "3"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+eggpass-auth = { path = "vendor/eggpass-auth" }
+pyo3 = { version = "=0.30.1", features = ["abi3-py311"] }
+pyo3-async-runtimes = { version = "=0.30.0", features = ["tokio-runtime"] }
+serde_json = "1.0"

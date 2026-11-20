@@ -26,6 +26,9 @@ out/
 # Dependencies
 node_modules/
 vendor/
+!python/eggpass-auth/vendor/
+!python/eggpass-auth/vendor/eggpass-auth/
+!python/eggpass-auth/vendor/eggpass-auth/**
 __pycache__/
 *.py[cod]
 .venv/

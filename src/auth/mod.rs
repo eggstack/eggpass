@@ -9,9 +9,9 @@
 //! Everything provider-specific lives in [`crate::provider`]; this module
 //! holds the machinery that is the same for every provider.
 
+pub mod bridge;
 pub mod client;
 pub mod flow;
-pub mod pkce;
 pub mod refresh;
 pub mod store;
 

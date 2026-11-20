@@ -153,7 +153,7 @@ eggpass croncheck
 
 ```sh
 eggpass update              # install the latest release
-eggpass update 0.2.0        # install an exact version
+eggpass update 0.1.0        # install an exact version
 eggpass update --check      # report the plan without changing files
 ```
 

@@ -28,13 +28,21 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run the tests
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
+
+      - name: Package eggpass-auth
+        run: cargo package --locked --allow-dirty -p eggpass-auth
+
+      - name: Package eggpass
+        run: >-
+          cargo package --locked --allow-dirty -p eggpass
+          --config 'patch.crates-io.eggpass-auth.path="crates/eggpass-auth"'
 
       - name: Build the release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
   windows-msvc:
     name: Windows MSVC tests and release build

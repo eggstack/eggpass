@@ -92,7 +92,7 @@ Use `eggpass host` and `eggpass port` to change a live server's address. These c
 | `eggpass.pid` | Daemon process ID and the address and port it serves. |
 | `eggpass.log` | Daemon log. |
 
-The data directory and `credentials` directory are restricted to mode `0700`; credential and key files use `0600` on Unix-like systems. Keep any custom config file containing `api_key` private too.
+The data directory and `credentials` directory are restricted to mode `0700`; credential and key files use `0600` on Unix-like systems. On Windows, daemon startup applies protected current-user-only ACLs to the data directory and `usage.key`, and fails closed if that protection cannot be established. A crash or forced termination may leave a stale `usage.key`; the next daemon start replaces it before serving. Keep any custom config file containing `api_key` private too.
 
 With the default data directory, xAI credentials may be read from `~/.grok/auth.json` when `credentials/xai.json` is absent. If an imported refresh token is rotated, eggpass stores its replacement in its own credential file; the Grok CLI's original file is not updated. Setting `EGGPASS_HOME` disables this import to keep the relocated installation isolated.
 

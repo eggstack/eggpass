@@ -18,16 +18,18 @@ need a separate provider API key.
 
 ## Install
 
+Install the published CLI from crates.io:
+
 ```sh
-cargo install eggpass --git https://github.com/eggstack/eggpass
+cargo install eggpass
 ```
 
-Or install from a local checkout:
+To build the current repository checkout instead:
 
 ```sh
 git clone https://github.com/eggstack/eggpass
 cd eggpass
-cargo install --path .
+cargo install --path . --locked --force
 ```
 
 ## Quick start
@@ -126,7 +128,7 @@ cleared when the daemon stops.
 | `eggpass usage` | Show subscription usage where available, preferring the running daemon's cached report. |
 | `eggpass run` | Start the server. Use `--foreground` to keep it in the terminal. |
 | `eggpass stop` / `restart` | Stop or restart the server. |
-| `eggpass port` / `host` | Show or change the listen address. Changes restart the server. |
+| `eggpass port` / `host` | Show or change the listen address. Changes restart a running server; when stopped, they take effect at the next start. |
 | `eggpass key` | Add, list, or revoke client keys. |
 | `eggpass edit` | Edit the config file. |
 | `eggpass croncheck` | Start the server if it is not running. |

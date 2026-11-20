@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/eggpass-auth"]
+resolver = "3"
+
 [package]
 name = "eggpass"
 version = "0.1.2"
@@ -9,7 +13,7 @@ readme = "README.md"
 repository = "https://github.com/eggstack/eggpass"
 documentation = "https://docs.rs/eggpass"
 keywords = ["grok", "chatgpt", "openai", "proxy", "oauth"]
-categories = ["command-line-utilities", "api-bindings"]
+categories = ["command-line-utilities"]
 
 # The published crate carries the source and the documentation, and nothing
 # else: no CI definitions, no live-verification script, no build output.
@@ -28,6 +32,7 @@ include = [
 ]
 
 [dependencies]
+eggpass-auth = { version = "0.1.0", path = "crates/eggpass-auth" }
 base64 = "0.23.1"
 dirs = "7.0.0"
 # Self-update mechanics. Acquisition, transport, release-manifest projection,
@@ -60,6 +65,7 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 signal-hook = "0.4.6"
 toml = "1.2.1"
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 ureq = "3.5.2"
 # WHATWG parser for the device-flow URL check. Pinned to the copy already
 # in Cargo.lock; the check is the parser, so do not bump it in passing.

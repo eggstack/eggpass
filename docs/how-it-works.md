@@ -37,7 +37,11 @@ clients.
 
 Client keys are separate from provider credentials. `eggpass key add` shows a
 key once and stores only a salted hash. The key is checked locally on each
-request. Add or revoke issued keys without restarting the server.
+request. Add or revoke issued keys without restarting the server. The CLI's
+usage request uses a separate private runtime Bearer credential, generated for
+each daemon start and accepted only for a bodyless `GET /v1/usage`. It is not
+stored in config or the regular key store, cannot authorize inference or other
+routes, and cannot satisfy the regular-key startup requirement.
 
 ## Model routing and discovery
 

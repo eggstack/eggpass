@@ -314,6 +314,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "eggfetch-core"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c22bdfc6ab683ddf5d5fcf0321b60dfc86c0ec1311284a33c31f536d12c1d2ae"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "getrandom 0.2.17",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "pem-rfc7468",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustls",
+ "rustls-native-certs",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "eggfetch-http-connect"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,6 +372,7 @@ dependencies = [
  "base64",
  "daemonize",
  "dirs",
+ "eggpass-auth",
  "eggup-acquisition",
  "eggup-core",
  "eggup-eggfetch",
@@ -353,11 +385,28 @@ dependencies = [
  "sha2 0.11.1",
  "signal-hook",
  "tempfile",
+ "tokio",
  "toml",
  "ureq",
  "url",
  "webbrowser",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "eggpass-auth"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "eggfetch-core 0.3.0",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "url",
 ]
 
 [[package]]
@@ -395,7 +444,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fc8f6480cd6717ed854ac764d0cfc18c6325b7367940149ea2f45f2d5658721"
 dependencies = [
- "eggfetch-core",
+ "eggfetch-core 0.2.2",
  "eggup-acquisition",
  "futures-util",
  "tokio",
@@ -501,6 +550,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
+
+[[package]]
 name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -513,6 +579,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -1508,6 +1575,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "pin-project-lite",
  "tokio",
 ]
 

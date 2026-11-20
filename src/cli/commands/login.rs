@@ -59,7 +59,9 @@ pub fn login(
     // sign-in and reused afterwards, so the same registration is kept.
     ensure_host_id(context, provider)?;
 
-    let outcome = login_with_fallback(&runtime, flow)?;
+    let existing = store::load(&context.paths.credential_file(provider.as_str()))
+        .map_err(|err| CommandError::new(format!("could not read the credentials: {err}")))?;
+    let outcome = login_with_fallback(&runtime, flow, existing.as_ref())?;
 
     let path = context.paths.credential_file(provider.as_str());
     store::save(&path, &outcome.auth)
@@ -101,14 +103,16 @@ enum Flow {
 fn login_with_fallback(
     runtime: &ProviderRuntime,
     flow: Flow,
+    existing: Option<&store::StoredAuth>,
 ) -> Result<LoginOutcome, CommandError> {
-    match attempt(runtime, flow) {
+    match attempt(runtime, flow, existing) {
         Ok(outcome) => Ok(outcome),
         // The device endpoint is not published to every client. The official
         // Grok CLI falls back to the browser in exactly the same way.
         Err(FlowError::DeviceUnavailable) if flow == Flow::Device => {
             eprintln!("The device-code flow is unavailable; falling back to the browser login.");
-            attempt(runtime, Flow::Browser).map_err(|err| CommandError::new(err.to_string()))
+            attempt(runtime, Flow::Browser, existing)
+                .map_err(|err| CommandError::new(err.to_string()))
         }
         Err(err) if is_retryable(&err) && runtime.spec.id == ProviderId::Xai => {
             eprintln!("The login was refused; retrying with the official client settings.");
@@ -120,15 +124,20 @@ fn login_with_fallback(
                 .map(|scope| scope.to_string())
                 .collect();
             let client = crate::auth::OAuthClient::for_provider(&spec, runtime.client.client_id());
-            attempt_with(&spec, &client, flow).map_err(|err| CommandError::new(err.to_string()))
+            attempt_with(&spec, &client, flow, existing)
+                .map_err(|err| CommandError::new(err.to_string()))
         }
         Err(err) => Err(CommandError::new(err.to_string())),
     }
 }
 
 /// Run one attempt of the chosen flow.
-fn attempt(runtime: &ProviderRuntime, flow: Flow) -> Result<LoginOutcome, FlowError> {
-    attempt_with(&runtime.spec, &runtime.client, flow)
+fn attempt(
+    runtime: &ProviderRuntime,
+    flow: Flow,
+    existing: Option<&store::StoredAuth>,
+) -> Result<LoginOutcome, FlowError> {
+    attempt_with(&runtime.spec, &runtime.client, flow, existing)
 }
 
 /// Run one attempt with an explicit spec and client.
@@ -136,10 +145,11 @@ fn attempt_with(
     spec: &crate::provider::ProviderSpec,
     client: &crate::auth::OAuthClient,
     flow: Flow,
+    existing: Option<&store::StoredAuth>,
 ) -> Result<LoginOutcome, FlowError> {
     match flow {
-        Flow::Device => flow::login_device(spec, client),
-        Flow::Browser => flow::login_loopback(spec, client, None),
+        Flow::Device => flow::login_device(spec, client, existing),
+        Flow::Browser => flow::login_loopback(spec, client, existing),
     }
 }
 
