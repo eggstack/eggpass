@@ -283,9 +283,9 @@ dependencies = [
 
 [[package]]
 name = "eggfetch-core"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27463e41d20019d7f1dd877ab2e71d49db14a01e2781766ecc2ef112421e4055"
+checksum = "c22bdfc6ab683ddf5d5fcf0321b60dfc86c0ec1311284a33c31f536d12c1d2ae"
 dependencies = [
  "base64",
  "bytes",
@@ -314,41 +314,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "eggfetch-core"
+name = "eggfetch-http-connect"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c22bdfc6ab683ddf5d5fcf0321b60dfc86c0ec1311284a33c31f536d12c1d2ae"
-dependencies = [
- "base64",
- "bytes",
- "futures-core",
- "futures-util",
- "getrandom 0.2.17",
- "http",
- "http-body",
- "http-body-util",
- "httpdate",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "pem-rfc7468",
- "percent-encoding",
- "pin-project-lite",
- "rustls",
- "rustls-native-certs",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tower-service",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "eggfetch-http-connect"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc41df795f7b7152912bc8fccf424c58ceb76da83eed31096edaef2a9340d5f"
+checksum = "b57fad98d6848005a223343d13f4438c5829691281eabf7900ab71ce8635faf2"
 dependencies = [
  "base64",
  "thiserror",
@@ -398,7 +367,7 @@ name = "eggpass-auth"
 version = "0.1.0"
 dependencies = [
  "base64",
- "eggfetch-core 0.3.0",
+ "eggfetch-core",
  "rand",
  "serde",
  "serde_json",
@@ -440,11 +409,11 @@ dependencies = [
 
 [[package]]
 name = "eggup-eggfetch"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fc8f6480cd6717ed854ac764d0cfc18c6325b7367940149ea2f45f2d5658721"
+checksum = "2ca53436f6f12ca3ae0a9d194e81a6af6bf04fadf2d90b49d866359ab9eab2dc"
 dependencies = [
- "eggfetch-core 0.2.2",
+ "eggfetch-core",
  "eggup-acquisition",
  "futures-util",
  "tokio",
