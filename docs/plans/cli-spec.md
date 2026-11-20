@@ -661,26 +661,31 @@ be read or written, or the arguments were wrong.
 Report how much of the subscription allowance remains.
 
 ```
-eggpass usage                  # every provider you are signed in to
+eggpass usage                  # every enabled provider
 eggpass usage --provider xai   # one provider
 eggpass usage --json           # the report as JSON
 ```
 
 **Behaviour**
 
-1. **One fresh read per provider.** Each provider is asked once, on this run,
-   and the command ends. There is no polling, no cache, and no background
-   refresh: a cached reading is a number that might be wrong, and this command
-   exists to be right.
-2. **No daemon is needed.** The credential file is read and the provider is
-   asked directly, exactly as `status`'s model count does. The command works
-   with the proxy stopped.
-3. **No state of its own.** `usage` writes no cache, no config and no key
-   store. It may *trigger* a token refresh — that is the `TokenManager`'s job,
-   and it writes the credential file — but it adds nothing of its own. It does
-   **read** the daemon's memory, over the loopback socket.
-4. **A provider that is not signed in still gets a block**, so the output does
-   not change shape, and no network call is made for it.
+1. **Prefer the daemon report.** The CLI asks the running daemon for
+   `GET /v1/usage`, which returns a fresh cached snapshot when available or
+   starts a shared, demand-triggered refresh when the snapshot is cold or
+   expired. The report cache lives in daemon memory for 600 seconds.
+2. **Direct collection is a compatibility fallback.** It is used when the
+   daemon is stopped or stale, the private runtime usage credential is missing
+   or unreadable, or an older daemon returns `404`. After a transport failure,
+   the CLI falls back only if a state recheck confirms the daemon is stopped or
+   stale; other daemon errors and invalid reports are surfaced.
+3. **No persistent report cache of its own.** The CLI does not save usage
+   reports. The daemon cache is process-local and disappears on restart. The
+   separate runtime `usage.key` credential is generated for each daemon start;
+   direct collection may refresh provider OAuth credentials through the
+   existing token manager.
+4. **Every enabled provider gets an entry.** A provider without Eggpass
+   credentials is still represented. When OpenAI is enabled, the optional
+   local Codex app-server can supply its own report before the Eggpass
+   credential check; that report may describe a separate account.
 5. **A provider that fails still gets a block**, and the failure is stated
    rather than swallowed. The upstream body is never printed: it carries the
    account's email, its user id and its balances.
@@ -734,18 +739,19 @@ ChatGPT
   the consumer subscription the billing endpoint reports. The caption says
   which pool the number belongs to, and it changes with
   `providers.xai.upstream`.
-- **ChatGPT is unavailable, and says why.** Sign in with ChatGPT exposes no
-  quota API, so the block names the authentication mode, says where the quota
-  would have come from, links OpenAI's own usage page, and lists the three
-  error codes OpenAI does publish. It never infers a number.
+- **ChatGPT OAuth has no quota API.** Without an optional local Codex
+  app-server report, the block explains that limit, links OpenAI's usage page,
+  and lists the documented error signals; it never infers a quota. When the
+  OpenAI provider is enabled, the local Codex app-server may supply a report
+  from a separate account.
 - **The last inference is shown when the quota could not be read.** The
   `Inference` row says what the last inference to that provider was answered
   with — `succeeded`, or `failed (429)`. It is the only evidence there is
   about an account whose quota cannot be read, so a block that already carries
   a percentage does not repeat it.
-- **Nothing is kept on disk.** The daemon holds one number per provider in
-  memory and writes nothing: no file, no log, no history. A record that
-  outlived the process would be a history of what the user asked for.
+- **Usage reports are not persisted.** The daemon caches complete provider
+  entries in process memory only; report contents are not written to disk or
+  logs, and the snapshot is cleared when the daemon stops.
 
 **The last inference**
 
@@ -807,6 +813,7 @@ in on this machine.
 | --- | --- | --- |
 | `~/.config/eggpass/config.toml` | User-editable config | `0644` |
 | `~/.config/eggpass/keys.json` | The keys `eggpass` issued — salted hashes, never the keys | `0600` |
+| `~/.config/eggpass/usage.key` | Daemon-generated Bearer credential restricted to bodyless `GET /v1/usage` | `0600` / owner-only ACL |
 | `~/.config/eggpass/credentials/xai.json` | x.ai OAuth tokens | `0600` (dir `0700`) |
 | `~/.config/eggpass/credentials/openai.json` | ChatGPT OAuth tokens, issued client id, host id | `0600` (dir `0700`) |
 | `~/.config/eggpass/eggpass.pid` | Daemon PID, the host it bound and the port it is serving | `0644` |
@@ -860,7 +867,7 @@ write_timeout_seconds = 600 # how long a single write may stall
 
 [update]
 repository = "eggstack/eggpass"
-manifest_name = "eggpass-release-manifest.json"
+manifest_name = "release-manifest.json"
 
 [providers.xai]
 enabled = true

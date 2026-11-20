@@ -6,6 +6,22 @@ Notable changes to eggpass are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-20
+
+### Added
+
+- Add an authenticated `GET /v1/usage` endpoint with an in-memory report
+  cache and bounded, demand-triggered refresh.
+- Make `eggpass usage` reuse the daemon's cached report when available, while
+  retaining guarded direct-collection fallback.
+- Add optional usage reporting from the local Codex app-server for the enabled
+  OpenAI provider; this may describe a separate account.
+
+### Security
+
+- Generate a daemon runtime credential for the usage endpoint, separate from
+  regular client keys and restricted to bodyless `GET /v1/usage`.
+
 ## [0.1.1] - 2026-11-16
 
 ### Added
@@ -86,6 +102,7 @@ First release of the local OpenAI-compatible proxy for Grok and ChatGPT.
 - The project was renamed from `grokproxy` to `eggpass`. Existing data is
   copied to `~/.config/eggpass`; the old directory is left in place.
 
-[Unreleased]: https://github.com/eggstack/eggpass/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/eggstack/eggpass/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/eggstack/eggpass/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/eggstack/eggpass/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/eggstack/eggpass/releases/tag/v0.1.0

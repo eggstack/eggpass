@@ -1,8 +1,8 @@
 //! `eggpass usage`.
 //!
-//! One fresh read per provider, normalised, printed, and done. The command
-//! needs no daemon: it reads the credential file and talks to the provider
-//! directly, exactly as `status`'s model count does.
+//! The command first reads the running daemon's in-memory report using its
+//! private usage-only credential. When the daemon is unavailable or uses an
+//! older API, it falls back to direct provider collection.
 //!
 //! The output is `status`'s: a label column, aligned, greppable, no colour.
 //! It is meant to be piped and diffed.
