@@ -741,39 +741,37 @@ fn render_reported(
 
         // An explicit state is the provider's answer, and it replaces the
         // percentage entirely.
-        if let Some(state) = &report.state {
-            out.push_str(&field(&label, state.display()));
-            out.push('\n');
+        let reset_suffix = window
+            .resets_at
+            .map(|resets_at| {
+                // Use the offset in force at the reset instant, including
+                // when the reset crosses a daylight-saving change.
+                let offset = timeutil::local_offset_seconds(resets_at).unwrap_or(0);
+                let timestamp = reset_text(resets_at, now, offset);
+                match reset_countdown(resets_at, now) {
+                    Some(remaining) => format!(" [Reset] {remaining}, {timestamp}"),
+                    None => format!(" [Reset] {timestamp}"),
+                }
+            })
+            .unwrap_or_default();
+
+        // Keep reset details beside the window they describe. The bar and
+        // percentage show allowance remaining.
+        let value = if let Some(state) = &report.state {
+            format!("{}{reset_suffix}", state.display())
         } else {
             match window.used_percent {
                 Some(percent) => {
                     let left = left_percent(percent);
-                    out.push_str(&field(
-                        &label,
-                        &format!("{}  {} left", bar(left), percent_text(left)),
-                    ));
+                    format!("{}  {}{}", bar(left), percent_text(left), reset_suffix)
                 }
                 // No bar at all: a bar with a question mark in it would be a
                 // number we do not have.
-                None => out.push_str(&field(&label, "unavailable")),
+                None => format!("unavailable{reset_suffix}"),
             }
-            out.push('\n');
-        }
-
-        // A window with no reset time gets no reset line. `Resets
-        // unavailable` would be noise.
-        if let Some(resets_at) = window.resets_at {
-            // The offset is the one in force at the reset instant, so a
-            // reset on the far side of a daylight-saving change is right.
-            let offset = timeutil::local_offset_seconds(resets_at).unwrap_or(0);
-            let mut reset = reset_text(resets_at, now, offset);
-            if let Some(remaining) = reset_countdown(resets_at, now) {
-                reset.push_str(" · in ");
-                reset.push_str(&remaining);
-            }
-            out.push_str(&field("Resets", &reset));
-            out.push('\n');
-        }
+        };
+        out.push_str(&field(&label, &value));
+        out.push('\n');
     }
 
     // An explicit state is the provider's answer, and it replaces every
@@ -1170,7 +1168,7 @@ mod tests {
     #[test]
     fn a_tiny_remaining_percentage_does_not_contradict_its_bar() {
         // When almost all the allowance is used, a remainder that rounds to
-        // zero reads `0% left` and has an empty bar.
+        // zero reads `0%` and has an empty bar.
         let left = left_percent(99.96);
         assert_eq!(percent_text(left), "0%");
         assert_eq!(bar(left).chars().filter(|c| *c == FILLED).count(), 0);
@@ -1396,7 +1394,7 @@ mod tests {
     #[test]
     fn the_bar_and_percentage_show_remaining_allowance() {
         let text = render(&[entry(reported(Some(40.0)))]);
-        assert!(text.contains(&format!("{}  60% left", bar(60.0))), "{text}");
+        assert!(text.contains(&format!("{}  60%", bar(60.0))), "{text}");
         assert!(!text.contains("40% used"), "{text}");
     }
 
@@ -1454,8 +1452,9 @@ mod tests {
         let text = render(&[entry(ProviderUsage::Reported { report })]);
 
         // Every labelled line puts its value in the same column: two spaces of
-        // indent, then the label padded to the label width.
-        for label in ["Weekly", "Resets", "Prepaid"] {
+        // indent, then the label padded to the label width. Reset details share
+        // the window line rather than getting their own label.
+        for label in ["Weekly", "Prepaid"] {
             let line = text
                 .lines()
                 .find(|line| line.starts_with(&format!("  {label}")))
@@ -1463,6 +1462,15 @@ mod tests {
             let value = &line[2 + LABEL_WIDTH..];
             assert!(!value.starts_with(' '), "{value:?} in {line}");
         }
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("  Weekly") && line.contains("[Reset]")),
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("  Resets")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1637,7 +1645,7 @@ mod tests {
         };
         let text = render(std::slice::from_ref(&entry));
         assert!(text.contains("5-hour"), "{text}");
-        assert!(text.contains("75% left"), "{text}");
+        assert!(text.contains("75%"), "{text}");
         assert!(!text.contains("codex Primary"), "{text}");
         assert!(!text.contains("Duration"), "{text}");
         assert!(text.contains("Source      Codex app-server"), "{text}");
@@ -1690,8 +1698,12 @@ mod tests {
         let text = render(&[entry(ProviderUsage::Reported { report })]);
 
         assert!(text.contains("Weekly"), "{text}");
-        assert!(text.contains("99% left"), "{text}");
-        assert!(text.contains("in 3d 15hr"), "{text}");
+        assert!(text.contains("99% [Reset] 3d 15hr, "), "{text}");
+        assert!(!text.contains("in 3d 15hr"), "{text}");
+        assert!(
+            !text.lines().any(|line| line.starts_with("  Resets")),
+            "{text}"
+        );
         assert!(!text.contains("5-hour"), "{text}");
         assert!(!text.contains("7-day"), "{text}");
     }
@@ -1733,11 +1745,11 @@ mod tests {
         let text = render(&[entry(ProviderUsage::Reported { report })]);
 
         assert!(text.contains("5-hour"), "{text}");
-        assert!(text.contains("31% left"), "{text}");
+        assert!(text.contains("31% [Reset] 3hr 21m, "), "{text}");
         assert!(text.contains("7-day"), "{text}");
-        assert!(text.contains("5% left"), "{text}");
-        assert!(text.contains("in 3hr 21m"), "{text}");
-        assert!(text.contains("in 3d 15hr"), "{text}");
+        assert!(text.contains("5% [Reset] 3d 15hr, "), "{text}");
+        assert!(!text.contains("in 3hr 21m"), "{text}");
+        assert!(!text.contains("in 3d 15hr"), "{text}");
         assert!(!text.contains("Primary"), "{text}");
         assert!(!text.contains("Secondary"), "{text}");
         assert!(!text.contains("Duration"), "{text}");
