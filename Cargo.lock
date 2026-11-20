@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "eggpass"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "daemonize",

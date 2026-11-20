@@ -125,7 +125,7 @@ cleared when the daemon stops.
 | `eggpass login` | Sign in to a provider. |
 | `eggpass logout` | Revoke and remove a provider credential. |
 | `eggpass status` | Show provider login and server state. |
-| `eggpass usage` | Show remaining subscription usage where available. |
+| `eggpass usage` | Show subscription usage where available, preferring the running daemon's cached report. |
 | `eggpass run` | Start the server. Use `--foreground` to keep it in the terminal. |
 | `eggpass stop` / `restart` | Stop or restart the server. |
 | `eggpass port` / `host` | Show or change the listen address. Changes restart a running server; when stopped, they take effect at the next start. |
