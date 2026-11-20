@@ -78,11 +78,45 @@ pub(crate) fn begin_authorization(
     })
 }
 
+struct ValidatedAuthorizationCallback {
+    code: String,
+    client_id: String,
+    scope: Option<String>,
+}
+
+/// Validate a callback without consuming its pending transaction.
+///
+/// Interactive callers can use this before accepting user-supplied callback
+/// input, leaving the transaction available when the input needs to be retried.
+pub(crate) fn validate_authorization_callback(
+    client: &OAuthClient,
+    pending: &PendingAuthorization,
+    callback_url: &str,
+) -> Result<()> {
+    parse_authorization_callback(client, pending, callback_url).map(|_| ())
+}
+
 pub(crate) async fn complete_authorization(
     client: &OAuthClient,
     pending: PendingAuthorization,
     callback_url: &str,
 ) -> Result<Credentials> {
+    let callback = parse_authorization_callback(client, &pending, callback_url)?;
+    complete_pending_authorization(
+        client,
+        pending,
+        callback.code,
+        callback.client_id,
+        callback.scope,
+    )
+    .await
+}
+
+fn parse_authorization_callback(
+    client: &OAuthClient,
+    pending: &PendingAuthorization,
+    callback_url: &str,
+) -> Result<ValidatedAuthorizationCallback> {
     let callback = url::Url::parse(callback_url).map_err(|_| Error::CallbackMismatch)?;
     let redirect = url::Url::parse(&pending.redirect_uri).map_err(|_| Error::CallbackMismatch)?;
     if callback.path() != client.provider.callback_path
@@ -128,9 +162,13 @@ pub(crate) async fn complete_authorization(
             pending.client_id.clone()
         }
     };
-    let callback_scope = unique_query_value(&callback, "scope")?;
+    let scope = unique_query_value(&callback, "scope")?;
 
-    complete_pending_authorization(client, pending, code, client_id, callback_scope).await
+    Ok(ValidatedAuthorizationCallback {
+        code,
+        client_id,
+        scope,
+    })
 }
 
 pub(crate) async fn complete_authorization_with_code(
@@ -363,6 +401,34 @@ mod tests {
                 assert!(matches!(error, Error::InvalidResponse(_)));
             }
         }
+    }
+
+    #[test]
+    fn callback_validation_can_be_retried_without_consuming_the_transaction() {
+        let client = OAuthClient::new(Client::new(), OAuthProviderConfig::openai());
+        let redirect = "http://127.0.0.1:45678/auth/callback";
+        let pending = client.begin_authorization(redirect, None).unwrap();
+        let state = pending.state.clone();
+
+        let wrong_state = format!("{redirect}?code=code&state=wrong&client_id=issued-client");
+        assert!(matches!(
+            client.validate_authorization_callback(&pending, &wrong_state),
+            Err(Error::StateMismatch)
+        ));
+
+        let missing_issued_id = format!("{redirect}?code=code&state={state}");
+        assert!(matches!(
+            client.validate_authorization_callback(&pending, &missing_issued_id),
+            Err(Error::InvalidResponse(_))
+        ));
+
+        let valid =
+            format!("{redirect}?code=code&state={state}&client_id=issued-client&scope=openid");
+        assert!(
+            client
+                .validate_authorization_callback(&pending, &valid)
+                .is_ok()
+        );
     }
 
     #[test]

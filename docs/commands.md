@@ -42,7 +42,7 @@ eggpass logout                         # choose a signed-in provider
 eggpass logout --provider openai
 ```
 
-Without `--provider`, `login` offers enabled providers and `logout` offers providers with stored credentials. x.ai uses the device-code flow by default when available; ChatGPT uses a browser flow. `--device` and `--oauth` cannot be combined. Signing in again replaces that provider's stored credentials.
+Without `--provider`, `login` offers enabled providers and `logout` offers providers with stored credentials. x.ai uses the device-code flow by default when available; ChatGPT uses a browser flow. If the browser cannot reach the callback listener (for example, when signing in from another computer), copy the entire callback URL from the browser address bar and paste it into the waiting CLI. ChatGPT requires the full URL, not only its authorization code. `--device` and `--oauth` cannot be combined. Signing in again replaces that provider's stored credentials.
 
 `logout` attempts provider-side revocation, then removes the local credential. Revocation is best-effort, so a failed revocation does not prevent local removal. A running server stays up, but requests to the signed-out provider will fail until you sign in again.
 

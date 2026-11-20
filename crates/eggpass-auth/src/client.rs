@@ -107,6 +107,18 @@ impl OAuthClient {
         crate::authorization::begin_authorization(self, redirect_uri, existing)
     }
 
+    /// Validate a full callback URL without consuming the pending transaction.
+    ///
+    /// Use this when callback input can be retried, such as a URL pasted into a
+    /// CLI. Completion performs the same validation again before exchanging it.
+    pub fn validate_authorization_callback(
+        &self,
+        pending: &PendingAuthorization,
+        callback_url: &str,
+    ) -> Result<()> {
+        crate::authorization::validate_authorization_callback(self, pending, callback_url)
+    }
+
     /// Complete a pending transaction from a full callback URL. This validates
     /// callback origin and exact path, state, and (when OpenID Connect is
     /// requested) ID-token nonce before returning credentials.

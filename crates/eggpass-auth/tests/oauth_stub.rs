@@ -289,6 +289,9 @@ async fn issued_client_id_is_exchanged_and_reused_after_registration() {
         .unwrap();
     let callback =
         format!("{redirect}?code=registration-code&state={state}&client_id=issued-client");
+    oauth
+        .validate_authorization_callback(&pending, &callback)
+        .unwrap();
     let credentials = oauth
         .complete_authorization(pending, &callback)
         .await

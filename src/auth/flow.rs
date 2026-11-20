@@ -65,7 +65,10 @@ impl std::fmt::Display for FlowError {
         match self {
             FlowError::Auth(err) => write!(f, "{err}"),
             FlowError::Timeout => {
-                write!(f, "timed out waiting for the browser to complete the login")
+                write!(
+                    f,
+                    "timed out waiting for the browser callback or a pasted response"
+                )
             }
             FlowError::StateMismatch => {
                 write!(
@@ -112,32 +115,20 @@ pub struct LoginOutcome {
     pub auth: StoredAuth,
 }
 
-/// What the callback carried.
-pub struct Callback {
-    /// The authorization code, when copied by the user or parsed from a callback.
-    pub code: String,
-    /// The client id the provider issued, when it issued one.
-    pub issued_client_id: Option<String>,
-    /// The scope the provider reported, when it reported one.
-    pub scope: Option<String>,
-    /// Raw callback request target, retained for library-side callback validation.
-    pub callback_target: Option<String>,
+/// A successful result from either callback transport.
+pub enum Callback {
+    /// The full callback URL, from the local listener or pasted by the user.
+    Url(String),
+    /// A code pasted by a provider with a fixed client ID.
+    Code(String),
 }
 
 impl std::fmt::Debug for Callback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Callback")
-            .field("code", &"<redacted>")
-            .field(
-                "issued_client_id",
-                &self.issued_client_id.as_ref().map(|_| "<redacted>"),
-            )
-            .field("scope", &self.scope)
-            .field(
-                "callback_target",
-                &self.callback_target.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
+        match self {
+            Self::Url(_) => f.write_str("Callback::Url(<redacted>)"),
+            Self::Code(_) => f.write_str("Callback::Code(<redacted>)"),
+        }
     }
 }
 
@@ -175,37 +166,41 @@ pub fn login_loopback(
         .ok_or(FlowError::Auth(AuthError::InvalidResponse))?;
     let url = pending.authorization_url().to_string();
 
-    // A pasted code can only be completed for a fixed-client-ID provider.
+    // A pasted code is supported only for fixed-client-ID providers. A full
+    // callback URL retains registration metadata for OpenAI's issued client ID.
     let allow_pasted_code = !spec.issues_client_id;
+    let pasted = watch_stdin_for_response();
 
     println!("Opening your browser to complete the login.");
     println!("If it does not open, visit this URL yourself:\n\n  {url}\n");
-    if allow_pasted_code {
+    if pasted.is_some() {
         println!(
-            "If the page shows a code to copy instead of redirecting, paste it here and press Enter."
+            "If the browser is on another machine or cannot reach this callback, copy the full callback URL from its address bar and paste it here."
         );
+        if allow_pasted_code {
+            println!("A standalone authorization code also works for this provider.");
+        } else {
+            println!("Paste the complete URL, not just the code.");
+        }
     }
     let _ = webbrowser::open(&url);
 
-    // A provider that shows a code to copy, rather than redirecting to the
-    // loopback, can still be finished by pasting the code back here. The
-    // official Grok CLI waits for the code from "loopback + stdin"; this is
-    // the same idea.
-    //
-    // It is only possible when the provider does not issue a client id of its
-    // own, because a pasted code carries no issued id to exchange.
-    let pasted = if allow_pasted_code {
-        watch_stdin_for_code()
-    } else {
-        None
-    };
-
-    let callback = wait_for_callback(listener, &state, spec.callback_path, pasted)?;
-    let credentials = if let Some(target) = &callback.callback_target {
-        let callback_url = format!("http://127.0.0.1:{port}{target}");
-        client.complete_authorization(pending, &callback_url)?
-    } else {
-        client.complete_authorization_with_code(pending, &callback.code)?
+    // Both transports use the same pending PKCE transaction. Validation is
+    // non-consuming, so a bad pasted URL leaves the listener and transaction
+    // available for another callback or paste.
+    let validate_callback_url =
+        |callback_url: &str| client.validate_authorization_callback(&pending, callback_url);
+    let callback = wait_for_callback(
+        listener,
+        &state,
+        spec.callback_path,
+        pasted,
+        allow_pasted_code,
+        validate_callback_url,
+    )?;
+    let credentials = match callback {
+        Callback::Url(callback_url) => client.complete_authorization(pending, &callback_url)?,
+        Callback::Code(code) => client.complete_authorization_with_code(pending, &code)?,
     };
 
     Ok(finish(spec, client, credentials, existing))
@@ -318,17 +313,24 @@ fn finish(
     LoginOutcome { auth }
 }
 
-/// Accept connections until the callback arrives, a code is pasted, or the
-/// deadline passes.
-fn wait_for_callback(
+/// Accept a loopback callback or a pasted response until the deadline passes.
+fn wait_for_callback<F>(
     listener: TcpListener,
     state: &str,
     callback_path: &str,
     pasted: Option<mpsc::Receiver<String>>,
-) -> Result<Callback, FlowError> {
+    allow_pasted_code: bool,
+    validate_callback_url: F,
+) -> Result<Callback, FlowError>
+where
+    F: Fn(&str) -> Result<(), AuthError>,
+{
     listener.set_nonblocking(true).map_err(|err| {
         FlowError::Io(format!("could not configure the callback listener: {err}"))
     })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|err| FlowError::Io(format!("could not read the callback address: {err}")))?;
 
     let deadline = Instant::now() + Duration::from_secs(super::CALLBACK_TIMEOUT_SECS);
 
@@ -337,22 +339,38 @@ fn wait_for_callback(
             return Err(FlowError::Timeout);
         }
 
-        // A pasted code takes the same path as a callback, minus the issued
-        // client id and scope, which only the callback carries.
+        // The input worker feeds this channel while the same loop continues to
+        // accept browser callbacks from the nonblocking listener.
         if let Some(pasted) = &pasted
             && let Ok(line) = pasted.try_recv()
         {
             let candidate = line.trim();
-            if looks_like_authorization_code(candidate) {
+            if looks_like_callback_url(candidate) {
+                match validate_callback_url(candidate) {
+                    Ok(()) => {
+                        println!("Using the callback URL you pasted.");
+                        return Ok(Callback::Url(candidate.to_string()));
+                    }
+                    Err(AuthError::ProviderDenied(error)) => {
+                        return Err(FlowError::Provider {
+                            error,
+                            description: None,
+                        });
+                    }
+                    Err(_) => println!(
+                        "That callback URL does not match this login. Paste the complete URL from the browser address bar."
+                    ),
+                }
+            } else if allow_pasted_code && looks_like_authorization_code(candidate) {
                 println!("Using the code you pasted.");
-                return Ok(Callback {
-                    code: candidate.to_string(),
-                    issued_client_id: None,
-                    scope: None,
-                    callback_target: None,
-                });
+                return Ok(Callback::Code(candidate.to_string()));
+            } else if !allow_pasted_code && looks_like_authorization_code(candidate) {
+                println!(
+                    "Paste the complete callback URL; the code alone is not enough for this provider."
+                );
+            } else {
+                println!("Paste the full callback URL from the browser address bar.");
             }
-            println!("That does not look like an authorization code. Ignoring it.");
         }
 
         match listener.accept() {
@@ -373,8 +391,7 @@ fn wait_for_callback(
 
                 // A connection is this login's result only when it carries
                 // the state we issued. Anything else is a local process
-                // poking the listener: answer and keep waiting. The page
-                // does not echo the query or the expected state.
+                // poking the listener: answer and keep waiting.
                 if params.get("state").map(String::as_str) != Some(state) {
                     respond(
                         &mut stream,
@@ -399,7 +416,7 @@ fn wait_for_callback(
                     });
                 }
 
-                let Some(code) = params.get("code") else {
+                let Some(_code) = params.get("code") else {
                     respond(
                         &mut stream,
                         400,
@@ -409,18 +426,24 @@ fn wait_for_callback(
                     return Err(FlowError::NoCode);
                 };
 
+                let callback_url = format!("http://{local_addr}{target}");
+                if validate_callback_url(&callback_url).is_err() {
+                    respond(
+                        &mut stream,
+                        400,
+                        "Login failed",
+                        "The login could not be verified. You can close this window.",
+                    )?;
+                    continue;
+                }
+
                 respond(
                     &mut stream,
                     200,
                     "Login complete",
                     "You are logged in. You can close this window and return to your terminal.",
                 )?;
-                return Ok(Callback {
-                    code: code.clone(),
-                    issued_client_id: params.get("client_id").cloned(),
-                    scope: params.get("scope").cloned(),
-                    callback_target: Some(target.to_string()),
-                });
+                return Ok(Callback::Url(callback_url));
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -434,12 +457,12 @@ fn wait_for_callback(
     }
 }
 
-/// Watch stdin for a pasted authorization code.
+/// Watch stdin for a pasted callback URL or fixed-client-ID authorization code.
 ///
 /// Returns `None` when stdin is not a terminal. Reading a pipe would swallow
-/// whatever the caller piped in and would block a scripted login forever, so
-/// the watcher only exists for a person at a keyboard.
-fn watch_stdin_for_code() -> Option<mpsc::Receiver<String>> {
+/// whatever the caller piped in and could block a scripted login forever, so
+/// this watcher is only active for an interactive user.
+fn watch_stdin_for_response() -> Option<mpsc::Receiver<String>> {
     use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() {
@@ -467,6 +490,11 @@ fn watch_stdin_for_code() -> Option<mpsc::Receiver<String>> {
         }
     });
     Some(receiver)
+}
+
+/// Whether a pasted line looks like a callback URL.
+fn looks_like_callback_url(candidate: &str) -> bool {
+    candidate.contains("://")
 }
 
 /// Whether a pasted line could be an authorization code.
@@ -793,10 +821,15 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         sender.send("SplxlOBeZQQYbYS6WxSbIA".to_string()).unwrap();
 
-        let callback = wait_for_callback(listener, "state", "/callback", Some(receiver)).unwrap();
-        assert_eq!(callback.code, "SplxlOBeZQQYbYS6WxSbIA");
-        assert!(callback.issued_client_id.is_none());
-        assert!(callback.scope.is_none());
+        let callback =
+            wait_for_callback(listener, "state", "/callback", Some(receiver), true, |_| {
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            callback,
+            Callback::Code(code) if code == "SplxlOBeZQQYbYS6WxSbIA"
+        ));
     }
 
     #[test]
@@ -812,8 +845,91 @@ mod tests {
             let _ = sender.send("SplxlOBeZQQYbYS6WxSbIA".to_string());
         });
 
-        let callback = wait_for_callback(listener, "state", "/callback", Some(receiver)).unwrap();
-        assert_eq!(callback.code, "SplxlOBeZQQYbYS6WxSbIA");
+        let callback =
+            wait_for_callback(listener, "state", "/callback", Some(receiver), true, |_| {
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            callback,
+            Callback::Code(code) if code == "SplxlOBeZQQYbYS6WxSbIA"
+        ));
+    }
+
+    #[test]
+    fn a_full_callback_url_can_be_pasted_and_is_redacted_from_debug() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback_url = format!(
+            "http://{address}/auth/callback?code=callback-secret&state=issued-state&client_id=issued-client&scope=openid"
+        );
+        let expected = callback_url.clone();
+        let (sender, receiver) = mpsc::channel();
+        // OpenAI requires the callback URL; a code-only paste must not win.
+        sender.send("SplxlOBeZQQYbYS6WxSbIA".to_string()).unwrap();
+        sender.send(callback_url.clone()).unwrap();
+
+        let callback = wait_for_callback(
+            listener,
+            "issued-state",
+            "/auth/callback",
+            Some(receiver),
+            false,
+            |candidate| {
+                if candidate == expected {
+                    Ok(())
+                } else {
+                    Err(AuthError::InvalidResponse)
+                }
+            },
+        )
+        .unwrap();
+
+        let debug = format!("{callback:?}");
+        assert!(!debug.contains("callback-secret"));
+        assert!(!debug.contains(&callback_url));
+        assert!(matches!(callback, Callback::Url(url) if url == callback_url));
+    }
+
+    #[test]
+    fn an_invalid_paste_does_not_stop_waiting_for_a_loopback_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = "issued-state-9f3c7a1e4b2d";
+        let bad_url = format!("http://127.0.0.1:{port}/callback?code=wrong&state=another-login");
+        let (sender, receiver) = mpsc::channel();
+        sender.send(bad_url).unwrap();
+
+        let target = format!("/callback?code=goodcode12&state={state}");
+        let expected_url = format!("http://127.0.0.1:{port}{target}");
+        let (response_sender, response_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let response = exchange_callback(port, &target);
+            let _ = response_sender.send(response);
+        });
+
+        let accepted_url = expected_url.clone();
+        let callback = wait_for_callback(
+            listener,
+            state,
+            "/callback",
+            Some(receiver),
+            false,
+            |candidate| {
+                if candidate == accepted_url {
+                    Ok(())
+                } else {
+                    Err(AuthError::InvalidResponse)
+                }
+            },
+        )
+        .unwrap();
+        let response = response_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the browser callback was handled");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(matches!(callback, Callback::Url(url) if url == expected_url));
     }
 
     fn exchange_callback(port: u16, target: &str) -> String {
@@ -838,7 +954,8 @@ mod tests {
         let state_owned = state.to_string();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = wait_for_callback(listener, &state_owned, "/callback", None);
+            let result =
+                wait_for_callback(listener, &state_owned, "/callback", None, false, |_| Ok(()));
             let _ = sender.send(result);
         });
         std::thread::sleep(Duration::from_millis(50));
@@ -856,7 +973,8 @@ mod tests {
         let expected = state.to_string();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = wait_for_callback(listener, &expected, "/callback", None);
+            let result =
+                wait_for_callback(listener, &expected, "/callback", None, false, |_| Ok(()));
             let _ = sender.send(result);
         });
         std::thread::sleep(Duration::from_millis(50));
@@ -882,7 +1000,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the login wait finished")
             .expect("a later callback with the issued state finishes the login");
-        assert_eq!(callback.code, "goodcode12");
+        assert!(matches!(
+            callback,
+            Callback::Url(url) if url.ends_with(&format!("/callback?code=goodcode12&state={state}"))
+        ));
     }
 
     #[test]
@@ -899,7 +1020,10 @@ mod tests {
 
         let callback = callback_result("/callback?code=goodcode12&state=the-state", "the-state")
             .expect("a code with the issued state finishes the login");
-        assert_eq!(callback.code, "goodcode12");
+        assert!(matches!(
+            callback,
+            Callback::Url(url) if url.ends_with("/callback?code=goodcode12&state=the-state")
+        ));
     }
 
     #[test]
@@ -910,7 +1034,8 @@ mod tests {
         let expected = state.to_string();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = wait_for_callback(listener, &expected, "/callback", None);
+            let result =
+                wait_for_callback(listener, &expected, "/callback", None, false, |_| Ok(()));
             let _ = sender.send(result);
         });
         std::thread::sleep(Duration::from_millis(50));

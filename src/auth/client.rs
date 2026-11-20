@@ -179,6 +179,18 @@ impl OAuthClient {
             .map_err(Into::into)
     }
 
+    /// Validate a callback without consuming its pending transaction, allowing
+    /// an interactive caller to reject bad input and keep waiting for a retry.
+    pub fn validate_authorization_callback(
+        &self,
+        pending: &PendingAuthorization,
+        callback_url: &str,
+    ) -> Result<(), AuthError> {
+        self.inner()?
+            .validate_authorization_callback(pending, callback_url)
+            .map_err(Into::into)
+    }
+
     /// Complete a browser callback and exchange its authorization code.
     pub fn complete_authorization(
         &self,
