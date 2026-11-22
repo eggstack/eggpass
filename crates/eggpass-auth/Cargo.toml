@@ -1,6 +1,6 @@
 [package]
 name = "eggpass-auth"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Async OAuth authentication flows for applications using Eggfetch"

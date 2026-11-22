@@ -6,10 +6,19 @@ Notable changes to eggpass are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3]
+
 ### Added
 
 - Add the independently versioned async `eggpass-auth` Rust library and its
   Python `asyncio` bindings.
+- Allow users to paste the full OAuth callback URL into the waiting CLI when
+  the browser cannot reach the loopback listener.
+
+### Changed
+
+- Show available usage reset times and countdowns inline in the human-readable
+  `eggpass usage` report.
 
 ## [0.1.2] - 2026-11-20
 
@@ -107,7 +116,8 @@ First release of the local OpenAI-compatible proxy for Grok and ChatGPT.
 - The project was renamed from `grokproxy` to `eggpass`. Existing data is
   copied to `~/.config/eggpass`; the old directory is left in place.
 
-[Unreleased]: https://github.com/eggstack/eggpass/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/eggstack/eggpass/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/eggstack/eggpass/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/eggstack/eggpass/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/eggstack/eggpass/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/eggstack/eggpass/releases/tag/v0.1.0

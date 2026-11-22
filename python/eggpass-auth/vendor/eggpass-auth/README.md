@@ -1,6 +1,6 @@
 # eggpass-auth
 
-Async OAuth authentication primitives for applications using Eggfetch. The crate is independently versioned from the Eggpass CLI and accepts an Eggfetch 0.3 `Client` owned by the caller.
+Async OAuth authentication primitives for applications using Eggfetch. The crate is independently versioned from the Eggpass CLI and accepts an Eggfetch 0.4 `Client` owned by the caller.
 
 ## Boundary
 
