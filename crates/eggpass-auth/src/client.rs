@@ -3,10 +3,15 @@ use std::time::Duration;
 
 use eggfetch_core::timeout::Timeout;
 use eggfetch_core::{Client as HttpClient, redirect::RedirectPolicy};
+use http::Uri;
+use http_body_util::BodyExt;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::{ClientIdPolicy, OAuthProviderConfig};
+use crate::provider::{
+    ClientIdPolicy, OAuthProviderConfig, effective_port, is_loopback_uri, uri_has_userinfo,
+    uri_host,
+};
 use crate::token::{Credentials, DeviceCode, DevicePoll, TokenSet, UserInfo};
 use crate::{Error, Result};
 
@@ -248,14 +253,13 @@ impl OAuthClient {
             .userinfo_endpoint
             .as_deref()
             .ok_or(Error::Unsupported("user-info lookup"))?;
+        let endpoint = parse_endpoint_uri(endpoint)?;
         let builder = self
             .http
-            .get(endpoint)
+            .get_uri(&endpoint)
             .map_err(map_eggfetch_error)?
-            .without_auth()
             .header("Authorization", &format!("Bearer {access_token}"))
             .timeout(self.options.timeout)
-            .max_decoded_body_size(self.options.max_response_body_bytes)
             .without_retry()
             .redirect_policy(RedirectPolicy::new(false, 0));
         let mut response = builder.send().await.map_err(map_eggfetch_error)?;
@@ -451,7 +455,7 @@ impl OAuthClient {
         parameters: &[(String, String)],
     ) -> Result<RawResponse> {
         let body = {
-            let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+            let mut encoded = form_urlencoded::Serializer::new(String::new());
             encoded.extend_pairs(
                 parameters
                     .iter()
@@ -459,15 +463,14 @@ impl OAuthClient {
             );
             encoded.finish()
         };
+        let endpoint = parse_endpoint_uri(endpoint)?;
         let builder = self
             .http
-            .post(endpoint)
+            .post_uri(&endpoint)
             .map_err(map_eggfetch_error)?
-            .without_auth()
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
             .timeout(self.options.timeout)
-            .max_decoded_body_size(self.options.max_response_body_bytes)
             .without_retry()
             .redirect_policy(RedirectPolicy::new(false, 0));
         let mut response = builder.send().await.map_err(map_eggfetch_error)?;
@@ -592,20 +595,30 @@ pub(crate) struct RawResponse {
 }
 
 async fn read_limited_body(
-    response: &mut eggfetch_core::Response,
+    response: &mut http::Response<eggfetch_core::NativeResponseBody>,
     maximum: usize,
 ) -> Result<Vec<u8>> {
     if response
-        .content_length()
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|size| size > maximum as u64)
     {
         return Err(Error::ResponseTooLarge);
     }
-    let bytes = response.bytes().await.map_err(map_eggfetch_error)?;
-    if bytes.len() > maximum {
-        return Err(Error::ResponseTooLarge);
+
+    let mut body = Vec::new();
+    while let Some(frame) = response.body_mut().frame().await {
+        let frame = frame.map_err(map_eggfetch_error)?;
+        if let Ok(data) = frame.into_data() {
+            if data.len() > maximum.saturating_sub(body.len()) {
+                return Err(Error::ResponseTooLarge);
+            }
+            body.extend_from_slice(&data);
+        }
     }
-    Ok(bytes.to_vec())
+    Ok(body)
 }
 
 pub(crate) fn oauth_error(status: u16, body: &[u8]) -> Error {
@@ -649,21 +662,27 @@ fn validate_nonempty(value: &str, label: &'static str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_redirect_uri(redirect_uri: &str, expected_path: &str) -> Result<url::Url> {
-    let redirect = url::Url::parse(redirect_uri)
+fn parse_endpoint_uri(endpoint: &str) -> Result<Uri> {
+    endpoint
+        .parse::<Uri>()
+        .map_err(|_| Error::InvalidConfiguration("OAuth endpoint URL is invalid"))
+}
+
+pub(crate) fn validate_redirect_uri(redirect_uri: &str, expected_path: &str) -> Result<Uri> {
+    let redirect = redirect_uri
+        .parse::<Uri>()
         .map_err(|_| Error::InvalidConfiguration("redirect URI is invalid"))?;
-    let loopback_http = match redirect.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-    if !matches!(redirect.scheme(), "https" | "http")
-        || (redirect.scheme() == "http" && !loopback_http)
-        || !redirect.username().is_empty()
-        || redirect.password().is_some()
-        || redirect.query().is_some()
-        || redirect.fragment().is_some()
+    let scheme = redirect.scheme_str().unwrap_or_default();
+    if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+        || uri_host(&redirect).is_none()
+        || effective_port(&redirect).is_none()
+        || (scheme.eq_ignore_ascii_case("http") && !is_loopback_uri(&redirect))
+        || uri_has_userinfo(&redirect)
+        || redirect
+            .path_and_query()
+            .and_then(|path| path.query())
+            .is_some()
+        || redirect_uri.contains('#')
         || redirect.path() != expected_path
     {
         return Err(Error::InvalidConfiguration(
@@ -687,16 +706,15 @@ pub(crate) fn require_trusted_verification_url(url: &str, trusted_hosts: &[Strin
     {
         return Err(Error::UntrustedVerificationUrl { host: None });
     }
-    let parsed = match url::Url::parse(url) {
-        Ok(parsed) => parsed,
+    let uri = match url.split('#').next().unwrap_or_default().parse::<Uri>() {
+        Ok(uri) => uri,
         Err(_) => return Err(Error::UntrustedVerificationUrl { host: None }),
     };
-    let host = parsed
-        .host_str()
-        .map(|host| host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase());
-    let trusted = parsed.scheme() == "https"
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
+    let host = uri_host(&uri).map(|host| host.strip_suffix('.').unwrap_or(&host).to_string());
+    let trusted = uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+        && !uri_has_userinfo(&uri)
         && host.as_ref().is_some_and(|host| {
             trusted_hosts
                 .iter()
@@ -726,9 +744,14 @@ mod tests {
     #[test]
     fn redirect_uri_path_is_exact_and_http_requires_loopback() {
         assert!(validate_redirect_uri("http://127.0.0.1:1234/callback", "/callback").is_ok());
+        assert!(validate_redirect_uri("http://[::1]:1234/callback", "/callback").is_ok());
         assert!(validate_redirect_uri("https://example.test/callback", "/callback").is_ok());
         assert!(validate_redirect_uri("http://example.test/callback", "/callback").is_err());
         assert!(validate_redirect_uri("http://127.0.0.1:1234/other", "/callback").is_err());
+        assert!(validate_redirect_uri("https://user@example.test/callback", "/callback").is_err());
+        assert!(validate_redirect_uri("https://:443/callback", "/callback").is_err());
+        assert!(validate_redirect_uri("https://example.test:65536/callback", "/callback").is_err());
+        assert!(validate_redirect_uri("https://example.test/callback?x=1", "/callback").is_err());
     }
 
     #[test]

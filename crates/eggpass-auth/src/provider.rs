@@ -1,4 +1,7 @@
 use std::fmt;
+use std::net::IpAddr;
+
+use http::Uri;
 
 use crate::{Error, Result};
 
@@ -495,21 +498,24 @@ impl OAuthProviderConfigBuilder {
 }
 
 fn validate_endpoint(value: &str, label: &'static str) -> Result<()> {
-    let url = url::Url::parse(value)
+    let uri = value
+        .parse::<Uri>()
         .map_err(|_| Error::InvalidConfiguration("OAuth endpoint URL is invalid"))?;
-    if !matches!(url.scheme(), "https" | "http")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
+    let scheme = uri.scheme_str().unwrap_or_default();
+    if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+        || uri.authority().is_none()
+        || uri_host(&uri).is_none()
+        || effective_port(&uri).is_none()
+        || uri_has_userinfo(&uri)
+        || uri.path_and_query().and_then(|path| path.query()).is_some()
+        || value.contains('#')
     {
         return Err(Error::InvalidConfiguration(match label {
             "issuer" => "issuer must be an HTTP(S) origin without credentials, query, or fragment",
             _ => "OAuth endpoints must be HTTP(S) URLs without credentials, query, or fragment",
         }));
     }
-    if url.scheme() != "https" && !is_loopback_url(&url) {
+    if !scheme.eq_ignore_ascii_case("https") && !is_loopback_uri(&uri) {
         return Err(Error::InvalidConfiguration(
             "plain HTTP is permitted only for loopback OAuth endpoints",
         ));
@@ -517,12 +523,56 @@ fn validate_endpoint(value: &str, label: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn is_loopback_url(url: &url::Url) -> bool {
-    match url.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        None => false,
+pub(crate) fn uri_host(uri: &Uri) -> Option<String> {
+    let host = uri.authority()?.host();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() || !host.is_ascii() || host.contains('%') {
+        return None;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(address) => Some(address.to_string()),
+        Err(_) => Some(host.to_ascii_lowercase()),
+    }
+}
+
+pub(crate) fn uri_has_userinfo(uri: &Uri) -> bool {
+    uri.authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+}
+
+pub(crate) fn is_loopback_uri(uri: &Uri) -> bool {
+    let Some(host) = uri_host(uri) else {
+        return false;
+    };
+    host.parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or_else(|_| host.eq_ignore_ascii_case("localhost"))
+}
+
+fn authority_has_port(authority: &http::uri::Authority) -> bool {
+    let authority = authority.as_str();
+    if let Some(closing_bracket) = authority.rfind(']') {
+        authority.as_bytes().get(closing_bracket + 1) == Some(&b':')
+    } else {
+        authority.rfind(':').is_some()
+    }
+}
+
+pub(crate) fn effective_port(uri: &Uri) -> Option<u16> {
+    let authority = uri.authority()?;
+    if let Some(port) = authority.port_u16() {
+        return Some(port);
+    }
+    if authority_has_port(authority) {
+        return None;
+    }
+    match uri.scheme_str()? {
+        scheme if scheme.eq_ignore_ascii_case("http") => Some(80),
+        scheme if scheme.eq_ignore_ascii_case("https") => Some(443),
+        _ => None,
     }
 }
 
@@ -648,6 +698,23 @@ mod tests {
             .token_endpoint("https://issuer.example/token")
             .build();
         assert!(matches!(insecure, Err(Error::InvalidConfiguration(_))));
+
+        for endpoint in [
+            "https://user@issuer.example/authorize",
+            "https://issuer.example/authorize?query=1",
+            "https://issuer.example/authorize#fragment",
+            "https://issuer.example:65536/authorize",
+        ] {
+            let invalid_endpoint =
+                OAuthProviderConfig::custom("example", "https://issuer.example", "client")
+                    .authorization_endpoint(endpoint)
+                    .token_endpoint("https://issuer.example/token")
+                    .build();
+            assert!(
+                matches!(invalid_endpoint, Err(Error::InvalidConfiguration(_))),
+                "accepted invalid endpoint: {endpoint}"
+            );
+        }
 
         let invalid_path =
             OAuthProviderConfig::custom("example", "https://issuer.example", "client")

@@ -283,9 +283,9 @@ dependencies = [
 
 [[package]]
 name = "eggfetch-core"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c22bdfc6ab683ddf5d5fcf0321b60dfc86c0ec1311284a33c31f536d12c1d2ae"
+checksum = "db5ee3c2312c08942874fbc4b44d91c4ef674f19fb5e9d6edd1281c94225f65e"
 dependencies = [
  "base64",
  "bytes",
@@ -315,9 +315,9 @@ dependencies = [
 
 [[package]]
 name = "eggfetch-http-connect"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b57fad98d6848005a223343d13f4438c5829691281eabf7900ab71ce8635faf2"
+checksum = "16ee2bb546c6c60c27e32779a75f1472ccd419a3472c88ab8f03721de2223f25"
 dependencies = [
  "base64",
  "thiserror",
@@ -368,6 +368,9 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "eggfetch-core",
+ "form_urlencoded",
+ "http",
+ "http-body-util",
  "rand",
  "serde",
  "serde_json",
@@ -375,20 +378,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "url",
 ]
 
 [[package]]
 name = "eggup-acquisition"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8832b13c4488a59ec4dc8920aea610ba5a1c50434e9cd1e5209c35e7235d7f7d"
+checksum = "4000935b1d4d384eaba066c9742e70f91d5cb3dd12618ac3aa79d654e2aab865"
 
 [[package]]
 name = "eggup-archive"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b841216d7c0495885c6fe21b1aa353a4415d04139018f68f08d76e101bf61d80"
+checksum = "67ab697e3af41b3cd3d1ed140f821c68739ec446d2a7782fa26ca4960edc882b"
 dependencies = [
  "flate2",
  "fs_at",
@@ -399,9 +401,9 @@ dependencies = [
 
 [[package]]
 name = "eggup-core"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3841a8390f8c7b1be0207156e5c895aa4b6c0eec8b05772ac8331d3e43e7ef88"
+checksum = "a0b0dba6035ec7d403ddf0298f1021a5bd544764f9bb4e3011cb31b2dacd614b"
 dependencies = [
  "self-replace",
  "sha2 0.10.9",
@@ -409,9 +411,9 @@ dependencies = [
 
 [[package]]
 name = "eggup-eggfetch"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ca53436f6f12ca3ae0a9d194e81a6af6bf04fadf2d90b49d866359ab9eab2dc"
+checksum = "f683e0c3b377a1713a5af4a64257f785da24f17771a927c07508b0d73ad35df1"
 dependencies = [
  "eggfetch-core",
  "eggup-acquisition",
@@ -421,9 +423,9 @@ dependencies = [
 
 [[package]]
 name = "eggup-eggpack"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "492271d54d9529fcef74bcf354466c1971e102c261e7ceac696ea3746fded795"
+checksum = "f24df78cf088e665dd69db1b319d7168007175ebc1ec5d2df76a069e31242e49"
 dependencies = [
  "eggpack-manifest",
  "eggup-acquisition",

@@ -1,11 +1,12 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use http::Uri;
 use rand::Rng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::client::{OAuthClient, PendingAuthorization, validate_redirect_uri};
-use crate::provider::ClientIdPolicy;
+use crate::provider::{ClientIdPolicy, effective_port, uri_has_userinfo, uri_host};
 use crate::token::{Credentials, TokenSet};
 use crate::{Error, Result};
 
@@ -42,10 +43,8 @@ pub(crate) fn begin_authorization(
     let nonce = random_urlsafe(32);
 
     let scope = client.provider.scopes.join(" ");
-    let mut authorization_url = url::Url::parse(&client.provider.authorization_endpoint)
-        .map_err(|_| Error::InvalidConfiguration("authorization endpoint URL is invalid"))?;
-    {
-        let mut query = authorization_url.query_pairs_mut();
+    let authorization_url = {
+        let mut query = form_urlencoded::Serializer::new(String::new());
         query.append_pair("response_type", "code");
         query.append_pair("client_id", &client_id);
         query.append_pair("redirect_uri", redirect_uri);
@@ -65,10 +64,15 @@ pub(crate) fn begin_authorization(
         if !registration && let Some(id_token) = existing.and_then(Credentials::id_token) {
             query.append_pair("id_token_hint", id_token);
         }
-    }
+        format!(
+            "{}?{}",
+            client.provider.authorization_endpoint,
+            query.finish()
+        )
+    };
 
     Ok(PendingAuthorization {
-        authorization_url: authorization_url.into(),
+        authorization_url,
         redirect_uri: redirect.to_string(),
         code_verifier,
         state,
@@ -117,14 +121,18 @@ fn parse_authorization_callback(
     pending: &PendingAuthorization,
     callback_url: &str,
 ) -> Result<ValidatedAuthorizationCallback> {
-    let callback = url::Url::parse(callback_url).map_err(|_| Error::CallbackMismatch)?;
-    let redirect = url::Url::parse(&pending.redirect_uri).map_err(|_| Error::CallbackMismatch)?;
+    let callback = callback_url
+        .parse::<Uri>()
+        .map_err(|_| Error::CallbackMismatch)?;
+    let redirect = pending
+        .redirect_uri
+        .parse::<Uri>()
+        .map_err(|_| Error::CallbackMismatch)?;
     if callback.path() != client.provider.callback_path
         || !same_origin(&callback, &redirect)
         || callback.path() != redirect.path()
-        || !callback.username().is_empty()
-        || callback.password().is_some()
-        || callback.fragment().is_some()
+        || uri_has_userinfo(&callback)
+        || callback_url.contains('#')
     {
         return Err(Error::CallbackMismatch);
     }
@@ -226,8 +234,12 @@ async fn complete_pending_authorization(
     Ok(credentials)
 }
 
-fn unique_query_value(url: &url::Url, name: &str) -> Result<Option<String>> {
-    let mut values = url.query_pairs().filter(|(key, _)| key == name);
+fn unique_query_value(uri: &Uri, name: &str) -> Result<Option<String>> {
+    let query = uri
+        .path_and_query()
+        .and_then(|path| path.query())
+        .unwrap_or_default();
+    let mut values = form_urlencoded::parse(query.as_bytes()).filter(|(key, _)| key == name);
     let value = values.next().map(|(_, value)| value.into_owned());
     if values.next().is_some() {
         return Err(Error::CallbackMismatch);
@@ -235,14 +247,15 @@ fn unique_query_value(url: &url::Url, name: &str) -> Result<Option<String>> {
     Ok(value)
 }
 
-fn same_origin(left: &url::Url, right: &url::Url) -> bool {
-    left.scheme() == right.scheme()
-        && left.host_str().is_some_and(|host| {
-            right
-                .host_str()
-                .is_some_and(|other| host.eq_ignore_ascii_case(other))
-        })
-        && left.port_or_known_default() == right.port_or_known_default()
+fn same_origin(left: &Uri, right: &Uri) -> bool {
+    let (Some(left_scheme), Some(right_scheme)) = (left.scheme_str(), right.scheme_str()) else {
+        return false;
+    };
+    left_scheme.eq_ignore_ascii_case(right_scheme)
+        && uri_host(left)
+            .zip(uri_host(right))
+            .is_some_and(|(left, right)| left == right)
+        && effective_port(left) == effective_port(right)
 }
 
 fn validate_nonce(id_token: Option<&str>, expected_nonce: &str) -> Result<()> {
@@ -286,13 +299,23 @@ mod tests {
         OAuthClient::new(Client::new(), OAuthProviderConfig::xai())
     }
 
+    fn query_values(url: &str) -> std::collections::HashMap<String, String> {
+        let uri = url.parse::<Uri>().unwrap();
+        let query = uri
+            .path_and_query()
+            .and_then(|path| path.query())
+            .unwrap_or_default();
+        form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect()
+    }
+
     #[test]
     fn authorization_transaction_uses_pkce_state_nonce_and_callback_path() {
         let pending = client()
             .begin_authorization("http://127.0.0.1:34567/callback", None)
             .unwrap();
-        let url = url::Url::parse(pending.authorization_url()).unwrap();
-        let values: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        let values = query_values(pending.authorization_url());
         assert_eq!(
             values.get("code_challenge_method").map(String::as_str),
             Some("S256")
@@ -323,9 +346,7 @@ mod tests {
         let first = client
             .begin_authorization("http://127.0.0.1:45678/auth/callback", None)
             .unwrap();
-        let first_url = url::Url::parse(first.authorization_url()).unwrap();
-        let first_values: std::collections::HashMap<_, _> =
-            first_url.query_pairs().into_owned().collect();
+        let first_values = query_values(first.authorization_url());
         assert_eq!(
             first_values.get("client_id").map(String::as_str),
             Some("dynamic_agent_client")
@@ -345,15 +366,28 @@ mod tests {
         let next = client
             .begin_authorization("http://127.0.0.1:45678/auth/callback", Some(&existing))
             .unwrap();
-        let next_url = url::Url::parse(next.authorization_url()).unwrap();
-        let next_values: std::collections::HashMap<_, _> =
-            next_url.query_pairs().into_owned().collect();
+        let next_values = query_values(next.authorization_url());
         assert_eq!(
             next_values.get("client_id").map(String::as_str),
             Some("issued-client-id")
         );
         assert!(!next.registration);
         assert!(!next_values.contains_key("agent_name_hint"));
+    }
+
+    #[test]
+    fn callback_uri_normalizes_default_port_host_case_and_form_encoding() {
+        let client = client();
+        let pending = client
+            .begin_authorization("https://Example.test/callback", None)
+            .unwrap();
+        let callback = format!(
+            "https://example.TEST:443/callback?code=code+%2B+value&state={}",
+            pending.state
+        );
+
+        let parsed = parse_authorization_callback(&client, &pending, &callback).unwrap();
+        assert_eq!(parsed.code, "code + value");
     }
 
     #[tokio::test]

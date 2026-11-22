@@ -71,6 +71,17 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
     stream.flush().await.unwrap();
 }
 
+fn authorization_query(url: &str) -> std::collections::HashMap<String, String> {
+    let uri = url.parse::<http::Uri>().unwrap();
+    let query = uri
+        .path_and_query()
+        .and_then(|path| path.query())
+        .unwrap_or_default();
+    form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
 fn oauth(base: &str, client: Client) -> OAuthClient {
     let config = OAuthProviderConfig::custom("stub", base, "public-client")
         .authorization_endpoint(format!("{base}/authorize"))
@@ -127,7 +138,7 @@ async fn real_eggfetch_posts_encoded_authorization_code_without_leaking_bearer_a
     );
     assert!(!request.to_ascii_lowercase().contains("authorization:"));
     let body = request.split("\r\n\r\n").nth(1).unwrap();
-    let parameters: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+    let parameters: std::collections::HashMap<_, _> = form_urlencoded::parse(body.as_bytes())
         .into_owned()
         .collect();
     assert_eq!(parameters.get("code").map(String::as_str), Some("code /+&"));
@@ -153,7 +164,7 @@ async fn revocation_and_userinfo_use_their_configured_endpoints() {
     assert!(request.starts_with("POST /revoke HTTP/1.1"));
     assert!(!request.to_ascii_lowercase().contains("authorization:"));
     let body = request.split("\r\n\r\n").nth(1).unwrap();
-    let form: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+    let form: std::collections::HashMap<_, _> = form_urlencoded::parse(body.as_bytes())
         .into_owned()
         .collect();
     assert_eq!(
@@ -227,10 +238,9 @@ async fn device_code_request_and_poll_use_real_eggfetch_requests() {
     let first = String::from_utf8(first).unwrap();
     assert!(first.starts_with("POST /device HTTP/1.1"));
     let first_body = first.split("\r\n\r\n").nth(1).unwrap();
-    let first_form: std::collections::HashMap<_, _> =
-        url::form_urlencoded::parse(first_body.as_bytes())
-            .into_owned()
-            .collect();
+    let first_form: std::collections::HashMap<_, _> = form_urlencoded::parse(first_body.as_bytes())
+        .into_owned()
+        .collect();
     assert_eq!(
         first_form.get("client_id").map(String::as_str),
         Some("public-client")
@@ -240,7 +250,7 @@ async fn device_code_request_and_poll_use_real_eggfetch_requests() {
     assert!(second.starts_with("POST /token HTTP/1.1"));
     let second_body = second.split("\r\n\r\n").nth(1).unwrap();
     let second_form: std::collections::HashMap<_, _> =
-        url::form_urlencoded::parse(second_body.as_bytes())
+        form_urlencoded::parse(second_body.as_bytes())
             .into_owned()
             .collect();
     assert_eq!(
@@ -281,11 +291,8 @@ async fn issued_client_id_is_exchanged_and_reused_after_registration() {
     let oauth = OAuthClient::new(Client::new(), profile);
     let redirect = format!("{base}/callback");
     let pending = oauth.begin_authorization(&redirect, None).unwrap();
-    let authorization_url = url::Url::parse(pending.authorization_url()).unwrap();
-    let state = authorization_url
-        .query_pairs()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.into_owned())
+    let state = authorization_query(pending.authorization_url())
+        .remove("state")
         .unwrap();
     let callback =
         format!("{redirect}?code=registration-code&state={state}&client_id=issued-client");
@@ -301,7 +308,7 @@ async fn issued_client_id_is_exchanged_and_reused_after_registration() {
     let request = String::from_utf8(server.await.unwrap()).unwrap();
     assert!(request.starts_with("POST /token HTTP/1.1"));
     let body = request.split("\r\n\r\n").nth(1).unwrap();
-    let form: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+    let form: std::collections::HashMap<_, _> = form_urlencoded::parse(body.as_bytes())
         .into_owned()
         .collect();
     assert_eq!(
@@ -312,9 +319,7 @@ async fn issued_client_id_is_exchanged_and_reused_after_registration() {
     let next = oauth
         .begin_authorization(&redirect, Some(&credentials))
         .unwrap();
-    let next_url = url::Url::parse(next.authorization_url()).unwrap();
-    let next_values: std::collections::HashMap<_, _> =
-        next_url.query_pairs().into_owned().collect();
+    let next_values = authorization_query(next.authorization_url());
     assert_eq!(
         next_values.get("client_id").map(String::as_str),
         Some("issued-client")
@@ -504,8 +509,7 @@ async fn manager_coalesces_concurrent_refresh_and_retains_rotated_refresh_token(
         .position(|window| window == b"\r\n\r\n")
         .expect("request contains the end of headers");
     let body = &request[header_end + 4..];
-    let form: std::collections::HashMap<_, _> =
-        url::form_urlencoded::parse(body).into_owned().collect();
+    let form: std::collections::HashMap<_, _> = form_urlencoded::parse(body).into_owned().collect();
     assert_eq!(
         form.get("refresh_token").map(String::as_str),
         Some("preserved-refresh")

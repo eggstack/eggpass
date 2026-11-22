@@ -48,10 +48,10 @@ dirs = "7.0.0"
 # `eggup-eggpack` reads an Eggpack `ReleaseManifest` v1. Its `project_json`
 # takes the manifest as bytes, so `eggpack-manifest` is not a direct
 # dependency and no version pin has to be mirrored here.
-eggup-acquisition = "0.2.1"
-eggup-core = "0.2.1"
-eggup-eggpack = "0.2.1"
-eggup-eggfetch = "0.2.1"
+eggup-acquisition = "0.2.2"
+eggup-core = "0.2.2"
+eggup-eggpack = "0.2.2"
+eggup-eggfetch = "0.2.2"
 # The local UTC offset, for the reset times `eggpass usage` prints.
 #
 # `libc` is already in the lockfile through `nix`, `dirs` and `ureq`, so
