@@ -6,7 +6,7 @@ Notable changes to eggpass are listed here. The format follows
 
 ## [Unreleased]
 
-## [0.1.3]
+## [0.1.3] - 2026-11-22
 
 ### Added
 
