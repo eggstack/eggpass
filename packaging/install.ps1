@@ -200,12 +200,32 @@ function Install-VerifiedCandidate {
     $current = Get-DestinationClassification -DestPath $DestPath
     if ($current -ne $Scope) { throw "Destination changed during install (expected $Scope, found $current); refusing to overwrite it." }
     $stagedCopy = Join-Path $DestDir (".eggpass-install-" + [Guid]::NewGuid().ToString('N') + ".tmp")
+    $backupPath = $null
+    $replacementSucceeded = $false
     try {
         [IO.File]::Copy($Candidate, $stagedCopy, $false)
-        if ($Scope -eq "replace") { [IO.File]::Replace($stagedCopy, $DestPath, $null) }
+        if ($Scope -eq "replace") {
+            $backupPath = Join-Path $DestDir (".eggpass-backup-" + [Guid]::NewGuid().ToString('N') + ".tmp")
+            [IO.File]::Replace($stagedCopy, $DestPath, $backupPath)
+            $replacementSucceeded = $true
+        }
         else { [IO.File]::Move($stagedCopy, $DestPath) }
+    } catch {
+        $installError = $_
+        if ($backupPath -and [IO.File]::Exists($backupPath) -and -not [IO.File]::Exists($DestPath)) {
+            try {
+                [IO.File]::Move($backupPath, $DestPath)
+                $backupPath = $null
+            } catch {
+                throw "Installation failed and the prior Eggpass executable could not be restored; its backup remains at $backupPath. Install error: $($installError.Exception.Message). Restore error: $($_.Exception.Message)"
+            }
+        } elseif ($backupPath -and [IO.File]::Exists($backupPath)) {
+            Write-Warning "Replacement failed; retained the prior executable backup at $backupPath for recovery."
+        }
+        throw $installError
     } finally {
         if (Test-Path -LiteralPath $stagedCopy) { Remove-Item -LiteralPath $stagedCopy -Force -ErrorAction SilentlyContinue }
+        if ($replacementSucceeded -and $backupPath -and [IO.File]::Exists($backupPath)) { Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue }
     }
     if ($Scope -eq "replace") { Write-Host "Updated Eggpass at $DestPath ($ExistingVersion -> eggpass $(Get-CandidateVersion -Candidate $DestPath))" }
     else { Write-Host "Installed Eggpass to $DestPath" }

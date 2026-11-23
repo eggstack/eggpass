@@ -174,6 +174,8 @@ try {
     $script:CandidateVersions[$rerunPath] = "1.2.4"
     Assert-Fixture ((Get-DestinationClassification -DestPath $rerunPath) -eq "replace" -and (Get-ExistingVersion -DestPath $rerunPath) -eq "eggpass 1.2.4") "same-scope rerun replaces the verified Eggpass executable"
     Assert-Fixture ($script:FixtureUrls.Count -eq 4) "same-scope rerun fetches both exact latest assets again"
+    $replacementTemps = @(Get-ChildItem -LiteralPath $script:DestRoot -Filter ".eggpass-*.tmp" -ErrorAction SilentlyContinue)
+    Assert-Fixture ($replacementTemps.Count -eq 0) "same-scope replacement cleans staged and backup files"
 
     Reset-Fixture "foreign"
     $foreign = Join-Path $script:DestRoot "eggpass.exe"
