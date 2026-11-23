@@ -25,16 +25,22 @@ publication.
 | Manifest file | `release-manifest.json` |
 
 The release contains these five binary assets, a matching `.sha256` sidecar
-for each, and the manifest:
+for each, `release-manifest.json`, and four auxiliary installer assets:
 
 - `eggpass-aarch64-apple-darwin`
 - `eggpass-aarch64-unknown-linux-gnu`
 - `eggpass-x86_64-apple-darwin`
 - `eggpass-x86_64-pc-windows-msvc.exe`
 - `eggpass-x86_64-unknown-linux-gnu`
+- `install.sh` and `install.ps1` (Eggpass product wrappers)
+- `install-exact.sh` and `install-exact.ps1` (Eggpack-generated exact bootstraps)
 
 The Windows executable keeps its `.exe` suffix. Asset names are not
-versioned so the `releases/latest/download/<name>` URLs remain stable.
+versioned, so binary URLs and the latest installer URLs use
+`releases/latest/download/<name>`. Pinned installer scripts select the exact
+`vX.Y.Z` release; they do not fetch scripts from the repository's `main` branch.
+The four installer files are auxiliary staging assets and are not members of
+`release-manifest.json` or the five-target distribution contract.
 
 ## Prepare and stage a release
 
@@ -84,8 +90,14 @@ versioned so the `releases/latest/download/<name>` URLs remain stable.
 
 5. Review the staged draft and download every asset into a clean local
    verification directory. Confirm that:
-   - all five expected binaries, all five checksum sidecars, and
-     `release-manifest.json` are present;
+   - all five expected binaries, all five checksum sidecars,
+     `release-manifest.json`, and all four installer assets (`install.sh`,
+     `install.ps1`, `install-exact.sh`, and `install-exact.ps1`) are present;
+   - latest installer URLs select `releases/latest/download`, pinned installs
+     select the exact `releases/download/vX.Y.Z` tag, and no installer fetches
+     mutable source from `main`;
+   - the four installer files are auxiliary assets and do not appear as
+     artifacts or targets in `release-manifest.json`;
    - `schema_version` is `1`, `product_id` is `eggpass`, `release_id` is the
      plain package version, and `source_revision` matches the full commit the
      tag peels to;

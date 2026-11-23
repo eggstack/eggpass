@@ -3,7 +3,7 @@
   "owner": "eggstack",
   "repository": "eggpass",
   "title_prefix": "eggpass ",
-  "body": "Draft binary release staged by Eggpack. Review the five target binaries, release manifest, source revision, and checksum sidecars before publishing. This release remains a draft until a maintainer publishes it.",
+  "body": "Draft release staged by Eggpack. Review all five target binaries and checksum sidecars, release manifest, source revision, and four auxiliary installer assets (install.sh, install.ps1, install-exact.sh, install-exact.ps1). Confirm wrappers use latest/exact release URLs and are not manifest binaries. This release remains a draft until a maintainer publishes it.",
   "prerelease": false,
   "token_env": "GITHUB_TOKEN",
   "request_timeout_secs": 30,

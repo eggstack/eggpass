@@ -69,7 +69,8 @@
     "inputs": {
       "contract": "release/eggpack/distribution.toml",
       "install_policy": "release/eggpack/install-policy.toml",
-      "github_policy": "release/eggpack/github-template.json"
+      "github_policy": "release/eggpack/github-template.json",
+      "installer_presentation": "release/eggpack/installer-presentation.json"
     },
     "receipt_retention_days": 7
   }

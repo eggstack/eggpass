@@ -18,7 +18,56 @@ need a separate provider API key.
 
 ## Install
 
-Install the published CLI from crates.io:
+Install the latest prebuilt release on Linux or macOS (Bash):
+
+```sh
+curl -fsSL https://github.com/eggstack/eggpass/releases/latest/download/install.sh | bash
+```
+
+To pin an exact stable release, use the matching release script and version:
+
+```sh
+curl -fsSL https://github.com/eggstack/eggpass/releases/download/vX.Y.Z/install.sh | bash -s -- --version X.Y.Z
+```
+
+On Windows, from PowerShell, download and run the latest installer:
+
+```powershell
+$installer = Join-Path $env:TEMP "eggpass-install.ps1"
+Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/eggstack/eggpass/releases/latest/download/install.ps1" -OutFile $installer
+& $installer
+```
+
+For a pinned Windows release, change both the script URL to
+`https://github.com/eggstack/eggpass/releases/download/vX.Y.Z/install.ps1` and
+pass `-Version X.Y.Z` to the script. The installers verify the published SHA-256
+sidecar and the candidate's exact `eggpass --version` identity before installing.
+They default to a per-user directory (`~/.local/bin` on Unix or `%LOCALAPPDATA%\Eggpass`
+on Windows); Bash can add a safe PATH block to a Bash/Zsh profile. The Bash
+installer needs Bash, `curl`, and `sha256sum` or `shasum`; Windows needs
+PowerShell 5.1 or later. Prebuilt installs do not require Rust. If the Windows
+install directory is not already on PATH, add `%LOCALAPPDATA%\Eggpass` to PATH,
+use the full executable path, or for the current PowerShell session run:
+
+```powershell
+$env:Path = "$env:LOCALAPPDATA\Eggpass;$env:Path"
+```
+
+A system-wide install requires an explicitly elevated shell (`--system` on Bash
+or `-System` in PowerShell); neither installer invokes elevation for you. For
+example, an explicit Unix system install is:
+
+```sh
+curl -fsSL https://github.com/eggstack/eggpass/releases/latest/download/install.sh | sudo bash -s -- --system
+```
+
+Unsupported targets fail rather than installing a binary without a supported
+updater mapping. On a supported target, Cargo fallback is attempted only when the exact GitHub release
+binary asset returns HTTP 404; it requests that same exact crate version, so a
+brief crates.io publication lag requires retrying later. Other transport or
+verification failures stop without fallback.
+
+Cargo remains a separate supported install method:
 
 ```sh
 cargo install eggpass
