@@ -17,6 +17,8 @@ pub enum Route {
     LastInference,
     /// `GET /v1/usage`
     Usage,
+    /// `POST /v1/eggpool/enroll`
+    EggpoolEnrollment,
     /// `GET /health`
     Health,
     /// Anything else.
@@ -30,6 +32,7 @@ pub enum Route {
 pub fn route(path: &str) -> Route {
     match path {
         "/health" | "/healthz" => return Route::Health,
+        crate::eggpool::ENROLLMENT_PATH => return Route::EggpoolEnrollment,
         _ => {}
     }
 
@@ -68,6 +71,8 @@ mod tests {
         assert_eq!(route("/last-inference"), Route::LastInference);
         assert_eq!(route("/v1/usage"), Route::Usage);
         assert_eq!(route("/usage"), Route::Usage);
+        assert_eq!(route("/v1/eggpool/enroll"), Route::EggpoolEnrollment);
+        assert_eq!(route("/eggpool/enroll"), Route::NotFound);
     }
 
     #[test]

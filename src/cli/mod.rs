@@ -174,5 +174,6 @@ fn dispatch(context: &Context) -> Result<(), CommandError> {
             commands::update::update(context, version.clone(), *check)
         }
         Command::Key { action } => commands::key::key(context, action.clone()),
+        Command::Eggpool { action } => commands::eggpool::eggpool(context, action.clone()),
     }
 }

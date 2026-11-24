@@ -29,6 +29,7 @@ mod keep_body_tests {
         assert!(!keep_body_for("/health"));
         assert!(!keep_body_for("/healthz"));
         assert!(!keep_body_for("/v1/usage"));
+        assert!(keep_body_for(crate::eggpool::ENROLLMENT_PATH));
         assert!(keep_body_for("/v1/chat/completions"));
         assert!(keep_body_for("/v1/models"));
     }
@@ -77,6 +78,8 @@ pub struct ServerContext {
     ///
     /// This is never counted as a configured client key.
     pub usage_key: String,
+    /// The one-time EggPool enrollment callback, when the integration is enabled.
+    pub eggpool_enrollment: Option<Arc<crate::eggpool::EnrollmentStore>>,
     /// The keys `eggpass` issued to its clients.
     pub keys: Arc<crate::keys::KeyStore>,
     /// The providers that are available.
@@ -266,6 +269,32 @@ fn pre_authorize(request: &Request, context: &ServerContext) -> Option<Response>
         return Some(refusal);
     }
 
+    // Enrollment is authorized by the short-lived, one-time bearer token, not
+    // by an ordinary EggPass API key. It is accepted only on the exact callback
+    // route and only while private state says enrollment is still pending.
+    if router::route(request.path()) == router::Route::EggpoolEnrollment {
+        if request.method != "POST" {
+            return None;
+        }
+        let Some(store) = &context.eggpool_enrollment else {
+            return Some(openai_error(
+                404,
+                "unknown endpoint",
+                "invalid_request_error",
+            ));
+        };
+        let authorized = crate::eggpool::enrollment_bearer(request.header("authorization"))
+            .is_some_and(|token| store.authorizes(token));
+        if !authorized {
+            return Some(openai_error(
+                401,
+                "invalid or expired EggPool enrollment token",
+                "invalid_request_error",
+            ));
+        }
+        return None;
+    }
+
     // The health probe is never authenticated: `status` and `croncheck` use
     // it, and it carries nothing but a version string.
     //
@@ -302,14 +331,18 @@ fn pre_authorize(request: &Request, context: &ServerContext) -> Option<Response>
 }
 
 /// Route a request and produce a response.
-fn handle_request(request: Request, context: &ServerContext) -> Response {
+fn handle_request(mut request: Request, context: &ServerContext) -> Response {
     if let Some(refusal) = pre_authorize(&request, context) {
+        if router::route(request.path()) == router::Route::EggpoolEnrollment {
+            crate::eggpool::scrub_enrollment_request(&mut request);
+        }
         return refusal;
     }
 
     let path = request.path().to_string();
     let route = router::route(&path);
-    let method = request.method.as_str();
+    let method_text = request.method.clone();
+    let method = method_text.as_str();
 
     // The method is matched *after* the route, so an endpoint that exists and
     // takes a different method answers `405` rather than claiming not to
@@ -326,6 +359,19 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
         router::Route::Usage => match method {
             "GET" => usage::handle(context),
             _ => method_not_allowed(method, "GET"),
+        },
+        router::Route::EggpoolEnrollment => match method {
+            "POST" => match &context.eggpool_enrollment {
+                Some(store) => crate::eggpool::handle_enrollment(request, store),
+                None => {
+                    crate::eggpool::scrub_enrollment_request(&mut request);
+                    openai_error(404, "unknown endpoint", "invalid_request_error")
+                }
+            },
+            _ => {
+                crate::eggpool::scrub_enrollment_request(&mut request);
+                method_not_allowed(method, "POST")
+            }
         },
         router::Route::Models => match method {
             "GET" => models::list(&request, context),
@@ -525,6 +571,7 @@ mod authorisation_tests {
             port: 8484,
             api_key: key.to_string(),
             usage_key: "usage-only-secret".to_string(),
+            eggpool_enrollment: None,
             keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,
@@ -572,6 +619,53 @@ mod authorisation_tests {
             headers: Vec::new(),
             body: Vec::new(),
         }
+    }
+
+    #[test]
+    fn eggpool_enrollment_uses_the_one_time_token_without_an_api_key() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state_path = directory.path().join("eggpool.json");
+        let state = serde_json::json!({
+            "version": 1,
+            "agent": "test-agent",
+            "api_key_id": 1,
+            "ca_sha256": "pin",
+            "enroll_token": "one-time-secret",
+            "expires_at": crate::timeutil::now_unix() + 60
+        });
+        std::fs::write(&state_path, state.to_string()).expect("write pending enrollment");
+        let store = Arc::new(crate::eggpool::EnrollmentStore::new(
+            state_path,
+            Vec::new(),
+            "pool.example".to_string(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let mut context = context_with_key("");
+        context.eggpool_enrollment = Some(store);
+
+        let invalid_token = request_at(
+            "POST",
+            crate::eggpool::ENROLLMENT_PATH,
+            vec![
+                ("Host", "127.0.0.1:8484"),
+                ("Authorization", "Bearer wrong"),
+            ],
+            b"{}",
+        );
+        assert_eq!(handle_request(invalid_token, &context).status, 401);
+
+        let valid_token = request_at(
+            "POST",
+            crate::eggpool::ENROLLMENT_PATH,
+            vec![
+                ("Host", "127.0.0.1:8484"),
+                ("Authorization", "Bearer one-time-secret"),
+            ],
+            b"{}",
+        );
+        // The pending token passed authorization (the body is then rejected),
+        // even though this context has no ordinary API key.
+        assert_eq!(handle_request(valid_token, &context).status, 400);
     }
 
     #[test]
@@ -842,6 +936,7 @@ mod authorisation_tests {
             port: 8484,
             api_key: String::new(),
             usage_key: String::new(),
+            eggpool_enrollment: None,
             keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,

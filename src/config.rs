@@ -313,6 +313,24 @@ impl Default for UpdateSettings {
     }
 }
 
+/// Non-secret settings for the optional EggPool integration.
+///
+/// `ca` is a filesystem path; credentials and PEM contents do not belong in
+/// the configuration file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EggpoolSettings {
+    /// Whether EggPool integration is enabled.
+    pub enabled: bool,
+    /// EggPool control endpoint.
+    pub control: Option<String>,
+    /// Server name presented to EggPool.
+    pub server_name: Option<String>,
+    /// Path to the CA certificate file (not certificate PEM contents).
+    pub ca: Option<PathBuf>,
+    /// Optional agent label.
+    pub label: Option<String>,
+}
+
 /// The effective configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -341,6 +359,8 @@ pub struct Config {
     pub server: ServerLimits,
     /// Where the releases are published.
     pub update: UpdateSettings,
+    /// Optional EggPool integration settings.
+    pub eggpool: EggpoolSettings,
 }
 
 impl Default for Config {
@@ -361,6 +381,7 @@ impl Default for Config {
             timeouts: Timeouts::default(),
             server: ServerLimits::default(),
             update: UpdateSettings::default(),
+            eggpool: EggpoolSettings::default(),
         }
     }
 }
@@ -402,6 +423,14 @@ body_seconds = 1800
 max_connections = 256
 idle_timeout_seconds = 120
 write_timeout_seconds = 600
+
+# Optional EggPool integration. `ca` is a file path, never PEM contents.
+# Do not store tokens, API keys, private keys, or certificate PEM in this file.
+[eggpool]
+enabled = false
+control = ""
+server_name = ""
+ca = ""
 
 # Where `eggpass update` looks for releases. The repository publishes a
 # release manifest beside the binaries it names.
@@ -506,6 +535,7 @@ struct RawConfig {
     timeouts: Option<RawTimeouts>,
     server: Option<RawServer>,
     update: Option<RawUpdate>,
+    eggpool: Option<RawEggpool>,
 }
 
 /// The raw shape of the `[update]` table.
@@ -513,6 +543,19 @@ struct RawConfig {
 struct RawUpdate {
     repository: Option<String>,
     manifest_name: Option<String>,
+}
+
+/// The raw shape of the `[eggpool]` table. Unknown non-secret fields are
+/// retained by the text writer, while credential-like keys are rejected.
+#[derive(Debug, Deserialize, Default)]
+struct RawEggpool {
+    enabled: Option<bool>,
+    control: Option<String>,
+    server_name: Option<String>,
+    ca: Option<String>,
+    label: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
 }
 
 /// The raw shape of the `[timeouts]` table.
@@ -717,6 +760,25 @@ impl Config {
             }
         }
 
+        if let Some(eggpool) = raw.eggpool {
+            validate_eggpool_extras(&eggpool.extra, path)?;
+            if let Some(enabled) = eggpool.enabled {
+                config.eggpool.enabled = enabled;
+            }
+            config.eggpool.control = eggpool.control;
+            config.eggpool.server_name = eggpool.server_name;
+            config.eggpool.ca = eggpool.ca.map(PathBuf::from);
+            config.eggpool.label = eggpool.label;
+            validate_eggpool(&config.eggpool, path)?;
+            if config.eggpool.enabled && !is_loopback_host(&config.host) {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: "EggPool requires the EggPass HTTP listener to bind only to loopback"
+                        .to_string(),
+                });
+            }
+        }
+
         if let Some(providers) = raw.providers {
             if let Some(xai) = providers.xai {
                 if let Some(enabled) = xai.enabled {
@@ -888,11 +950,67 @@ pub fn set_host_id(path: &Path, host_id: &str) -> Result<(), ConfigError> {
     write_file(path, &updated)
 }
 
+/// Update the EggPool settings while preserving unrelated TOML text.
+///
+/// Only non-secret configuration is written; credentials and PEM material are
+/// rejected by validation and never serialized here.
+pub fn set_eggpool_settings(path: &Path, settings: &EggpoolSettings) -> Result<(), ConfigError> {
+    validate_eggpool(settings, path)?;
+    ensure_config_file(path)?;
+
+    let original = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut updated = replace_in_table_value(
+        &original,
+        "eggpool",
+        "enabled",
+        &settings.enabled.to_string(),
+    );
+    let ca = match settings.ca.as_ref() {
+        Some(path) => Some(path.to_str().ok_or_else(|| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: "[eggpool].ca path must be valid UTF-8 to write TOML".to_string(),
+        })?),
+        None => None,
+    };
+    for (key, value) in [
+        ("control", settings.control.as_deref()),
+        ("server_name", settings.server_name.as_deref()),
+        ("ca", ca),
+    ] {
+        updated = match value {
+            Some(value) => replace_in_table(&updated, "eggpool", key, value),
+            None => remove_in_table(&updated, "eggpool", key),
+        };
+    }
+    updated = match &settings.label {
+        Some(label) => replace_in_table(&updated, "eggpool", "label", label),
+        None => remove_in_table(&updated, "eggpool", "label"),
+    };
+
+    // Validate the complete result before replacing the file.
+    Config::parse(&updated, path)?;
+    write_file(path, &updated)
+}
+
+/// Serialize a TOML string value, including any required escaping.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
 /// Replace a key inside a named table, appending it to the table if needed.
 ///
 /// The table is named by its dotted path, so `oauth.openai` means the
 /// `[oauth.openai]` header.
 fn replace_in_table(text: &str, table: &str, key: &str, value: &str) -> String {
+    let value = toml_string(value);
+    replace_in_table_value(text, table, key, &value)
+}
+
+/// Replace a TOML value inside a named table, appending it if needed.
+fn replace_in_table_value(text: &str, table: &str, key: &str, value: &str) -> String {
     let header = format!("[{table}]");
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
 
@@ -920,7 +1038,7 @@ fn replace_in_table(text: &str, table: &str, key: &str, value: &str) -> String {
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("\n{header}\n{key} = \"{value}\"\n"));
+        out.push_str(&format!("\n{header}\n{key} = {value}\n"));
         return out;
     };
 
@@ -947,13 +1065,61 @@ fn replace_in_table(text: &str, table: &str, key: &str, value: &str) -> String {
         while value_end > value_start && line.as_bytes()[value_end - 1].is_ascii_whitespace() {
             value_end -= 1;
         }
-        lines[index].replace_range(value_start..value_end, &format!("\"{value}\""));
+        lines[index].replace_range(value_start..value_end, value);
         return join_lines(&lines, text.ends_with('\n'));
     }
 
     // The key is not in the table yet: add it at the end of the table.
-    lines.insert(table_end, format!("{key} = \"{value}\""));
+    lines.insert(table_end, format!("{key} = {value}"));
     join_lines(&lines, text.ends_with('\n'))
+}
+
+/// Remove a key from a named table while retaining any inline comment.
+fn remove_in_table(text: &str, table: &str, key: &str) -> String {
+    let header = format!("[{table}]");
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut table_start = None;
+    let mut table_end = lines.len();
+    let mut in_table = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            if in_table {
+                table_end = index;
+                break;
+            }
+            if trimmed.trim() == header {
+                table_start = Some(index);
+                in_table = true;
+            }
+        }
+    }
+    let Some(start) = table_start else {
+        return text.to_string();
+    };
+
+    for index in (start + 1)..table_end {
+        let line = &lines[index];
+        let trimmed = line.trim_start();
+        let Some(eq) = find_assignment(trimmed) else {
+            continue;
+        };
+        if trimmed[..eq].trim() != key {
+            continue;
+        }
+        let indentation = line.len() - trimmed.len();
+        let value_start = indentation + eq + 1;
+        let comment = comment_start(&line[value_start..])
+            .map(|offset| line[value_start + offset..].trim_start().to_string());
+        if let Some(comment) = comment {
+            lines[index] = format!("{}{}", &line[..indentation], comment);
+        } else {
+            lines.remove(index);
+        }
+        return join_lines(&lines, text.ends_with('\n'));
+    }
+    text.to_string()
 }
 
 /// Change one top-level key in the configuration file, preserving everything else.
@@ -1062,10 +1228,15 @@ fn join_lines(lines: &[String], trailing_newline: bool) -> String {
 fn find_assignment(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut in_string = false;
+    let mut escaped = false;
     let mut quote = b'"';
     for (index, byte) in bytes.iter().enumerate() {
         if in_string {
-            if *byte == quote {
+            if escaped {
+                escaped = false;
+            } else if quote == b'"' && *byte == b'\\' {
+                escaped = true;
+            } else if *byte == quote {
                 in_string = false;
             }
             continue;
@@ -1087,10 +1258,15 @@ fn find_assignment(line: &str) -> Option<usize> {
 fn comment_start(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
     let mut in_string = false;
+    let mut escaped = false;
     let mut quote = b'"';
     for (index, byte) in bytes.iter().enumerate() {
         if in_string {
-            if *byte == quote {
+            if escaped {
+                escaped = false;
+            } else if quote == b'"' && *byte == b'\\' {
+                escaped = true;
+            } else if *byte == quote {
                 in_string = false;
             }
             continue;
@@ -1105,6 +1281,107 @@ fn comment_start(value: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Validate the non-secret EggPool settings and their conditional requirements.
+fn validate_eggpool(settings: &EggpoolSettings, path: &Path) -> Result<(), ConfigError> {
+    let ca = settings
+        .ca
+        .as_ref()
+        .map(|ca| {
+            ca.to_str().ok_or_else(|| ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: "[eggpool].ca path must be valid UTF-8 to write TOML".to_string(),
+            })
+        })
+        .transpose()?;
+
+    for (name, value) in [
+        ("control", settings.control.as_deref()),
+        ("server_name", settings.server_name.as_deref()),
+        ("label", settings.label.as_deref()),
+        ("ca", ca),
+    ] {
+        if value.is_some_and(|value| value.contains("-----BEGIN ")) {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("[eggpool].{name} must not contain PEM material"),
+            });
+        }
+    }
+
+    if settings.enabled {
+        for (name, value) in [
+            ("control", settings.control.as_deref()),
+            ("server_name", settings.server_name.as_deref()),
+            ("ca", ca),
+        ] {
+            if value.is_none_or(|value| value.trim().is_empty()) {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("[eggpool].{name} must be nonempty when enabled"),
+                });
+            }
+        }
+        if let Some(control) = settings.control.as_deref() {
+            crate::eggpool::validate_control(control).map_err(|message| ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("[eggpool].control {message}"),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject credential-like keys or PEM contents in unmodelled EggPool values.
+fn validate_eggpool_extras(
+    extra: &BTreeMap<String, toml::Value>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    for (key, value) in extra {
+        if credential_like_key(key) || contains_prohibited_eggpool_data(value) {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("[eggpool].{key} must not contain credentials or PEM material"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether a key names credential material rather than a non-secret setting.
+fn credential_like_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    [
+        "token",
+        "apikey",
+        "privatekey",
+        "clientkey",
+        "clientcert",
+        "password",
+        "secret",
+        "credential",
+        "authorization",
+        "pem",
+    ]
+    .iter()
+    .any(|hint| normalized.contains(hint))
+}
+
+/// Whether a TOML value contains credential-like keys or a PEM block marker.
+fn contains_prohibited_eggpool_data(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(text) => text.contains("-----BEGIN "),
+        toml::Value::Array(values) => values.iter().any(contains_prohibited_eggpool_data),
+        toml::Value::Table(values) => values.iter().any(|(key, value)| {
+            credential_like_key(key) || contains_prohibited_eggpool_data(value)
+        }),
+        _ => false,
+    }
 }
 
 /// Validate a port number coming from the configuration file.
@@ -1184,6 +1461,101 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.port, 9000);
         assert_eq!(config.upstream, Upstream::Api);
+    }
+
+    #[test]
+    fn eggpool_defaults_disabled() {
+        let config = Config::parse("", Path::new("config.toml")).unwrap();
+        assert!(!config.eggpool.enabled);
+        assert_eq!(config.eggpool.control, None);
+        assert_eq!(config.eggpool.server_name, None);
+        assert_eq!(config.eggpool.ca, None);
+        assert_eq!(config.eggpool.label, None);
+    }
+
+    #[test]
+    fn eggpool_settings_parse_when_valid() {
+        let config = Config::parse(
+            "[eggpool]\nenabled = true\ncontrol = \"pool.example:18443\"\nserver_name = \"agent.example\"\nca = \"/etc/eggpool/ca.pem\"\nlabel = \"build-agent\"\n",
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        assert!(config.eggpool.enabled);
+        assert_eq!(
+            config.eggpool.control.as_deref(),
+            Some("pool.example:18443")
+        );
+        assert_eq!(config.eggpool.server_name.as_deref(), Some("agent.example"));
+        assert_eq!(
+            config.eggpool.ca.as_deref(),
+            Some(Path::new("/etc/eggpool/ca.pem"))
+        );
+        assert_eq!(config.eggpool.label.as_deref(), Some("build-agent"));
+    }
+
+    #[test]
+    fn enabled_eggpool_requires_a_loopback_http_listener() {
+        let text = "host = \"0.0.0.0\"\n[eggpool]\nenabled = true\ncontrol = \"pool.example:18443\"\nserver_name = \"pool.example\"\nca = \"ca.pem\"\n";
+        let error = Config::parse(text, Path::new("config.toml")).unwrap_err();
+        assert!(error.to_string().contains("loopback"), "{error}");
+    }
+
+    #[test]
+    fn enabled_eggpool_requires_control_server_name_and_ca() {
+        for missing in ["control", "server_name", "ca"] {
+            let mut fields = vec!["enabled = true".to_string()];
+            for (name, value) in [
+                ("control", "pool.example:18443"),
+                ("server_name", "agent.example"),
+                ("ca", "/etc/eggpool/ca.pem"),
+            ] {
+                if name != missing {
+                    fields.push(format!("{name} = \"{value}\""));
+                }
+            }
+            let text = format!("[eggpool]\n{}\n", fields.join("\n"));
+            let error = Config::parse(&text, Path::new("config.toml")).unwrap_err();
+            assert!(error.to_string().contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn eggpool_rejects_control_urls_and_invalid_ports() {
+        for control in [
+            "https://pool.example/control",
+            "pool.example/control",
+            "pool.example:0",
+        ] {
+            let text = format!(
+                "[eggpool]\nenabled = true\ncontrol = \"{control}\"\nserver_name = \"pool.example\"\nca = \"ca.pem\"\n"
+            );
+            let error = Config::parse(&text, Path::new("config.toml"))
+                .expect_err("invalid control endpoint");
+            assert!(error.to_string().contains("control"), "{error}");
+        }
+    }
+
+    #[test]
+    fn eggpool_rejects_credential_keys_and_pem_contents() {
+        for key in [
+            "token",
+            "api_key",
+            "private_key",
+            "password",
+            "secret",
+            "client_key",
+            "client_cert",
+            "credential",
+            "authorization",
+        ] {
+            let text = format!("[eggpool]\nenabled = false\n{key} = \"not allowed\"\n");
+            assert!(Config::parse(&text, Path::new("config.toml")).is_err());
+        }
+        let pem =
+            "[eggpool]\nca = \"-----BEGIN CERTIFICATE-----\\nabc\\n-----END CERTIFICATE-----\"\n";
+        assert!(Config::parse(pem, Path::new("config.toml")).is_err());
+        let nested_secret = "[eggpool.auth]\ntoken = \"not allowed\"\n";
+        assert!(Config::parse(nested_secret, Path::new("config.toml")).is_err());
     }
 
     #[test]
@@ -1272,6 +1644,49 @@ mod tests {
         assert!(text.contains("host = \"0.0.0.0\""), "{text}");
         assert!(text.contains("# loopback"), "{text}");
         assert!(text.contains("port = 8484"), "{text}");
+    }
+
+    #[test]
+    fn set_eggpool_settings_round_trips_and_preserves_unrelated_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# preserve top comment\nfuture_root = 17\n\n[eggpool]\n# preserve table comment\nenabled = false\ncontrol = \"old\" # preserve control comment\nserver_name = \"old-agent\"\nca = \"old-ca.pem\"\nlabel = \"old-label\" # preserve label comment\nfuture_eggpool_setting = \"keep me\"\n\n[unrelated]\nvalue = 42\n",
+        )
+        .unwrap();
+
+        let settings = EggpoolSettings {
+            enabled: true,
+            control: Some("pool.example:18443".to_string()),
+            server_name: Some("agent.example".to_string()),
+            ca: Some(PathBuf::from("/etc/eggpool/ca.pem")),
+            label: Some("builder \"one\"".to_string()),
+        };
+        set_eggpool_settings(&path, &settings).unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.eggpool, settings);
+        let text = std::fs::read_to_string(&path).unwrap();
+        for preserved in [
+            "# preserve top comment",
+            "# preserve table comment",
+            "# preserve control comment",
+            "# preserve label comment",
+            "future_root = 17",
+            "future_eggpool_setting = \"keep me\"",
+            "[unrelated]",
+            "value = 42",
+        ] {
+            assert!(text.contains(preserved), "missing {preserved:?} in {text}");
+        }
+
+        let mut without_label = settings;
+        without_label.label = None;
+        set_eggpool_settings(&path, &without_label).unwrap();
+        assert_eq!(Config::load(&path).unwrap().eggpool.label, None);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# preserve label comment"), "{text}");
     }
 
     #[test]

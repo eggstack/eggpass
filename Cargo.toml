@@ -23,6 +23,7 @@ include = [
     "/docs/client-setup.md",
     "/docs/commands.md",
     "/docs/configuration.md",
+    "/docs/eggpool.md",
     "/docs/how-it-works.md",
     "/docs/troubleshooting.md",
     "/docs/updating.md",
@@ -34,6 +35,8 @@ include = [
 [dependencies]
 eggpass-auth = { version = "0.1.1", path = "crates/eggpass-auth" }
 base64 = "0.23.1"
+# Exact Eggress reverse-client wire/API line used by EggPool.
+eggress-protocol-reverse = "=1.0.12"
 dirs = "7.0.0"
 # Self-update mechanics. Acquisition, transport, release-manifest projection,
 # digest binding, staging, locking, and rollback are owned by the published
@@ -71,6 +74,8 @@ ureq = "3.5.2"
 # in Cargo.lock; the check is the parser, so do not bump it in passing.
 url = "=2.5.8"
 webbrowser = "1.2.7"
+# Clear one-time enrollment and private-key buffers after use.
+zeroize = "1.9.1"
 
 [target.'cfg(unix)'.dependencies]
 # Unix-only process management and raw-terminal support.

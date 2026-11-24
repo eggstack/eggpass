@@ -70,6 +70,11 @@ pub enum Command {
         /// What to do with the keys.
         action: KeyAction,
     },
+    /// Configure or revoke an EggPool client connection.
+    Eggpool {
+        /// What to do with the EggPool connection.
+        action: EggpoolAction,
+    },
 }
 
 /// What `eggpass key` was asked to do.
@@ -89,6 +94,33 @@ pub enum KeyAction {
         /// Whether to take every key away.
         all: bool,
     },
+}
+
+/// What `eggpass eggpool` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EggpoolAction {
+    /// Configure a connection to EggPool.
+    Setup {
+        /// The EggPool control endpoint.
+        control: EggpoolControl,
+        /// The TLS server name expected by EggPool.
+        server_name: String,
+        /// The CA certificate bundle to trust.
+        ca: PathBuf,
+        /// An optional display label for this connection.
+        label: Option<String>,
+    },
+    /// Revoke the configured EggPool connection.
+    Revoke,
+}
+
+/// The host and port of an EggPool control endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EggpoolControl {
+    /// Hostname or IP address (without IPv6 brackets).
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
 }
 
 /// A parsed command line.
@@ -396,6 +428,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
             let action = parse_key_action(&rest)?;
             Command::Key { action }
         }
+        "eggpool" => {
+            if provider.is_some() {
+                return Err(UsageError {
+                    message: "`eggpass eggpool` discovers providers through `/v1/models` and does not accept `--provider`".to_string(),
+                });
+            }
+            let action = parse_eggpool_action(&rest)?;
+            Command::Eggpool { action }
+        }
         other => {
             return Err(UsageError {
                 message: format!("unknown command `{other}`"),
@@ -504,6 +545,176 @@ fn parse_key_action(rest: &[String]) -> Result<KeyAction, UsageError> {
     }
 }
 
+/// Parse the arguments of `eggpass eggpool`.
+fn parse_eggpool_action(rest: &[String]) -> Result<EggpoolAction, UsageError> {
+    let mut revoke = false;
+    let mut setup_flag_seen = false;
+    let mut control = None;
+    let mut server_name = None;
+    let mut ca = None;
+    let mut label = None;
+    let mut index = 0usize;
+
+    while index < rest.len() {
+        let arg = rest[index].as_str();
+        match arg {
+            "--revoke" => {
+                if revoke {
+                    return Err(UsageError {
+                        message: "`--revoke` may only be specified once".to_string(),
+                    });
+                }
+                revoke = true;
+                index += 1;
+            }
+            _ if arg == "--control" || arg.starts_with("--control=") => {
+                setup_flag_seen = true;
+                if control.is_some() {
+                    return Err(UsageError {
+                        message: "`--control` may only be specified once".to_string(),
+                    });
+                }
+                let value = eggpool_option_value(rest, &mut index, "--control", arg)?;
+                control = Some(parse_eggpool_control(value)?);
+            }
+            _ if arg == "--server-name" || arg.starts_with("--server-name=") => {
+                setup_flag_seen = true;
+                if server_name.is_some() {
+                    return Err(UsageError {
+                        message: "`--server-name` may only be specified once".to_string(),
+                    });
+                }
+                let value = eggpool_option_value(rest, &mut index, "--server-name", arg)?;
+                server_name = Some(value.to_string());
+            }
+            _ if arg == "--ca" || arg.starts_with("--ca=") => {
+                setup_flag_seen = true;
+                if ca.is_some() {
+                    return Err(UsageError {
+                        message: "`--ca` may only be specified once".to_string(),
+                    });
+                }
+                let value = eggpool_option_value(rest, &mut index, "--ca", arg)?;
+                ca = Some(PathBuf::from(value));
+            }
+            _ if arg == "--label" || arg.starts_with("--label=") => {
+                setup_flag_seen = true;
+                if label.is_some() {
+                    return Err(UsageError {
+                        message: "`--label` may only be specified once".to_string(),
+                    });
+                }
+                let value = eggpool_option_value(rest, &mut index, "--label", arg)?;
+                label = Some(value.to_string());
+            }
+            _ if arg.starts_with('-') => {
+                return Err(UsageError {
+                    message: format!("unknown option `{arg}` for `eggpass eggpool`"),
+                });
+            }
+            _ => {
+                return Err(UsageError {
+                    message: format!(
+                        "`eggpass eggpool` does not take positional arguments (got `{arg}`)"
+                    ),
+                });
+            }
+        }
+    }
+
+    if revoke {
+        if setup_flag_seen {
+            return Err(UsageError {
+                message: "`--revoke` cannot be combined with EggPool setup options".to_string(),
+            });
+        }
+        return Ok(EggpoolAction::Revoke);
+    }
+
+    let mut missing = Vec::new();
+    if control.is_none() {
+        missing.push("--control");
+    }
+    if server_name.is_none() {
+        missing.push("--server-name");
+    }
+    if ca.is_none() {
+        missing.push("--ca");
+    }
+    if !missing.is_empty() {
+        return Err(UsageError {
+            message: format!("`eggpass eggpool` setup requires {}", missing.join(", ")),
+        });
+    }
+
+    Ok(EggpoolAction::Setup {
+        control: control.expect("required above"),
+        server_name: server_name.expect("required above"),
+        ca: ca.expect("required above"),
+        label,
+    })
+}
+
+/// Read a required EggPool option value in either `--option VALUE` or `--option=VALUE` form.
+fn eggpool_option_value<'a>(
+    rest: &'a [String],
+    index: &mut usize,
+    option: &str,
+    arg: &'a str,
+) -> Result<&'a str, UsageError> {
+    let value = if arg == option {
+        let value = rest.get(*index + 1).ok_or_else(|| UsageError {
+            message: format!("`{option}` requires a value"),
+        })?;
+        if value.starts_with("--") {
+            return Err(UsageError {
+                message: format!("`{option}` requires a value"),
+            });
+        }
+        *index += 2;
+        value.as_str()
+    } else {
+        *index += 1;
+        arg.strip_prefix(&format!("{option}=")).unwrap_or_default()
+    };
+    if value.is_empty() {
+        return Err(UsageError {
+            message: format!("`{option}` requires a non-empty value"),
+        });
+    }
+    Ok(value)
+}
+
+/// Parse and validate an EggPool `HOST:PORT` control endpoint.
+fn parse_eggpool_control(value: &str) -> Result<EggpoolControl, UsageError> {
+    let invalid = || UsageError {
+        message: format!("invalid EggPool control address `{value}` (expected HOST:PORT)"),
+    };
+    let (host, port) = if value.starts_with('[') {
+        let close = value.find(']').ok_or_else(invalid)?;
+        let host = &value[1..close];
+        let port = value[close + 1..].strip_prefix(':').ok_or_else(invalid)?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(invalid());
+        }
+        (host, port)
+    } else {
+        let (host, port) = value.split_once(':').ok_or_else(invalid)?;
+        if host.contains(':') {
+            return Err(invalid());
+        }
+        (host, port)
+    };
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    let port = parse_port(port)?;
+    Ok(EggpoolControl {
+        host: host.to_string(),
+        port,
+    })
+}
+
 /// Parse the number of a key given on the command line.
 fn parse_key_number(value: &str) -> Result<u32, UsageError> {
     let number: u32 = value.parse().map_err(|_| UsageError {
@@ -538,7 +749,7 @@ pub fn global_help() -> String {
              edit        Open the config file in your editor\n    \
              croncheck   Start the daemon only if it is not already running\n    \
              update      Update to the latest released version\n    \
-             key         Issue, list and revoke the keys clients use\n\
+             key         Issue, list and revoke the keys clients use\n             eggpool     Configure or revoke an EggPool connection\n\
          \n\
          OPTIONS:\n    \
              --config <path>     Use a different config file\n    \
@@ -606,6 +817,16 @@ pub fn command_help(name: &str) -> String {
             revoke --all  Revoke every key\n"
                 .to_string()
         }
+        "eggpool" => "eggpass eggpool [--control HOST:PORT --server-name NAME --ca PATH --label NAME]\n\n\
+            eggpass eggpool --revoke\n\n\
+            Configure EggPool and print a one-time enrollment ticket;\n\
+            the CA bundle stays local, and the EggPass listener must remain on loopback.\n\n\
+            --control HOST:PORT   EggPool control endpoint\n\
+            --server-name NAME   TLS server name expected by EggPool\n\
+            --ca PATH            CA certificate bundle to trust\n\
+            --label NAME         Optional connection label\n\
+            --revoke             Revoke the configured EggPool connection\n"
+            .to_string(),
         other => format!("unknown command `{other}`\n"),
     }
 }
@@ -943,5 +1164,122 @@ mod tests {
             panic!("expected help")
         };
         assert!(text.contains("--json"), "{text}");
+    }
+
+    #[test]
+    fn eggpool_setup_and_revoke_actions_are_parsed() {
+        let ParseOutcome::Run(cli) = parse_args(&[
+            "eggpool",
+            "--control",
+            "pool.example:8443",
+            "--server-name",
+            "eggpool.internal",
+            "--ca",
+            "/etc/ssl/eggpool.pem",
+            "--label",
+            "work",
+        ])
+        .unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Eggpool {
+                action: EggpoolAction::Setup {
+                    control: EggpoolControl {
+                        host: "pool.example".to_string(),
+                        port: 8443,
+                    },
+                    server_name: "eggpool.internal".to_string(),
+                    ca: PathBuf::from("/etc/ssl/eggpool.pem"),
+                    label: Some("work".to_string()),
+                },
+            }
+        );
+
+        let ParseOutcome::Run(cli) = parse_args(&["eggpool", "--revoke"]).unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Eggpool {
+                action: EggpoolAction::Revoke,
+            }
+        );
+    }
+
+    #[test]
+    fn eggpool_setup_label_is_optional_and_equals_values_work() {
+        let ParseOutcome::Run(cli) = parse_args(&[
+            "eggpool",
+            "--control=127.0.0.1:7000",
+            "--server-name=pool.internal",
+            "--ca=/tmp/ca.pem",
+        ])
+        .unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            cli.command,
+            Command::Eggpool {
+                action: EggpoolAction::Setup {
+                    control: EggpoolControl {
+                        host: "127.0.0.1".to_string(),
+                        port: 7000,
+                    },
+                    server_name: "pool.internal".to_string(),
+                    ca: PathBuf::from("/tmp/ca.pem"),
+                    label: None,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_eggpool_option_combinations_are_usage_errors() {
+        for args in [
+            vec!["eggpool", "--revoke", "--control", "pool:443"],
+            vec!["eggpool", "--revoke", "--server-name", "pool"],
+            vec!["eggpool", "--revoke", "--ca", "ca.pem"],
+            vec!["eggpool", "--revoke", "--label", "pool"],
+            vec!["eggpool", "--control", "pool:443", "--server-name", "pool"],
+            vec!["eggpool", "--control", "pool:443", "--ca", "ca.pem"],
+            vec!["eggpool", "--server-name", "pool", "--ca", "ca.pem"],
+            vec![
+                "eggpool",
+                "--control",
+                "pool:0",
+                "--server-name",
+                "pool",
+                "--ca",
+                "ca.pem",
+            ],
+            vec![
+                "eggpool",
+                "--control",
+                "pool:443",
+                "--server-name",
+                "pool",
+                "--ca",
+                "ca.pem",
+                "--provider",
+                "xai",
+            ],
+        ] {
+            assert!(parse_args(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn eggpool_help_describes_both_actions_and_global_help_lists_it() {
+        assert!(global_help().contains("eggpool     Configure or revoke an EggPool connection"));
+        let ParseOutcome::Help(text) = parse_args(&["eggpool", "--help"]).unwrap() else {
+            panic!("expected help")
+        };
+        assert!(text.contains("--control HOST:PORT"), "{text}");
+        assert!(text.contains("--revoke"), "{text}");
+        assert!(text.contains("one-time enrollment ticket"), "{text}");
+        assert!(!text.contains("/v1/models"), "{text}");
+        assert!(!text.contains("--provider"), "{text}");
     }
 }

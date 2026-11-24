@@ -420,6 +420,7 @@ fn harness_with_specs(
         port,
         api_key: api_key.to_string(),
         usage_key: "server-test-usage-key".to_string(),
+        eggpool_enrollment: None,
         keys: Arc::clone(&keys),
         providers,
         default_provider,

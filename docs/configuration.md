@@ -70,6 +70,12 @@ For a prefix match, the longest matching prefix wins. With the defaults, names b
 
 The advanced `[oauth.xai]` settings are `client_id`, `issuer`, `scopes`, and `referrer`. `[oauth.openai]` supports `issuer`, `scopes`, `agent_name_hint`, `resource`, and `ext_agent_host_id`. `scopes` can be a space-separated string or an array of strings. Leave these at their built-in values unless a provider requires a change. The ChatGPT host ID is generated and recorded on first sign-in if it is absent.
 
+## EggPool
+
+eggpass eggpool --control HOST:PORT --server-name NAME --ca PATH [--label NAME] enables the optional outbound EggPool reverse tunnel. control must be a bare Eggress control host and TCP port (not a URL); server_name is the TLS name checked for the control server; ca is a path to its CA PEM bundle. EggPool mode refuses to start unless host is loopback. EggPass uses a fixed loopback forwarding target equal to its configured listener address; ticket data cannot select an arbitrary target. EggPool must rewrite forwarded HTTP Host headers to 127.0.0.1 (or localhost) to pass the loopback authority guard.
+
+The config stores only non-secret fields (enabled, control, server_name, ca, and optional label). Enrollment tokens, client certificates/private keys, and status state are kept in owner-only files in the data directory. The one-line ticket printed by setup is a bearer secret: give it only to the trusted EggPool enrollment flow. See [eggpool.md](eggpool.md) for the wire contract and certificate exchange. Use eggpass eggpool --revoke to remove local state and disable the tunnel.
+
 ## Keys and network exposure
 
 A client key is required to start the server, including when it listens only on loopback. Use `eggpass key add` to create a numbered, revocable key, or set `api_key` for one static key. The static key is readable in the config. Issued keys are shown once and stored as salted hashes. Clients may send either as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.

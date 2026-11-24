@@ -97,17 +97,29 @@ fn print_server(context: &Context) {
             println!("  auth:      {}", auth_summary(context));
             println!("  upstream:  {}", context.config.upstream.display_name());
             println!("  models:    {}", model_count(context));
+            println!(
+                "  eggpool:   {}",
+                crate::eggpool::status_summary(&context.config.eggpool, &context.paths, true)
+            );
         }
         DaemonState::Stale { pid } => {
             println!("Server:   stopped");
             println!("  pid:       {pid} (stale)");
             println!("  url:       {}", context.config.api_base_url());
             println!("  auth:      {}", auth_summary(context));
+            println!(
+                "  eggpool:   {}",
+                crate::eggpool::status_summary(&context.config.eggpool, &context.paths, false)
+            );
         }
         DaemonState::Stopped => {
             println!("Server:   stopped");
             println!("  url:       {}", context.config.api_base_url());
             println!("  auth:      {}", auth_summary(context));
+            println!(
+                "  eggpool:   {}",
+                crate::eggpool::status_summary(&context.config.eggpool, &context.paths, false)
+            );
         }
     }
 }

@@ -110,6 +110,19 @@ ssh -L 8484:127.0.0.1:8484 box
 
 **Exit codes:** `0` if the value is shown or applied, including when already serving it. `1` for an invalid or unavailable address, a write failure, or a failed restart.
 
+## `eggpool`
+
+```sh
+eggpass eggpool --control pool.example:18443 --server-name pool.example --ca ./eggpool-ca.pem --label workstation
+eggpass eggpool --revoke
+```
+
+Setup writes non-secret connection settings to [eggpool], creates an EggPass API key for the agent, and prints one epagent1. enrollment ticket to stdout. Treat the ticket as a secret: it contains the one-time enrollment credential and the EggPass API key, and is shown only once. If the daemon is already running on loopback, setup restarts it to activate the tunnel; if it is stopped, setup leaves it stopped. The listener must remain loopback-only while EggPool is enabled. eggpass status reports connection state without printing credentials.
+
+--revoke stops a running daemon before removing local enrollment state and the EggPool API key. It restarts only if another EggPass API key remains; otherwise the daemon stays stopped. It does not contact EggPool to revoke a certificate already issued there; that server-side operation must be provided by EggPool.
+
+Exit code: 0 on success; 1 if settings, credentials, the CA file, or daemon restart cannot be handled.
+
 ## `key`
 
 ```sh
