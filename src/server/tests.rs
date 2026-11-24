@@ -324,80 +324,97 @@ fn harness_with_spec(
     access_token: &str,
     spec: ProviderSpec,
 ) -> Harness {
+    harness_with_specs(api_key, vec![(stub, spec, Some(access_token))])
+}
+
+/// Start a proxy with several provider fixtures. A missing access token leaves
+/// that configured provider unsigned, so catalogue tests can prove it is skipped.
+fn harness_with_specs(
+    api_key: &str,
+    fixtures: Vec<(&Stub, ProviderSpec, Option<&str>)>,
+) -> Harness {
+    assert!(
+        !fixtures.is_empty(),
+        "at least one provider fixture is required"
+    );
     let directory = tempfile::tempdir().expect("temp dir");
     let paths = Paths::in_directory(directory.path());
     paths.ensure_dir().expect("config dir");
 
-    let now = timeutil::now_unix();
-    let auth = StoredAuth {
-        access_token: access_token.to_string(),
-        refresh_token: Some("stored-refresh".to_string()),
-        id_token: None,
-        token_type: "Bearer".to_string(),
-        scope: None,
-        client_id: "client".to_string(),
-        issuer: stub.base_url(),
-        expires_at: Some(now + 3_600),
-        obtained_at: now,
-        user_id: Some("user-1".to_string()),
-        email: Some("user@example.com".to_string()),
-        ext_agent_host_id: None,
-        plan_enabled: false,
-    };
-    crate::auth::store::save(&paths.credential_file(spec.id.as_str()), &auth)
-        .expect("credentials are written");
+    let mut providers = HashMap::new();
+    let mut provider_ids = Vec::new();
+    let mut usage_sources: HashMap<ProviderId, (Arc<TokenManager>, String)> = HashMap::new();
+    for (stub, spec, access_token) in fixtures {
+        if let Some(access_token) = access_token {
+            let now = timeutil::now_unix();
+            let auth = StoredAuth {
+                access_token: access_token.to_string(),
+                refresh_token: Some("stored-refresh".to_string()),
+                id_token: None,
+                token_type: "Bearer".to_string(),
+                scope: None,
+                client_id: "client".to_string(),
+                issuer: stub.base_url(),
+                expires_at: Some(now + 3_600),
+                obtained_at: now,
+                user_id: Some("user-1".to_string()),
+                email: Some("user@example.com".to_string()),
+                ext_agent_host_id: None,
+                plan_enabled: false,
+            };
+            crate::auth::store::save(&paths.credential_file(spec.id.as_str()), &auth)
+                .expect("credentials are written");
+        }
 
-    let upstream = UpstreamClient::new(&spec);
-    let client = OAuthClient::for_provider(&spec, "client");
-    let tokens = TokenManager::new(paths.credential_file(spec.id.as_str()), client);
+        let upstream = UpstreamClient::new(&spec);
+        let client = OAuthClient::for_provider(&spec, "client");
+        let tokens = Arc::new(TokenManager::new(
+            paths.credential_file(spec.id.as_str()),
+            client,
+        ));
+        provider_ids.push(spec.id);
+        usage_sources.insert(spec.id, (Arc::clone(&tokens), stub.base_url()));
+        providers.insert(
+            spec.id,
+            ProviderHandle {
+                spec,
+                upstream,
+                tokens,
+            },
+        );
+    }
 
     let keys = Arc::new(crate::keys::KeyStore::open(paths.key_store_file()).expect("key store"));
-
-    let mut providers = HashMap::new();
-    providers.insert(
-        spec.id,
-        ProviderHandle {
-            spec: spec.clone(),
-            upstream,
-            tokens: Arc::new(tokens),
-        },
-    );
-
     let server = Server::bind_with_limits("127.0.0.1", 0, crate::config::ServerLimits::default())
         .expect("proxy binds");
     let port = server.address().port();
-
     let inferences = Arc::new(crate::inference::InferenceState::new());
-
     let usage_calls = Arc::new(AtomicUsize::new(0));
     let usage_calls_for_collector = Arc::clone(&usage_calls);
-    let usage_tokens = Arc::clone(
-        &providers
-            .get(&spec.id)
-            .expect("provider is registered")
-            .tokens,
-    );
-    let usage_base_url = stub.base_url();
     let usage_timeouts = crate::config::Timeouts {
         connect_seconds: 1,
         global_seconds: 1,
         body_seconds: 1,
     };
     let usage_cache = Arc::new(crate::server::usage::UsageCache::new(
-        vec![spec.id],
+        provider_ids.clone(),
         move |provider| {
             usage_calls_for_collector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (usage_tokens, usage_base_url) = usage_sources
+                .get(&provider)
+                .expect("usage provider is registered");
             crate::provider::usage::report::collect_entry(
                 provider,
                 crate::config::Upstream::Api,
                 usage_tokens.as_ref(),
                 usage_timeouts,
                 None,
-                &usage_base_url,
+                usage_base_url,
             )
         },
     ));
 
+    let default_provider = *provider_ids.first().expect("provider fixture");
     let context = Arc::new(ServerContext {
         host: "127.0.0.1".to_string(),
         port,
@@ -405,7 +422,7 @@ fn harness_with_spec(
         usage_key: "server-test-usage-key".to_string(),
         keys: Arc::clone(&keys),
         providers,
-        default_provider: spec.id,
+        default_provider,
         routing: Routing::default(),
         upstream_in_flight: Arc::new(AtomicUsize::new(0)),
         max_upstream_requests: crate::server::DEFAULT_MAX_UPSTREAM_REQUESTS,
@@ -415,15 +432,13 @@ fn harness_with_spec(
 
     let running = Arc::clone(&server);
     std::thread::spawn(move || running.serve(context));
-
-    // Give the accept loop a moment to start.
     std::thread::sleep(Duration::from_millis(50));
 
     Harness {
         port,
         keys,
         inferences,
-        provider: spec.id,
+        provider: default_provider,
         usage_calls,
         _directory: directory,
     }
@@ -967,6 +982,254 @@ fn the_model_list_comes_from_the_upstream() {
     // The catalogue is exactly what the provider advertises. There is no
     // compiled-in list of model names to pad it with.
     assert_eq!(ids, vec!["grok-4.7"]);
+}
+
+#[test]
+fn reasoning_levels_are_visible_on_merged_and_single_model_routes() {
+    let xai_stub = Stub::start(|request| {
+        if request.path == "/v1/models" {
+            Reply::json(
+                200,
+                r#"{"data":[
+                    {"id":"grok-4.7","object":"model","owned_by":"xai","context_length":500000,"capabilities":{"reasoning_effort":["low","future-level","high"],"default_reasoning_effort":"future-level","tools":true}},
+                    {"id":"shared-model","object":"model","owned_by":"xai","capabilities":{"reasoning_effort":["xai-level"]}}
+                ]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let chatgpt_stub = Stub::start(|request| {
+        if request.path == "/v1/models" {
+            Reply::json(
+                200,
+                r#"{"models":[
+                    {"slug":"gpt-6.1-sol","display_name":"GPT-6.1 Sol","visibility":"list","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"high"},{"effort":"experimental-future"}],"default_reasoning_level":"minimal","context_window":500000,"base_instructions":"private prompt"},
+                    {"slug":"shared-model","visibility":"list","supported_reasoning_levels":[{"effort":"openai-level"}],"default_reasoning_level":"openai-level"}
+                ]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+
+    // Deliberately insert providers in reverse precedence order. The merged
+    // catalogue must still use ProviderId::all's stable ordering.
+    let harness = harness_with_specs(
+        "secret-key",
+        vec![
+            (
+                &chatgpt_stub,
+                chatgpt_stub_spec(&chatgpt_stub),
+                Some("chatgpt-token"),
+            ),
+            (&xai_stub, stub_spec(&xai_stub), Some("grok-token")),
+        ],
+    );
+    let http = agent();
+    let response = http
+        .get(harness.url("/v1/models"))
+        .header("Authorization", "Bearer secret-key")
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_json_body(response);
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().expect("merged data array");
+    let ids: Vec<&str> = data
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id"))
+        .collect();
+    assert_eq!(ids, vec!["grok-4.7", "shared-model", "gpt-6.1-sol"]);
+
+    let grok = data.iter().find(|model| model["id"] == "grok-4.7").unwrap();
+    assert_eq!(
+        grok["reasoning"]["supported_efforts"],
+        json!(["low", "future-level", "high"])
+    );
+    assert_eq!(grok["reasoning"]["default_effort"], "future-level");
+    assert_eq!(
+        grok["capabilities"]["reasoning_effort"],
+        json!(["low", "future-level", "high"])
+    );
+    assert_eq!(
+        grok["capabilities"]["default_reasoning_effort"],
+        "future-level"
+    );
+    assert_eq!(grok["capabilities"]["tools"], true);
+
+    let chatgpt = data
+        .iter()
+        .find(|model| model["id"] == "gpt-6.1-sol")
+        .unwrap();
+    assert_eq!(
+        chatgpt["reasoning"]["supported_efforts"],
+        json!(["minimal", "high", "experimental-future"])
+    );
+    assert_eq!(chatgpt["reasoning"]["default_effort"], "minimal");
+    assert_eq!(
+        chatgpt["supported_reasoning_levels"][0]["effort"],
+        "minimal"
+    );
+    assert_eq!(chatgpt["default_reasoning_level"], "minimal");
+    assert!(chatgpt.get("base_instructions").is_none());
+
+    // XAI is the stable first provider, so its native record wins a duplicate
+    // ID even though the fixtures were inserted in the opposite order.
+    let shared = data
+        .iter()
+        .find(|model| model["id"] == "shared-model")
+        .unwrap();
+    assert_eq!(shared["owned_by"], "xai");
+    assert_eq!(
+        shared["reasoning"]["supported_efforts"],
+        json!(["xai-level"])
+    );
+
+    let single_model = |id: &str| {
+        let path = format!("/v1/models/{id}");
+        let response = http
+            .get(&harness.url(&path))
+            .header("Authorization", "Bearer secret-key")
+            .call()
+            .expect("the single-model route answers");
+        assert_eq!(response.status().as_u16(), 200);
+        read_json_body(response)
+    };
+    assert_eq!(single_model("grok-4.7"), *grok);
+    assert_eq!(single_model("gpt-6.1-sol"), *chatgpt);
+}
+
+#[test]
+fn an_unauthenticated_model_catalogue_request_is_rejected_before_upstream_access() {
+    let stub = Stub::start(|_| Reply::json(200, r#"{"data":[]}"#));
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    let response = agent()
+        .get(harness.url("/v1/models"))
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 401);
+    assert!(
+        stub.requests().is_empty(),
+        "unauthenticated catalogue requests must not reach providers"
+    );
+}
+
+#[test]
+fn an_unsigned_provider_contributes_no_catalogue_entries() {
+    let xai_stub = Stub::start(|request| {
+        if request.path == "/v1/models" {
+            Reply::json(200, r#"{"data":[{"id":"grok-signed","object":"model"}]}"#)
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let chatgpt_stub = Stub::start(|request| {
+        if request.path == "/v1/models" {
+            Reply::json(
+                200,
+                r#"{"models":[{"slug":"gpt-unsigned","visibility":"list"}]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness_with_specs(
+        "secret-key",
+        vec![
+            (&xai_stub, stub_spec(&xai_stub), Some("grok-token")),
+            (&chatgpt_stub, chatgpt_stub_spec(&chatgpt_stub), None),
+        ],
+    );
+
+    let response = agent()
+        .get(harness.url("/v1/models"))
+        .header("Authorization", "Bearer secret-key")
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_json_body(response);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["id"], "grok-signed");
+    assert!(
+        chatgpt_stub.requests().is_empty(),
+        "unsigned providers must not be queried"
+    );
+}
+
+#[test]
+fn catalogue_failures_do_not_create_reasoning_claims() {
+    let xai_stub = Stub::start(|_| {
+        Reply::json(
+            503,
+            r#"{"data":[{"id":"unavailable-model","capabilities":{"reasoning_effort":["high"]}}]}"#,
+        )
+    });
+    let chatgpt_stub = Stub::start(|request| {
+        if request.path == "/v1/models" {
+            Reply::json(
+                200,
+                r#"{"models":[{"slug":"gpt-no-levels","display_name":"GPT","visibility":"list"}]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness_with_specs(
+        "secret-key",
+        vec![
+            (&xai_stub, stub_spec(&xai_stub), Some("grok-token")),
+            (
+                &chatgpt_stub,
+                chatgpt_stub_spec(&chatgpt_stub),
+                Some("chatgpt-token"),
+            ),
+        ],
+    );
+
+    let response = agent()
+        .get(harness.url("/v1/models"))
+        .header("Authorization", "Bearer secret-key")
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_json_body(response);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["id"], "gpt-no-levels");
+    assert!(body["data"][0].get("reasoning").is_none());
+    assert!(body["data"][0].get("capabilities").is_none());
+    assert_eq!(xai_stub.requests().len(), 1);
+}
+
+#[test]
+fn grok_reasoning_effort_is_forwarded_unchanged() {
+    let stub = Stub::start(|request| {
+        if request.path == "/v1/chat/completions" {
+            Reply::json(200, r#"{"id":"chatcmpl-stub","choices":[]}"#)
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness(&stub, "secret-key", "grok-token");
+    let body = json!({
+        "model":"grok-4.7",
+        "messages":[{"role":"user","content":"hello"}],
+        "reasoning_effort":"future-level"
+    });
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .expect("the proxy answers");
+    assert_eq!(response.status().as_u16(), 200);
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1);
+    let forwarded: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(forwarded["reasoning_effort"], "future-level");
+    assert!(forwarded.get("reasoning").is_none());
 }
 
 #[test]
