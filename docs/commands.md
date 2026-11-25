@@ -19,7 +19,7 @@ Point an OpenAI-compatible client at `http://127.0.0.1:8484/v1` and send the key
 | Option | Meaning |
 | --- | --- |
 | `--config <PATH>` | Use a different TOML config file for this command. Other eggpass files stay in the usual data directory. |
-| `--provider <ID>` | Select `xai` or `openai` for `login`, `logout`, or `usage`. |
+| `--provider <ID>` | Select `xai` or `openai` for `login`, `logout`, `refresh`, or `usage`. |
 | `--verbose`, `-v` | Enable debug logging. |
 | `--help`, `-h` | Show help. |
 | `--version`, `-V` | Show the version. |
@@ -47,6 +47,15 @@ Without `--provider`, `login` offers enabled providers and `logout` offers provi
 `logout` attempts provider-side revocation, then removes the local credential. Revocation is best-effort, so a failed revocation does not prevent local removal. A running server stays up, but requests to the signed-out provider will fail until you sign in again.
 
 **Exit codes:** `login` returns `0` on success or cancellation, `1` on failure, and `2` if device flow is requested for a provider that does not support it. `logout` returns `0` on success, cancellation, or failed provider-side revocation. Credential read or removal errors return `1`.
+
+## `refresh`
+
+```sh
+eggpass refresh                         # choose a signed-in provider
+eggpass refresh --provider openai       # select one directly
+```
+
+`refresh` forces an OAuth credential refresh immediately, even when the access token is not near expiry. It does not send an inference request or remove the existing credentials. Without `--provider`, the picker lists providers with stored credentials; cancelling does nothing. A successful refresh stores rotated credentials. If the provider rejects the refresh or the stored credentials have no refresh token, run `eggpass login --provider <ID>` to sign in again. The command returns `1` when an explicitly selected provider cannot be refreshed; with no selected provider and no stored credentials, it prints `Not logged in.` and returns `0`.
 
 ## `status`
 

@@ -279,6 +279,7 @@ fn spawn_token_refresh_workers(context: &ServerContext) -> Vec<(mpsc::Sender<()>
                                 let reason = match error {
                                     TokenError::NotLoggedIn => "credentials unavailable",
                                     TokenError::Store(_) => "credential store error",
+                                    TokenError::Lock(_) => "credential refresh lock error",
                                     TokenError::Auth(_) => "OAuth refresh error",
                                     TokenError::NoRefreshToken => "no refresh token",
                                 };

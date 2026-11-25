@@ -26,6 +26,11 @@ pub enum Command {
         /// The provider to sign out of, when it was named.
         provider: Option<ProviderId>,
     },
+    /// Force-refresh a provider's stored credentials.
+    Refresh {
+        /// The provider to refresh, when it was named.
+        provider: Option<ProviderId>,
+    },
     /// Report account and daemon state.
     Status,
     /// Report how much of the subscription allowance remains.
@@ -306,6 +311,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseOutcome, Us
                 }
             }
             Command::Logout { provider }
+        }
+        "refresh" => {
+            expect_no_args(&name, &rest)?;
+            Command::Refresh { provider }
         }
         "status" => {
             expect_no_args(&name, &rest)?;
@@ -739,6 +748,7 @@ pub fn global_help() -> String {
          COMMANDS:\n    \
              login       Authenticate with a provider over OAuth\n    \
              logout      Revoke and remove stored credentials\n    \
+             refresh     Force-refresh a provider's stored credentials\n    \
              status      Show account and daemon state\n    \
              usage       Show how much of the subscription allowance remains\n    \
              run         Start the server as a background daemon\n    \
@@ -775,6 +785,7 @@ pub fn command_help(name: &str) -> String {
             Revoke and remove the stored credentials. Without --provider a picker\n\
             lists the providers you are signed in to.\n"
             .to_string(),
+        "refresh" => "eggpass refresh [--provider ID]\n\nForce-refresh stored credentials without sending an inference request.\nWithout --provider, choose from signed-in providers.\n".to_string(),
         "status" => "eggpass status\n\nShow account state and daemon state.\n".to_string(),
         "usage" => {
             "eggpass usage [--json]\n\n\
@@ -975,6 +986,25 @@ mod tests {
     }
 
     #[test]
+    fn refresh_accepts_a_provider_before_or_after_the_command() {
+        for args in [
+            vec!["--provider", "openai", "refresh"],
+            vec!["refresh", "--provider=openai"],
+        ] {
+            let ParseOutcome::Run(cli) = parse_args(&args).unwrap() else {
+                panic!("expected a command")
+            };
+            assert_eq!(
+                cli.command,
+                Command::Refresh {
+                    provider: Some(ProviderId::OpenAi)
+                }
+            );
+        }
+        assert!(parse_args(&["refresh", "extra"]).is_err());
+    }
+
+    #[test]
     fn an_unknown_provider_is_a_usage_error() {
         assert!(parse_args(&["--provider", "nope", "login"]).is_err());
     }
@@ -1024,6 +1054,15 @@ mod tests {
         let usage = command_help("usage");
         assert!(usage.contains("allowance remains"), "{usage}");
         assert!(!usage.contains("allowance is used"), "{usage}");
+    }
+
+    #[test]
+    fn refresh_has_command_help() {
+        let ParseOutcome::Help(text) = parse_args(&["refresh", "--help"]).unwrap() else {
+            panic!("expected help")
+        };
+        assert!(text.contains("Force-refresh stored credentials"), "{text}");
+        assert!(text.contains("--provider"), "{text}");
     }
 
     #[test]

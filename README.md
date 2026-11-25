@@ -173,6 +173,7 @@ cleared when the daemon stops.
 | --- | --- |
 | `eggpass login` | Sign in to a provider. |
 | `eggpass logout` | Revoke and remove a provider credential. |
+| `eggpass refresh` | Force-refresh stored credentials without an inference request. |
 | `eggpass status` | Show provider login and server state. |
 | `eggpass usage` | Show subscription usage where available, preferring the running daemon's cached report. |
 | `eggpass run` | Start the server. Use `--foreground` to keep it in the terminal. |
