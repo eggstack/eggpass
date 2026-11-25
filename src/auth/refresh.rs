@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use super::client::{AuthError, OAuthClient, TokenSet};
 use super::store::{self, StoreError, StoredAuth};
@@ -17,6 +18,9 @@ use crate::timeutil;
 
 /// How long before expiry we refresh the access token.
 pub const REFRESH_SKEW_SECS: i64 = 5 * 60;
+
+/// A daemon refresh check should not hold shutdown open during an outage.
+const BACKGROUND_REFRESH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Errors raised while obtaining a usable access token.
 #[derive(Debug)]
@@ -120,22 +124,44 @@ impl TokenManager {
     ///
     /// Refreshes the token first if it is about to expire.
     pub fn access_token(&self) -> Result<String, TokenError> {
+        self.usable_auth(None)?
+            .map(|auth| auth.access_token)
+            .ok_or(TokenError::NotLoggedIn)
+    }
+
+    /// Refresh the stored credentials when they are near expiry.
+    ///
+    /// A daemon can call this periodically, independently of provider traffic.
+    /// No credentials is not an error: the provider may not be signed in yet.
+    pub fn refresh_if_needed(&self) -> Result<(), TokenError> {
+        self.usable_auth(Some(BACKGROUND_REFRESH_TIMEOUT))
+            .map(|_| ())
+    }
+
+    /// Return current credentials after refreshing them when necessary.
+    fn usable_auth(
+        &self,
+        refresh_timeout: Option<Duration>,
+    ) -> Result<Option<StoredAuth>, TokenError> {
         let Some(auth) = self.current()? else {
-            return Err(TokenError::NotLoggedIn);
+            return Ok(None);
         };
 
         if auth.is_fresh(timeutil::now_unix(), self.skew) {
-            return Ok(auth.access_token);
+            return Ok(Some(auth));
         }
 
         let guard = self.lock();
-        // Another process may have refreshed while we waited for the lock.
-        let auth = self.current()?.ok_or(TokenError::NotLoggedIn)?;
+        // Re-read after acquiring the lock in case another caller refreshed.
+        let Some(auth) = self.current()? else {
+            return Ok(None);
+        };
         if auth.is_fresh(timeutil::now_unix(), self.skew) {
-            return Ok(auth.access_token);
+            return Ok(Some(auth));
         }
 
-        Ok(self.refresh_locked(&guard, &auth)?.access_token)
+        self.refresh_locked(&guard, &auth, refresh_timeout)
+            .map(Some)
     }
 
     /// Refresh after an upstream request was rejected with `401`.
@@ -153,7 +179,7 @@ impl TokenManager {
             return Ok(auth.access_token);
         }
 
-        Ok(self.refresh_locked(&guard, &auth)?.access_token)
+        Ok(self.refresh_locked(&guard, &auth, None)?.access_token)
     }
 
     /// Perform the refresh. The caller must hold the lock.
@@ -161,6 +187,7 @@ impl TokenManager {
         &self,
         _guard: &MutexGuard<'_, ()>,
         current: &StoredAuth,
+        timeout: Option<Duration>,
     ) -> Result<StoredAuth, TokenError> {
         let Some(refresh_token) = current.refresh_token.clone() else {
             return Err(TokenError::NoRefreshToken);
@@ -173,7 +200,13 @@ impl TokenManager {
         } else {
             current.client_id.clone()
         };
-        let tokens = self.client.refresh_as(&refresh_token, &client_id)?;
+        let tokens = match timeout {
+            Some(timeout) => {
+                self.client
+                    .refresh_as_with_timeout(&refresh_token, &client_id, timeout)?
+            }
+            None => self.client.refresh_as(&refresh_token, &client_id)?,
+        };
         let refreshed = merge_refreshed(current, &tokens);
 
         store::save(&self.path, &refreshed)?;
@@ -287,5 +320,58 @@ mod tests {
         let merged = merge_refreshed(&stored(), &tokens("new-access", None));
         assert_eq!(merged.email.as_deref(), Some("a@b.c"));
         assert_eq!(merged.user_id.as_deref(), Some("user"));
+    }
+
+    fn local_token_manager(path: &std::path::Path) -> TokenManager {
+        let config = crate::config::Config::default();
+        let mut spec = crate::provider::spec_for(crate::provider::ProviderId::OpenAi, &config);
+        // Keep any accidental refresh attempt on loopback; these tests never
+        // send credentials to a real provider.
+        spec.issuer = "http://127.0.0.1:9".to_string();
+        let client = OAuthClient::for_provider(&spec, &spec.entry_client_id);
+        TokenManager::new(path.to_path_buf(), client)
+    }
+
+    #[test]
+    fn periodic_refresh_is_a_noop_without_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = local_token_manager(&directory.path().join("auth.json"));
+
+        assert!(manager.refresh_if_needed().is_ok());
+    }
+
+    #[test]
+    fn periodic_refresh_leaves_fresh_credentials_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let now = timeutil::now_unix();
+        let mut auth = stored();
+        auth.expires_at = Some(now + 3600);
+        auth.obtained_at = now;
+        store::save(&path, &auth).unwrap();
+        let manager = local_token_manager(&path);
+
+        assert!(manager.refresh_if_needed().is_ok());
+        assert_eq!(
+            manager.current().unwrap().unwrap().access_token,
+            "old-access"
+        );
+    }
+
+    #[test]
+    fn periodic_refresh_attempts_due_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let now = timeutil::now_unix();
+        let mut auth = stored();
+        auth.expires_at = Some(now + REFRESH_SKEW_SECS - 1);
+        auth.obtained_at = now;
+        store::save(&path, &auth).unwrap();
+        let manager = local_token_manager(&path);
+
+        assert!(matches!(
+            manager.refresh_if_needed(),
+            Err(TokenError::Auth(_))
+        ));
     }
 }

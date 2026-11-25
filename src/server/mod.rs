@@ -41,9 +41,11 @@ pub use http::{HttpServer, Request, Response};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::auth::refresh::TokenManager;
+use crate::auth::refresh::{TokenError, TokenManager};
 use crate::config::Routing;
 use crate::provider::{ProviderId, ProviderSpec};
 use crate::upstream::UpstreamClient;
@@ -212,6 +214,10 @@ impl Server {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, flag.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
 
+        // Keep each signed-in provider's access token fresh even when no
+        // clients are sending requests. A failed check is retried next tick.
+        let refresh_workers = spawn_token_refresh_workers(&context);
+
         // The gate sees the request head before the body is read. A refusal
         // is written without retaining the body. Health stays unauthenticated
         // and does not retain one either: the probe does not read it.
@@ -230,6 +236,90 @@ impl Server {
         // The server waits for the in-flight connections itself, so a stream
         // that is halfway out when the signal arrives still finishes.
         Arc::clone(&self.http).serve(self.shutdown.clone(), gate, handler);
+
+        // Let an in-flight refresh finish, but don't leave a worker behind
+        // once the listener has stopped. OAuth requests have finite deadlines.
+        for (stop, _) in &refresh_workers {
+            let _ = stop.send(());
+        }
+        for (_, worker) in refresh_workers {
+            if worker.join().is_err() {
+                crate::logging::warn("a background token refresher stopped unexpectedly");
+            }
+        }
+    }
+}
+
+const TOKEN_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Start one periodic refresh worker for each provider enabled in this server.
+fn spawn_token_refresh_workers(context: &ServerContext) -> Vec<(mpsc::Sender<()>, JoinHandle<()>)> {
+    let mut workers = Vec::new();
+    for (provider, handle) in &context.providers {
+        let provider = *provider;
+        let tokens = Arc::clone(&handle.tokens);
+        let (stop, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name(format!("eggpass-{}-token-refresh", provider.as_str()))
+            .spawn(move || {
+                let mut failed = false;
+                run_refresh_worker(receiver, TOKEN_REFRESH_CHECK_INTERVAL, || {
+                    match tokens.refresh_if_needed() {
+                        Ok(()) => {
+                            if failed {
+                                crate::logging::info(&format!(
+                                    "{} background credential refresh recovered",
+                                    provider.display_name()
+                                ));
+                                failed = false;
+                            }
+                        }
+                        Err(error) => {
+                            if !failed {
+                                let reason = match error {
+                                    TokenError::NotLoggedIn => "credentials unavailable",
+                                    TokenError::Store(_) => "credential store error",
+                                    TokenError::Auth(_) => "OAuth refresh error",
+                                    TokenError::NoRefreshToken => "no refresh token",
+                                };
+                                crate::logging::warn(&format!(
+                                    "{} background credential refresh failed ({reason}); will retry",
+                                    provider.display_name()
+                                ));
+                                failed = true;
+                            }
+                        }
+                    }
+                });
+            });
+
+        match worker {
+            Ok(worker) => workers.push((stop, worker)),
+            Err(_) => crate::logging::warn(&format!(
+                "could not start the {} background token refresher; request-triggered refresh remains active",
+                provider.display_name()
+            )),
+        }
+    }
+    workers
+}
+
+/// Run checks immediately, then on each interval, until the owner asks us to stop.
+fn run_refresh_worker<F>(stop: mpsc::Receiver<()>, interval: Duration, mut check: F)
+where
+    F: FnMut(),
+{
+    loop {
+        match stop.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        check();
+        match stop.recv_timeout(interval) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 
@@ -551,6 +641,41 @@ pub fn openai_error_with_code(
         }
     });
     Response::json(status, body.to_string())
+}
+
+#[cfg(test)]
+mod refresh_worker_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn refresh_worker_checks_immediately_and_stops_on_request() {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&checks);
+
+        run_refresh_worker(stop_rx, Duration::from_secs(60), move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            stop_tx.send(()).unwrap();
+        });
+
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn refresh_worker_rechecks_after_the_interval() {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&checks);
+
+        run_refresh_worker(stop_rx, Duration::from_millis(1), move || {
+            if observed.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                stop_tx.send(()).unwrap();
+            }
+        });
+
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+    }
 }
 
 #[cfg(test)]

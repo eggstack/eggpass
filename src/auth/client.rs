@@ -251,7 +251,38 @@ impl OAuthClient {
     /// Refresh a token. The returned refresh token is optional; callers should
     /// retain the previous value if the provider omits rotation.
     pub fn refresh_as(&self, refresh_token: &str, client_id: &str) -> Result<TokenSet, AuthError> {
-        let inner = self.inner()?.clone();
+        self.refresh_as_with_options(refresh_token, client_id, None)
+    }
+
+    /// Refresh a token with a shorter per-request deadline.
+    ///
+    /// Used by the daemon's background check so a provider outage cannot hold
+    /// shutdown open for the interactive OAuth client's longer deadline.
+    pub fn refresh_as_with_timeout(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        timeout: Duration,
+    ) -> Result<TokenSet, AuthError> {
+        self.refresh_as_with_options(refresh_token, client_id, Some(timeout))
+    }
+
+    fn refresh_as_with_options(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<TokenSet, AuthError> {
+        let mut inner = self.inner()?.clone();
+        if let Some(timeout) = timeout {
+            let mut options = eggpass_auth::ClientOptions::default();
+            options.timeout.pool = Some(timeout);
+            options.timeout.connect = Some(timeout);
+            options.timeout.write = Some(timeout);
+            options.timeout.read = Some(timeout);
+            options.timeout.total = Some(timeout);
+            inner = inner.with_options(options).map_err(AuthError::from)?;
+        }
         let refresh_token = refresh_token.to_string();
         let client_id = client_id.to_string();
         let tokens = super::bridge::block_on(async move {
