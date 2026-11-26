@@ -19,9 +19,11 @@ log request bodies.
    prefix in `routing.prefixes` wins. Otherwise it uses
    `routing.default_provider`.
 3. The proxy refreshes the provider's OAuth token if needed, removes client
-   credentials, and forwards the request. While the daemon is running, it also
-   checks each enabled provider once a minute and refreshes tokens within five
-   minutes of expiry, even when no client traffic arrives.
+   credentials, and forwards the request. While the daemon is running, it starts
+   an independent background worker for each enabled provider (xAI/Grok and
+   OpenAI/ChatGPT). Each worker checks stored credentials immediately and then
+   once a minute, refreshing an access token when it is within five minutes of
+   expiry—even when no client traffic arrives.
 4. Chat Completions requests for ChatGPT are translated to the Responses API.
    x.ai Chat Completions requests are forwarded in their native format.
 5. The provider response is returned to the client. Streaming responses are

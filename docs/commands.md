@@ -159,15 +159,20 @@ Opens the config in `$EDITOR`, then `$VISUAL`, then `helix`, `vim`, or `nano`, f
 
 ## `croncheck`
 
-Start the daemon only if it is not already running. It is intended for a crontab, but it still requires a client key and can fail. Ordinary success is quiet.
+Start the daemon only if it is not already running. It is intended for a user crontab, requires a client key, and does not refresh provider tokens itself. Ordinary success is quiet.
 
 ```sh
 eggpass croncheck
 ```
 
+For the standard per-user install at `~/.local/bin/eggpass`, add both lines to the same user's crontab (`crontab -e`) to start at boot and check every five minutes:
+
 ```cron
-*/5 * * * * /usr/local/bin/eggpass croncheck >> ~/.config/eggpass/cron.log 2>&1
+@reboot "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
+*/5 * * * * "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
 ```
+
+If the binary is elsewhere, replace its path with the absolute path from `command -v eggpass`. These entries assume the default data directory; if you use `EGGPASS_HOME` or `XDG_CONFIG_HOME`, set the same value in the crontab. The running daemon, not `croncheck`, checks enabled xAI/Grok and OpenAI/ChatGPT credentials once a minute and refreshes tokens within five minutes of expiry; see [How it works](how-it-works.md).
 
 **Exit codes:** `0` if already running or started, `1` on failure.
 

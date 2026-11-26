@@ -115,6 +115,25 @@ curl http://127.0.0.1:8484/v1/chat/completions \
 
 Use `eggpass run --foreground` to keep the server in the current terminal.
 
+### Start at boot and keep it available on Linux
+
+After signing in and creating at least one client key, open the same user's
+crontab with `crontab -e`. For the standard per-user install, paste:
+
+```cron
+@reboot "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
+*/5 * * * * "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
+```
+
+These entries assume the binary is at `~/.local/bin/eggpass` and use the
+default data directory. If installed elsewhere, replace the binary path with
+the absolute path from `command -v eggpass`. If you use `EGGPASS_HOME` or
+`XDG_CONFIG_HOME`, set the same value in the crontab. `croncheck` starts the
+daemon only when it is not already running; it requires a client key. Cron
+keeps the daemon available, while the running daemon independently refreshes
+enabled xAI/Grok and OpenAI/ChatGPT credentials as needed (see
+[How it works](docs/how-it-works.md)).
+
 ## Connect a client
 
 | Setting | Value |
