@@ -978,9 +978,12 @@ mod tests {
     }
 
     #[test]
-    fn ca_digest_hashes_the_der_not_the_pem_text() {
+    fn ca_digest_hashes_the_first_certificate_der_not_the_pem_text() {
         let digest = ca_digest(&pem(&[1, 2, 3, 4])).expect("digest");
         assert_eq!(digest, URL_SAFE_NO_PAD.encode(Sha256::digest([1, 2, 3, 4])));
+
+        let bundle = [pem(&[1, 2, 3, 4]), pem(&[9, 8, 7])].concat();
+        assert_eq!(ca_digest(&bundle).expect("bundle digest"), digest);
     }
 
     #[test]
@@ -1024,11 +1027,23 @@ mod tests {
         let encoded = line.strip_prefix("epagent1.").expect("ticket prefix");
         let payload = URL_SAFE_NO_PAD.decode(encoded).expect("ticket base64");
         let parsed: serde_json::Value = serde_json::from_slice(&payload).expect("ticket JSON");
+        assert_eq!(parsed.as_object().map(serde_json::Map::len), Some(9));
         assert_eq!(parsed["v"], 1);
         assert_eq!(parsed["control"], "pool.example:18443");
         assert_eq!(parsed["server_name"], "pool.example");
+        assert_eq!(parsed["agent"], "test-agent");
+        assert_eq!(parsed["eggpass"], env!("CARGO_PKG_VERSION"));
+        let expected_pin = URL_SAFE_NO_PAD.encode(Sha256::digest([1, 2, 3, 4]));
+        assert_eq!(parsed["ca_sha256"].as_str(), Some(expected_pin.as_str()));
+        let expiry = parsed["expires_at"].as_i64().expect("expiry");
+        let remaining = expiry - crate::timeutil::now_unix();
+        assert!((599..=600).contains(&remaining));
         let enroll = parsed["enroll"].as_str().expect("enrollment token");
         let api_key = parsed["api_key"].as_str().expect("EggPass API key");
+        assert_ne!(
+            enroll, api_key,
+            "bootstrap and inference credentials are distinct"
+        );
 
         let secret_text =
             std::fs::read_to_string(paths.eggpool_secret_file()).expect("private state");
