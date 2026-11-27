@@ -19,7 +19,7 @@ Point an OpenAI-compatible client at `http://127.0.0.1:8484/v1` and send the key
 | Option | Meaning |
 | --- | --- |
 | `--config <PATH>` | Use a different TOML config file for this command. Other eggpass files stay in the usual data directory. |
-| `--provider <ID>` | Select `xai` or `openai` for `login`, `logout`, or `usage`. |
+| `--provider <ID>` | Select `xai` or `openai` for `login`, `logout`, `refresh`, or `usage`. |
 | `--verbose`, `-v` | Enable debug logging. |
 | `--help`, `-h` | Show help. |
 | `--version`, `-V` | Show the version. |
@@ -47,6 +47,15 @@ Without `--provider`, `login` offers enabled providers and `logout` offers provi
 `logout` attempts provider-side revocation, then removes the local credential. Revocation is best-effort, so a failed revocation does not prevent local removal. A running server stays up, but requests to the signed-out provider will fail until you sign in again.
 
 **Exit codes:** `login` returns `0` on success or cancellation, `1` on failure, and `2` if device flow is requested for a provider that does not support it. `logout` returns `0` on success, cancellation, or failed provider-side revocation. Credential read or removal errors return `1`.
+
+## `refresh`
+
+```sh
+eggpass refresh                         # choose a signed-in provider
+eggpass refresh --provider openai       # select one directly
+```
+
+`refresh` forces an OAuth credential refresh immediately, even when the access token is not near expiry. It does not send an inference request or remove the existing credentials. Without `--provider`, the picker lists providers with stored credentials; cancelling does nothing. A successful refresh stores rotated credentials. If the provider rejects the refresh or the stored credentials have no refresh token, run `eggpass login --provider <ID>` to sign in again. The command returns `1` when an explicitly selected provider cannot be refreshed; with no selected provider and no stored credentials, it prints `Not logged in.` and returns `0`.
 
 ## `status`
 
@@ -110,6 +119,19 @@ ssh -L 8484:127.0.0.1:8484 box
 
 **Exit codes:** `0` if the value is shown or applied, including when already serving it. `1` for an invalid or unavailable address, a write failure, or a failed restart.
 
+## `eggpool`
+
+```sh
+eggpass eggpool --control pool.example:18443 --server-name pool.example --ca ./eggpool-ca.pem --label workstation
+eggpass eggpool --revoke
+```
+
+Setup writes non-secret connection settings to [eggpool], creates an EggPass API key for the agent, and prints one epagent1. enrollment ticket to stdout. Treat the ticket as a secret: it contains the one-time enrollment credential and the EggPass API key, and is shown only once. If the daemon is already running on loopback, setup restarts it to activate the tunnel; if it is stopped, setup leaves it stopped. The listener must remain loopback-only while EggPool is enabled. eggpass status reports connection state without printing credentials.
+
+--revoke stops a running daemon before removing local enrollment state and the EggPool API key. It restarts only if another EggPass API key remains; otherwise the daemon stays stopped. It does not contact EggPool to revoke a certificate already issued there; that server-side operation must be provided by EggPool.
+
+Exit code: 0 on success; 1 if settings, credentials, the CA file, or daemon restart cannot be handled.
+
 ## `key`
 
 ```sh
@@ -137,15 +159,20 @@ Opens the config in `$EDITOR`, then `$VISUAL`, then `helix`, `vim`, or `nano`, f
 
 ## `croncheck`
 
-Start the daemon only if it is not already running. It is intended for a crontab, but it still requires a client key and can fail. Ordinary success is quiet.
+Start the daemon only if it is not already running. It is intended for a user crontab, requires a client key, and does not refresh provider tokens itself. Ordinary success is quiet.
 
 ```sh
 eggpass croncheck
 ```
 
+For the standard per-user install at `~/.local/bin/eggpass`, add both lines to the same user's crontab (`crontab -e`) to start at boot and check every five minutes:
+
 ```cron
-*/5 * * * * /usr/local/bin/eggpass croncheck >> ~/.config/eggpass/cron.log 2>&1
+@reboot "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
+*/5 * * * * "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
 ```
+
+If the binary is elsewhere, replace its path with the absolute path from `command -v eggpass`. These entries assume the default data directory; if you use `EGGPASS_HOME` or `XDG_CONFIG_HOME`, set the same value in the crontab. The running daemon, not `croncheck`, checks enabled xAI/Grok and OpenAI/ChatGPT credentials once a minute and refreshes tokens within five minutes of expiry; see [How it works](how-it-works.md).
 
 **Exit codes:** `0` if already running or started, `1` on failure.
 

@@ -76,6 +76,9 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// installation root.
 const CARGO_ROOT_SEARCH_DEPTH: usize = 4;
 
+/// Cargo's canonical source identifier for the default crates.io registry.
+const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
 /// The User-Agent every outbound request identifies itself with.
 ///
 /// The release host answers 403 to an anonymous or generic agent, so this is a
@@ -118,14 +121,16 @@ pub fn host_target() -> Option<&'static str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provenance {
     /// The running executable is positively recorded in a Cargo installation
-    /// root's package metadata. Cargo owns that file and its bookkeeping;
-    /// replacing it here would leave `cargo install --list` and uninstall
-    /// lying. The correct command is printed instead.
+    /// root's package metadata, including its original source. Cargo owns that
+    /// file and its bookkeeping; the binary is never replaced through Eggup.
+    /// Only a default crates.io source is eligible for Cargo delegation.
     CargoManaged {
         /// The installation root Cargo owns.
         root: PathBuf,
         /// The version Cargo recorded.
         version: String,
+        /// The source string Cargo recorded for this installation.
+        source: String,
     },
     /// The running executable is not Cargo-managed and is positively identified
     /// by its exact digest, which is revalidated under `eggup`'s mutation lock
@@ -155,10 +160,19 @@ impl Provenance {
     /// The exact command the user should run instead, when there is one.
     pub fn remediation(&self) -> Option<String> {
         match self {
-            Provenance::CargoManaged { root, .. } => Some(format!(
-                "cargo install {PRODUCT} --locked --force --root {}",
-                root.display()
-            )),
+            Provenance::CargoManaged { root, source, .. } => {
+                if source == CRATES_IO_SOURCE {
+                    Some(format!(
+                        "rerun `eggpass update` so Cargo uses the detected root {}",
+                        root.display()
+                    ))
+                } else {
+                    Some(format!(
+                        "update eggpass with the original Cargo source options for root {}",
+                        root.display()
+                    ))
+                }
+            }
             Provenance::Unprovable { .. } => Some(format!(
                 "Reinstall with the published installer, then retry: \
                  https://github.com/eggstack/{PRODUCT}"
@@ -223,6 +237,26 @@ pub enum UpdateError {
         /// What stopped it.
         provenance: Provenance,
     },
+    /// Cargo owns this install, but its source cannot be safely automated.
+    CargoSource {
+        /// Human-readable source classification.
+        source: &'static str,
+        /// Exact Eggpass release selected by the manifest.
+        version: String,
+        /// The Cargo installation root.
+        root: PathBuf,
+    },
+    /// Cargo could not update or verify a supported installation.
+    CargoUpdate {
+        /// What went wrong.
+        detail: String,
+    },
+    /// The platform requires the user to run the exact Cargo command after exit.
+    #[cfg(windows)]
+    CargoHandoff {
+        /// Exact command to run after this process closes.
+        command: String,
+    },
     /// The host has no published artifact.
     HostUnsupported {
         /// What was missing.
@@ -285,6 +319,24 @@ impl std::fmt::Display for UpdateError {
                 }
                 Ok(())
             }
+            UpdateError::CargoSource {
+                source,
+                version,
+                root,
+            } => write!(
+                f,
+                "Cargo owns this installation at {} and its recorded source is {source}; \
+                 automatic updates are limited to default crates.io and will not switch sources. \
+                 Update eggpass {version} with the original Cargo source options.",
+                root.display()
+            ),
+            UpdateError::CargoUpdate { detail } => write!(f, "{detail}"),
+            #[cfg(windows)]
+            UpdateError::CargoHandoff { command } => write!(
+                f,
+                "Cargo owns this executable and this platform cannot safely replace a running \
+                 executable. Close eggpass, then run:\n  {command}"
+            ),
             UpdateError::HostUnsupported { detail } => write!(f, "{detail}"),
             UpdateError::Catalogue { detail } => write!(f, "{detail}"),
             UpdateError::WrongRelease { wanted, published } => write!(
@@ -350,7 +402,7 @@ pub fn update(
     // release host anything. When local provenance alone makes the mutation
     // impossible, there is nothing the network can tell us that changes the
     // answer.
-    if !check_only && !matches!(provenance, Provenance::SelfManaged { .. }) {
+    if !check_only && matches!(provenance, Provenance::Unprovable { .. }) {
         return Err(UpdateError::Provenance { provenance });
     }
 
@@ -436,7 +488,166 @@ pub fn update(
         return Ok(plan);
     }
 
-    execute(settings, &plan, binary, &current_exe)
+    match &plan.provenance {
+        Provenance::SelfManaged { .. } => execute(settings, &plan, binary, &current_exe),
+        Provenance::CargoManaged { root, source, .. } => {
+            execute_cargo_managed_update(root, source, &plan.to_version, &current_exe)
+                .map(|()| plan)
+        }
+        Provenance::Unprovable { .. } => Err(UpdateError::Provenance {
+            provenance: plan.provenance,
+        }),
+    }
+}
+
+/// Dispatch only when the original install is proven to come from crates.io.
+fn execute_cargo_managed_update(
+    root: &Path,
+    source: &str,
+    version: &str,
+    current_exe: &Path,
+) -> Result<(), UpdateError> {
+    execute_cargo_managed_update_with(
+        std::ffi::OsStr::new("cargo"),
+        root,
+        source,
+        version,
+        current_exe,
+    )
+}
+
+fn execute_cargo_managed_update_with(
+    cargo: &std::ffi::OsStr,
+    root: &Path,
+    source: &str,
+    version: &str,
+    current_exe: &Path,
+) -> Result<(), UpdateError> {
+    if source != CRATES_IO_SOURCE {
+        return Err(UpdateError::CargoSource {
+            source: cargo_source_description(source),
+            version: version.to_string(),
+            root: root.to_path_buf(),
+        });
+    }
+    execute_cargo_update_with(cargo, root, version, current_exe)
+}
+
+/// Update a Cargo-managed binary without replacing it through Eggup.
+///
+/// Unix permits Cargo's atomic replacement while this process continues to run.
+/// Windows does not have a qualified safe replacement path for a running image,
+/// so it receives an exact command handoff instead of a risky in-place attempt.
+fn execute_cargo_update_with(
+    cargo: &std::ffi::OsStr,
+    root: &Path,
+    version: &str,
+    current_exe: &Path,
+) -> Result<(), UpdateError> {
+    let manual_command = cargo_update_hint(root, version);
+
+    #[cfg(windows)]
+    {
+        let _ = current_exe;
+        return Err(UpdateError::CargoHandoff {
+            command: manual_command,
+        });
+    }
+
+    #[cfg(not(windows))]
+    {
+        let status = cargo_update_command(cargo, root, version)
+            .status()
+            .map_err(|err| UpdateError::CargoUpdate {
+                detail: format!(
+                    "could not start Cargo ({err}); update the detected root manually with:\n  {manual_command}"
+                ),
+            })?;
+        if !status.success() {
+            return Err(UpdateError::CargoUpdate {
+                detail: format!(
+                    "Cargo did not install eggpass {version} (exit status {}). If this release was just published, wait for crates.io to index the exact version and retry; no other version was selected.\nRun manually with:\n  {manual_command}",
+                    status
+                        .code()
+                        .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+                ),
+            });
+        }
+
+        match read_cargo_record(root) {
+            CargoRecord::Recorded {
+                version: recorded,
+                source,
+            } if recorded == version && source == CRATES_IO_SOURCE => {}
+            CargoRecord::Recorded {
+                version: recorded, ..
+            } => {
+                return Err(UpdateError::CargoUpdate {
+                    detail: format!(
+                        "Cargo completed, but its record at {} names eggpass {recorded} rather than the requested crates.io version {version}; refusing to report success",
+                        root.display()
+                    ),
+                });
+            }
+            _ => {
+                return Err(UpdateError::CargoUpdate {
+                    detail: format!(
+                        "Cargo completed, but the package record at {} could not prove eggpass {version} is installed from crates.io; refusing to report success",
+                        root.display()
+                    ),
+                });
+            }
+        }
+
+        let output = std::process::Command::new(current_exe)
+            .arg("--version")
+            .output()
+            .map_err(|err| UpdateError::CargoUpdate {
+                detail: format!(
+                    "Cargo recorded eggpass {version}, but the installed executable could not be checked: {err}"
+                ),
+            })?;
+        if !output.status.success() || output.stdout != expected_identity(version).as_bytes() {
+            return Err(UpdateError::CargoUpdate {
+                detail: format!(
+                    "Cargo recorded eggpass {version}, but the installed executable did not print the exact expected identity; refusing to report success"
+                ),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Construct Cargo's invocation without a shell, preserving the detected root.
+fn cargo_update_command(
+    cargo: &std::ffi::OsStr,
+    root: &Path,
+    version: &str,
+) -> std::process::Command {
+    let exact_version = format!("={version}");
+    let mut command = std::process::Command::new(cargo);
+    command
+        .args(["install", PRODUCT, "--version"])
+        .arg(exact_version)
+        .args(["--locked", "--force", "--root"])
+        .arg(root)
+        .args(["--registry", "crates-io"]);
+    command
+}
+
+/// A shell-ready exact command for platforms that need a safe handoff.
+fn cargo_update_hint(root: &Path, version: &str) -> String {
+    #[cfg(unix)]
+    let quoted_root = format!("'{}'", root.display().to_string().replace('\'', "'\\''"));
+    #[cfg(windows)]
+    let quoted_root = format!("\"{}\"", root.display());
+    #[cfg(not(any(unix, windows)))]
+    let quoted_root = root.display().to_string();
+
+    format!(
+        "cargo install {PRODUCT} --version ={version} --locked --force --root {quoted_root} --registry crates-io"
+    )
 }
 
 /// The base URL a release's assets are served from.
@@ -752,8 +963,20 @@ pub fn classify_provenance(current_exe: &Path) -> Provenance {
     // A Cargo installation root owns the file when its own record says so.
     for root in cargo_roots_above(current_exe) {
         match read_cargo_record(&root) {
-            CargoRecord::Recorded { version } => {
-                return Provenance::CargoManaged { root, version };
+            CargoRecord::Recorded { version, source } => {
+                if version != CURRENT_VERSION {
+                    return Provenance::Unprovable {
+                        detail: format!(
+                            "Cargo records eggpass {version} in {}, but the running binary identifies as {CURRENT_VERSION}; ownership metadata and executable identity disagree",
+                            root.display()
+                        ),
+                    };
+                }
+                return Provenance::CargoManaged {
+                    root,
+                    version,
+                    source,
+                };
             }
             CargoRecord::Uninterpretable { detail } => {
                 // The record is there but could not be read. That is positive
@@ -782,7 +1005,7 @@ pub fn classify_provenance(current_exe: &Path) -> Provenance {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CargoRecord {
     /// Cargo positively records this product in this root.
-    Recorded { version: String },
+    Recorded { version: String, source: String },
     /// The record is readable and does not claim this product.
     DoesNotClaim,
     /// No record file at this root.
@@ -812,7 +1035,7 @@ fn cargo_roots_above(path: &Path) -> Vec<PathBuf> {
 fn read_cargo_record(root: &Path) -> CargoRecord {
     let path = root.join(".crates.toml");
 
-    let metadata = match std::fs::metadata(&path) {
+    let metadata = match std::fs::symlink_metadata(&path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return CargoRecord::Absent,
         Err(err) => {
             return CargoRecord::Uninterpretable {
@@ -874,33 +1097,114 @@ fn read_cargo_record(root: &Path) -> CargoRecord {
         };
     };
 
+    let mut matching_record = None;
     for (key, binaries) in table {
-        // The key is `<name> <version> (<source>)`.
-        let Some(rest) = key.split_whitespace().next() else {
-            continue;
+        let Some(list) = binaries.as_array() else {
+            return CargoRecord::Uninterpretable {
+                detail: format!(
+                    "the Cargo record {} contains a non-array package entry",
+                    path.display()
+                ),
+            };
         };
-        if rest != PRODUCT {
+        let mut claims = false;
+        for binary in list {
+            let Some(binary) = binary.as_str() else {
+                return CargoRecord::Uninterpretable {
+                    detail: format!(
+                        "the Cargo record {} contains a non-string binary entry",
+                        path.display()
+                    ),
+                };
+            };
+            claims |= binary == PRODUCT;
+        }
+        if !claims {
             continue;
         }
-        let version = key
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("unknown")
-            .to_string();
-        let claims = binaries
-            .as_array()
-            .map(|list| {
-                list.iter()
-                    .filter_map(toml::Value::as_str)
-                    .any(|name| name == PRODUCT)
-            })
-            .unwrap_or(false);
-        if claims {
-            return CargoRecord::Recorded { version };
+
+        let Some((package, version, source)) = parse_cargo_record_key(key) else {
+            return CargoRecord::Uninterpretable {
+                detail: format!(
+                    "the Cargo record {} claims an eggpass binary with malformed package metadata",
+                    path.display()
+                ),
+            };
+        };
+        if package != PRODUCT || !is_release_version(&version) {
+            return CargoRecord::Uninterpretable {
+                detail: format!(
+                    "the Cargo record {} claims eggpass but its package identity or version is not a supported stable release",
+                    path.display()
+                ),
+            };
         }
+        if matching_record.is_some() {
+            return CargoRecord::Uninterpretable {
+                detail: format!(
+                    "the Cargo record {} contains multiple entries claiming the eggpass binary",
+                    path.display()
+                ),
+            };
+        }
+        matching_record = Some((version, source));
     }
 
-    CargoRecord::DoesNotClaim
+    match matching_record {
+        Some((version, source)) => CargoRecord::Recorded { version, source },
+        None => CargoRecord::DoesNotClaim,
+    }
+}
+
+/// Parse Cargo's `<package> <version> (<source>)` record key.
+fn parse_cargo_record_key(key: &str) -> Option<(String, String, String)> {
+    let (package_version, source) = key.split_once(" (")?;
+    let source = source.strip_suffix(')')?;
+    if source.is_empty() || source.contains(['\n', '\r']) {
+        return None;
+    }
+
+    let mut fields = package_version.split_whitespace();
+    let package = fields.next()?;
+    let version = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+
+    Some((package.to_string(), version.to_string(), source.to_string()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CargoSourceKind {
+    CratesIo,
+    OtherRegistry,
+    Git,
+    Path,
+    Unrecognized,
+}
+
+fn cargo_source_kind(source: &str) -> CargoSourceKind {
+    if source == CRATES_IO_SOURCE {
+        CargoSourceKind::CratesIo
+    } else if source.starts_with("registry+") || source.starts_with("sparse+") {
+        CargoSourceKind::OtherRegistry
+    } else if source.starts_with("git+") {
+        CargoSourceKind::Git
+    } else if source.starts_with("path+") {
+        CargoSourceKind::Path
+    } else {
+        CargoSourceKind::Unrecognized
+    }
+}
+
+fn cargo_source_description(source: &str) -> &'static str {
+    match cargo_source_kind(source) {
+        CargoSourceKind::CratesIo => "the default crates.io registry",
+        CargoSourceKind::OtherRegistry => "an alternate registry",
+        CargoSourceKind::Git => "a Git source",
+        CargoSourceKind::Path => "a local path source",
+        CargoSourceKind::Unrecognized => "an unrecognized Cargo source",
+    }
 }
 
 /// Compare two plain `X.Y.Z` versions.
@@ -1001,3 +1305,7 @@ mod tests {
         assert_eq!(host_target(), Some("x86_64-unknown-linux-gnu"));
     }
 }
+
+#[cfg(test)]
+#[path = "update_tests.rs"]
+mod extra_tests;

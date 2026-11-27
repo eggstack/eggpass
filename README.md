@@ -18,7 +18,56 @@ need a separate provider API key.
 
 ## Install
 
-Install the published CLI from crates.io:
+Install the latest prebuilt release on Linux or macOS (Bash):
+
+```sh
+curl -fsSL https://github.com/eggstack/eggpass/releases/latest/download/install.sh | bash
+```
+
+To pin an exact stable release, use the matching release script and version:
+
+```sh
+curl -fsSL https://github.com/eggstack/eggpass/releases/download/vX.Y.Z/install.sh | bash -s -- --version X.Y.Z
+```
+
+On Windows, from PowerShell, download and run the latest installer:
+
+```powershell
+$installer = Join-Path $env:TEMP "eggpass-install.ps1"
+Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/eggstack/eggpass/releases/latest/download/install.ps1" -OutFile $installer
+& $installer
+```
+
+For a pinned Windows release, change both the script URL to
+`https://github.com/eggstack/eggpass/releases/download/vX.Y.Z/install.ps1` and
+pass `-Version X.Y.Z` to the script. The installers verify the published SHA-256
+sidecar and the candidate's exact `eggpass --version` identity before installing.
+They default to a per-user directory (`~/.local/bin` on Unix or `%LOCALAPPDATA%\Eggpass`
+on Windows); Bash can add a safe PATH block to a Bash/Zsh profile. The Bash
+installer needs Bash, `curl`, and `sha256sum` or `shasum`; Windows needs
+PowerShell 5.1 or later. Prebuilt installs do not require Rust. If the Windows
+install directory is not already on PATH, add `%LOCALAPPDATA%\Eggpass` to PATH,
+use the full executable path, or for the current PowerShell session run:
+
+```powershell
+$env:Path = "$env:LOCALAPPDATA\Eggpass;$env:Path"
+```
+
+A system-wide install requires an explicitly elevated shell (`--system` on Bash
+or `-System` in PowerShell); neither installer invokes elevation for you. For
+example, an explicit Unix system install is:
+
+```sh
+curl -fsSL https://github.com/eggstack/eggpass/releases/latest/download/install.sh | sudo bash -s -- --system
+```
+
+Unsupported targets fail rather than installing a binary without a supported
+updater mapping. On a supported target, Cargo fallback is attempted only when the exact GitHub release
+binary asset returns HTTP 404; it requests that same exact crate version, so a
+brief crates.io publication lag requires retrying later. Other transport or
+verification failures stop without fallback.
+
+Cargo remains a separate supported install method:
 
 ```sh
 cargo install eggpass
@@ -65,6 +114,25 @@ curl http://127.0.0.1:8484/v1/chat/completions \
 ```
 
 Use `eggpass run --foreground` to keep the server in the current terminal.
+
+### Start at boot and keep it available on Linux
+
+After signing in and creating at least one client key, open the same user's
+crontab with `crontab -e`. For the standard per-user install, paste:
+
+```cron
+@reboot "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
+*/5 * * * * "$HOME/.local/bin/eggpass" croncheck >> "$HOME/.config/eggpass/cron.log" 2>&1
+```
+
+These entries assume the binary is at `~/.local/bin/eggpass` and use the
+default data directory. If installed elsewhere, replace the binary path with
+the absolute path from `command -v eggpass`. If you use `EGGPASS_HOME` or
+`XDG_CONFIG_HOME`, set the same value in the crontab. `croncheck` starts the
+daemon only when it is not already running; it requires a client key. Cron
+keeps the daemon available, while the running daemon independently refreshes
+enabled xAI/Grok and OpenAI/ChatGPT credentials as needed (see
+[How it works](docs/how-it-works.md)).
 
 ## Connect a client
 
@@ -124,6 +192,7 @@ cleared when the daemon stops.
 | --- | --- |
 | `eggpass login` | Sign in to a provider. |
 | `eggpass logout` | Revoke and remove a provider credential. |
+| `eggpass refresh` | Force-refresh stored credentials without an inference request. |
 | `eggpass status` | Show provider login and server state. |
 | `eggpass usage` | Show subscription usage where available, preferring the running daemon's cached report. |
 | `eggpass run` | Start the server. Use `--foreground` to keep it in the terminal. |

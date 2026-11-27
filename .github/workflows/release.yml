@@ -1209,7 +1209,7 @@ jobs:
           if-no-files-found: error
       - name: Prepare staging payload
         shell: bash
-        run: "'eggpack' 'ci' '_prepare-stage' '--contract' 'release/eggpack/distribution.toml' '--release-manifest' './eggpack-finalized/release-manifest.json' '--finalized-root' './eggpack-finalized/root' '--github-policy' 'eggpack-runtime/github-draft.json' '--install-policy' 'release/eggpack/install-policy.toml' '--output-dir' './eggpack-staging' '--output-payload' './eggpack-staging-payload.json'"
+        run: "'eggpack' 'ci' '_prepare-stage' '--contract' 'release/eggpack/distribution.toml' '--release-manifest' './eggpack-finalized/release-manifest.json' '--finalized-root' './eggpack-finalized/root' '--github-policy' 'eggpack-runtime/github-draft.json' '--install-policy' 'release/eggpack/install-policy.toml' '--output-dir' './eggpack-staging' '--output-payload' './eggpack-staging-payload.json' '--installer-presentation' 'release/eggpack/installer-presentation.json' '--source-root' '${{ github.workspace }}'"
       - name: Stage GitHub draft release
         shell: bash
         env:

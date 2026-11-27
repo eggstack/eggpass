@@ -9,6 +9,7 @@ mod auth;
 mod cli;
 mod config;
 mod daemon;
+mod eggpool;
 mod inference;
 mod keys;
 mod logging;

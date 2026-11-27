@@ -16,6 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test bootstrap installers
+        run: |
+          bash -n packaging/install.sh
+          bash packaging/tests/test-install.sh
+
       - name: Install the toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
@@ -52,6 +57,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Run PowerShell installer fixtures
+        shell: pwsh
+        run: pwsh -NoProfile -File packaging/tests/test-install.ps1
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
@@ -81,6 +90,9 @@ jobs:
           revision="$(python3 -c "import json,sys;sys.stdout.write(json.load(open('release/eggpack/github-policy.json'))['eggpack_tool']['revision'])")"
           cargo install --git https://github.com/eggstack/eggpack --rev "$revision" --locked eggpack-cli
           eggpack --version
+
+      - name: Check installer release contract
+        run: python3 scripts/check-installer-contract.py
 
       - name: Check generated release workflow
         run: >-

@@ -161,6 +161,7 @@ fn dispatch(context: &Context) -> Result<(), CommandError> {
             provider,
         } => commands::login::login(context, *device, *oauth, *provider),
         Command::Logout { provider } => commands::login::logout(context, *provider),
+        Command::Refresh { provider } => commands::refresh::refresh(context, *provider),
         Command::Status => commands::status::status(context),
         Command::Usage { provider, json } => commands::usage::usage(context, *provider, *json),
         Command::Run { foreground } => commands::run::run(context, *foreground),
@@ -174,5 +175,6 @@ fn dispatch(context: &Context) -> Result<(), CommandError> {
             commands::update::update(context, version.clone(), *check)
         }
         Command::Key { action } => commands::key::key(context, action.clone()),
+        Command::Eggpool { action } => commands::eggpool::eggpool(context, action.clone()),
     }
 }

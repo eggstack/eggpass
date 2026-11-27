@@ -6,6 +6,7 @@
 
 use serde_json::{Value, json};
 
+use crate::provider::ProviderId;
 use crate::upstream::{self, Method, UpstreamError};
 
 use super::{Request, Response, ServerContext, openai_error};
@@ -62,7 +63,14 @@ fn merged_catalogue(context: &ServerContext) -> Result<Option<Value>, String> {
     let mut models: Vec<Value> = Vec::new();
     let mut any = false;
 
-    for handle in context.providers.values() {
+    // ProviderId::all is the stable public precedence order. If two
+    // providers advertise the same model id, the first provider in this list
+    // wins regardless of HashMap iteration order.
+    for provider in ProviderId::all() {
+        let Some(handle) = context.providers.get(&provider) else {
+            continue;
+        };
+
         // A provider we are not signed in to contributes nothing.
         match handle.tokens.current() {
             Ok(Some(_)) => {}

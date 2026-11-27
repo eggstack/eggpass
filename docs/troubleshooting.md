@@ -53,6 +53,37 @@ provider may omit models that are unavailable or filtered during normalization.
 **A reasoning level is rejected:** Use a level listed for that model. Providers
 can reject levels they do not support.
 
+**`unsupported_content_part`:** The request carries a content part the
+translated path cannot express. Use `text`, `image_url`, `input_audio`, or a
+file part with `file_id` or `filename` and `file_data`; a non-text part in a
+`system` message or a non-text `tool` output is refused by design. A part type
+this proxy does not translate can still be sent to `POST /v1/responses`, which
+is forwarded verbatim.
+
+**`unsupported_parameter`:** The named Chat Completions field has no Responses
+equivalent. `stop`, `seed`, `n` greater than 1, penalty fields with a non-zero
+value, `logit_bias`, and `logprobs` are examples. Remove the field, or send a
+native Responses request.
+
+**`image_requires_responses` or `audio_requires_responses`:** An image or audio
+generation tool was requested over Chat Completions, whose answer shape cannot
+carry the generated media. Call `POST /v1/responses` instead.
+
+**`missing_model`:** The body must be a JSON object with a `model` string. A
+non-JSON or model-less body is no longer forwarded to the default provider.
+
+**`body_too_large` (HTTP 413):** The body exceeds `server.max_body_bytes`
+(32 MiB by default). Inline base64 media counts toward the limit. Raise the
+setting within its documented range if the request is legitimate.
+
+**`unexpected_media_content_type`:** A native media endpoint answered with a
+content type its provider spec does not list. The response is refused rather
+than labelled wrongly; check that the endpoint and the probe result match.
+
+**`unmappable_output_item`:** The upstream returned an item, such as a
+generated image or audio, that the Chat Completions shape cannot express. Retry
+the request against `POST /v1/responses`.
+
 **An agent does not run a tool:** Check that the response contains
 `message.tool_calls` and that the client handles OpenAI Chat Completions tool
 calls. For the tool result, the client must send the assistant's tool call and

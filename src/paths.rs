@@ -122,6 +122,16 @@ impl Paths {
         self.dir.join(KEY_STORE_FILE_NAME)
     }
 
+    /// Owner-only state for EggPool enrollment and mTLS credentials.
+    pub fn eggpool_secret_file(&self) -> PathBuf {
+        self.dir.join("eggpool.json")
+    }
+
+    /// The non-secret connection state written by the EggPool client.
+    pub fn eggpool_status_file(&self) -> PathBuf {
+        self.dir.join("eggpool.status.json")
+    }
+
     /// The daemon-managed usage-only credential (not moved by `--config`).
     pub fn usage_key_file(&self) -> PathBuf {
         self.dir.join(USAGE_KEY_FILE_NAME)

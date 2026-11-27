@@ -1,0 +1,14 @@
+{
+  "model": "gpt-5",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image_url",
+          "image_url": { "url": "https://example.invalid/fixture.png", "detail": "high" }
+        }
+      ]
+    }
+  ]
+}

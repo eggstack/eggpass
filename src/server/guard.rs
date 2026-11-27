@@ -152,6 +152,16 @@ mod tests {
     }
 
     #[test]
+    fn eggpool_forwarding_hosts_pass_the_loopback_guard() {
+        for value in ["127.0.0.1", "localhost"] {
+            assert!(
+                !refused(value),
+                "EggPool Host rewrite {value:?} was refused"
+            );
+        }
+    }
+
+    #[test]
     fn a_lookalike_authority_is_refused() {
         for value in [
             "evil.example:8484",

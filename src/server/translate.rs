@@ -7,295 +7,489 @@
 //!
 //! x.ai speaks both natively, so nothing is translated for it.
 
+use super::parts::{self, Role};
+use serde_json::{Value, json};
+use std::fmt;
 use std::io::{Read, Result as IoResult};
 
-use serde_json::{Value, json};
-
-/// The request fields that carry over from a Chat Completions request.
-///
-/// Everything else either does not exist in the Responses API or is rejected
-/// outright by the Sign in with ChatGPT route.
-const PASSTHROUGH: &[&str] = &["model", "tool_choice", "parallel_tool_calls", "reasoning"];
-
-/// Convert a Chat Completions request into a Responses request.
-///
-/// System messages become `instructions`, because the Sign in with ChatGPT
-/// route rejects an explicit `{type: "message", role: "system"}` item.
-pub fn chat_request_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
-    let value: Value =
-        serde_json::from_slice(body).map_err(|err| format!("the request is not JSON: {err}"))?;
-    let Some(object) = value.as_object() else {
-        return Err("the request body is not a JSON object".to_string());
-    };
-
-    let mut output = serde_json::Map::new();
-
-    for field in PASSTHROUGH {
-        if let Some(value) = object.get(*field) {
-            output.insert((*field).to_string(), value.clone());
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslateError {
+    message: String,
+    code: &'static str,
+}
+impl TranslateError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code,
         }
     }
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+impl fmt::Display for TranslateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
-    // A Chat Completions client names a thinking level with `reasoning_effort`
-    // and a token limit with `max_tokens`. The Responses API names them
-    // `reasoning.effort` and `max_output_tokens`, and rejects the Chat
-    // Completions spellings outright — "Unsupported parameter: reasoning_effort"
-    // — so they are renamed here rather than dropped.
-    //
-    // A client that already speaks the Responses shape sends `reasoning` and
-    // `max_output_tokens`, and those are carried over untouched above.
-    if !output.contains_key("reasoning")
-        && let Some(effort) = object.get("reasoning_effort").and_then(Value::as_str)
-    {
+const CARRIED: &[&str] = &[
+    "model",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning",
+    "max_output_tokens",
+    "stream",
+    "store",
+    "service_tier",
+    "modalities",
+    "audio",
+];
+
+pub fn chat_request_to_responses(body: &[u8]) -> Result<Vec<u8>, TranslateError> {
+    let value: Value = serde_json::from_slice(body).map_err(|err| {
+        TranslateError::new(
+            "unsupported_parameter",
+            format!("the request is not JSON: {err}"),
+        )
+    })?;
+    let Some(object) = value.as_object() else {
+        return Err(TranslateError::new(
+            "unsupported_parameter",
+            "the request body is not a JSON object",
+        ));
+    };
+    let mut output = serde_json::Map::new();
+    for (field, value) in object {
+        if crate::provider::openai::REJECTED_FIELDS.contains(&field.as_str()) {
+            // This is provider policy from the live route, not an omission; passing these through makes the upstream reject the whole request.
+            continue;
+        }
+        if CARRIED.contains(&field.as_str()) {
+            output.insert(
+                field.clone(),
+                if field == "tool_choice" {
+                    flatten_tool_choice(value)
+                } else {
+                    value.clone()
+                },
+            );
+            continue;
+        }
+        if !matches!(
+            field.as_str(),
+            "messages"
+                | "tools"
+                | "reasoning_effort"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "response_format"
+                | "n"
+                | "stream_options"
+                | "stop"
+                | "seed"
+                | "logit_bias"
+                | "prediction"
+                | "web_search_options"
+                | "function_call"
+                | "functions"
+                | "logprobs"
+                | "presence_penalty"
+                | "frequency_penalty"
+        ) {
+            return Err(unsupported_parameter(
+                field,
+                "has no known Responses API mapping",
+            ));
+        }
+    }
+    if let Some(format) = object.get("response_format") {
         output.insert(
-            "reasoning".to_string(),
-            // The summary is asked for as well, because the Chat Completions
-            // shape has nowhere else to carry the thinking: the upstream only
-            // returns the reasoning text when it is asked for. x.ai's Chat
-            // Completions answer always carries it in `reasoning_content`, so
-            // this is what makes the two providers behave the same way.
-            json!({ "effort": effort, "summary": "auto" }),
+            "text".into(),
+            json!({"format":map_response_format(format)?}),
         );
     }
-
+    if let Some(n) = object.get("n").filter(|value| !value.is_null())
+        && n.as_u64() != Some(1)
+    {
+        return Err(unsupported_parameter(
+            "n",
+            "Responses returns one choice per request",
+        ));
+    }
+    if let Some(options) = object
+        .get("stream_options")
+        .filter(|value| !value.is_null())
+    {
+        let Some(options) = options.as_object() else {
+            return Err(unsupported_parameter(
+                "stream_options",
+                "must be an object containing only include_usage",
+            ));
+        };
+        for key in options.keys() {
+            if key != "include_usage" {
+                return Err(unsupported_parameter(
+                    key,
+                    "is not supported in stream_options",
+                ));
+            }
+        }
+    }
+    for field in [
+        "stop",
+        "seed",
+        "logit_bias",
+        "prediction",
+        "web_search_options",
+        "function_call",
+        "functions",
+    ] {
+        if object.contains_key(field) {
+            let reason = match field {
+                "stop" => "Responses has no stop-sequence equivalent",
+                "seed" => "Responses does not accept a deterministic seed",
+                "logit_bias" => "Responses has no token-bias equivalent",
+                "prediction" => "Responses has no prediction parameter equivalent",
+                "web_search_options" => "Responses web-search options are not Chat parameters",
+                _ => "use the tools and tool_choice parameters instead",
+            };
+            return Err(unsupported_parameter(field, reason));
+        }
+    }
+    if let Some(value) = object.get("logprobs").filter(|value| !value.is_null()) {
+        match value.as_bool() {
+            Some(false) => {}
+            Some(true) => {
+                return Err(unsupported_parameter(
+                    "logprobs",
+                    "Responses has no logprobs equivalent",
+                ));
+            }
+            None => return Err(unsupported_parameter("logprobs", "must be a boolean")),
+        }
+    }
+    for field in ["presence_penalty", "frequency_penalty"] {
+        if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
+            let Some(value) = value.as_f64() else {
+                return Err(unsupported_parameter(
+                    field,
+                    "must be zero because Responses has no penalty equivalent",
+                ));
+            };
+            if value != 0.0 {
+                return Err(unsupported_parameter(
+                    field,
+                    "Responses has no non-zero penalty equivalent",
+                ));
+            }
+        }
+    }
+    if !output.contains_key("reasoning")
+        && let Some(effort) = object.get("reasoning_effort")
+    {
+        let Some(effort) = effort.as_str() else {
+            return Err(unsupported_parameter(
+                "reasoning_effort",
+                "must be a string",
+            ));
+        };
+        output.insert(
+            "reasoning".into(),
+            json!({"effort":effort,"summary":"auto"}),
+        );
+    }
     if !output.contains_key("max_output_tokens")
         && let Some(limit) = object
             .get("max_completion_tokens")
             .or_else(|| object.get("max_tokens"))
-            .and_then(Value::as_u64)
     {
-        output.insert("max_output_tokens".to_string(), json!(limit));
+        let Some(limit) = limit.as_u64() else {
+            return Err(unsupported_parameter(
+                "max_tokens",
+                "must be a non-negative integer",
+            ));
+        };
+        output.insert("max_output_tokens".into(), json!(limit));
     }
-
-    // The instructions come from the system messages.
-    let mut instructions: Vec<String> = Vec::new();
-    let mut input: Vec<Value> = Vec::new();
-
-    if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    if let Some(messages_value) = object.get("messages") {
+        let Some(messages) = messages_value.as_array() else {
+            return Err(unsupported_parameter("messages", "must be an array"));
+        };
         for message in messages {
+            if !message.is_object() {
+                return Err(unsupported_parameter(
+                    "messages",
+                    "each message must be an object",
+                ));
+            }
             let role = message
                 .get("role")
                 .and_then(Value::as_str)
                 .unwrap_or("user");
             let content = message.get("content");
-
             match role {
                 "system" => {
-                    if let Some(text) = content_text(content) {
+                    if let Some(text) = parts::content_text(content)? {
                         instructions.push(text);
                     }
                 }
                 "developer" => {
-                    if let Some(text) = content_text(content) {
-                        input.push(json!({
-                            "role": "developer",
-                            "content": [{"type": "input_text", "text": text}],
-                        }));
+                    let content = parts::to_responses_parts(Role::Developer, content)?;
+                    if !content.is_empty() {
+                        input.push(json!({"role":"developer","content":content}));
                     }
                 }
                 "tool" => {
-                    // A tool result is a function-call output in the Responses
-                    // shape.
                     let call_id = message
                         .get("tool_call_id")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let output = content_text(content).unwrap_or_default();
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": output,
-                    }));
+                    let output_text = parts::content_text(content)?.unwrap_or_default();
+                    input.push(json!({"type":"function_call_output","call_id":call_id,"output":output_text}));
                 }
                 "assistant" => {
-                    // An assistant message with no text carries nothing, and a
-                    // message with empty text is not a message the Responses
-                    // API wants. A tool call is carried on its own below.
-                    if let Some(text) = content_text(content)
-                        && !text.is_empty()
-                    {
-                        input.push(json!({
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}],
-                        }));
+                    let content = parts::to_responses_parts(Role::Assistant, content)?;
+                    let only_empty_text = !content.is_empty()
+                        && content.iter().all(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("output_text")
+                                && part.get("text").and_then(Value::as_str) == Some("")
+                        });
+                    if !content.is_empty() && !only_empty_text {
+                        input.push(json!({"role":"assistant","content":content}));
                     }
-                    // The model's own tool call.
-                    //
-                    // The Responses API expects the call to be in the
-                    // conversation before the tool's answer, and it matches the
-                    // two by their `call_id`. Leaving the call out leaves the
-                    // upstream with a tool answer it cannot place.
-                    for call in message
-                        .get("tool_calls")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        if let Some(item) = convert_tool_call(call) {
-                            input.push(item);
+                    if let Some(calls) = message.get("tool_calls") {
+                        let Some(calls) = calls.as_array() else {
+                            return Err(unsupported_parameter("tool_calls", "must be an array"));
+                        };
+                        for call in calls {
+                            input.push(convert_tool_call(call)?);
                         }
                     }
                 }
                 _ => {
-                    if let Some(text) = content_text(content) {
-                        input.push(json!({
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": text}],
-                        }));
+                    let content = parts::to_responses_parts(Role::User, content)?;
+                    if !content.is_empty() {
+                        input.push(json!({"role":"user","content":content}));
                     }
                 }
             }
         }
     }
-
     if !instructions.is_empty() {
-        output.insert("instructions".to_string(), json!(instructions.join("\n\n")));
+        output.insert("instructions".into(), json!(instructions.join("\n\n")));
     }
-    output.insert("input".to_string(), Value::Array(input));
-
-    // The tools have a flatter shape in the Responses API.
-    if let Some(tools) = object.get("tools").and_then(Value::as_array) {
-        let converted: Vec<Value> = tools.iter().filter_map(convert_tool).collect();
+    output.insert("input".into(), Value::Array(input));
+    if let Some(tools) = object.get("tools") {
+        let Some(tools) = tools.as_array() else {
+            return Err(unsupported_parameter("tools", "must be an array"));
+        };
+        let converted = tools
+            .iter()
+            .map(convert_tool)
+            .collect::<Result<Vec<_>, _>>()?;
         if !converted.is_empty() {
-            output.insert("tools".to_string(), Value::Array(converted));
+            output.insert("tools".into(), Value::Array(converted));
         }
     }
-
-    serde_json::to_vec(&Value::Object(output)).map_err(|err| err.to_string())
+    serde_json::to_vec(&Value::Object(output))
+        .map_err(|err| TranslateError::new("unsupported_parameter", err.to_string()))
 }
 
-/// The text of a message's content, whatever shape it arrives in.
-fn content_text(content: Option<&Value>) -> Option<String> {
-    match content {
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(Value::Array(parts)) => {
-            let text: Vec<String> = parts
-                .iter()
-                .filter_map(|part| {
-                    part.get("text")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| part.as_str().map(str::to_string))
-                })
-                .collect();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text.join("\n"))
+fn unsupported_parameter(field: &str, reason: &str) -> TranslateError {
+    TranslateError::new(
+        "unsupported_parameter",
+        format!("unsupported parameter {field}: {reason}"),
+    )
+}
+fn map_response_format(value: &Value) -> Result<Value, TranslateError> {
+    let Some(kind) = value.get("type").and_then(Value::as_str) else {
+        return Err(unsupported_parameter(
+            "response_format",
+            "requires a string type",
+        ));
+    };
+    match kind {
+        "json_object" | "text" => Ok(json!({"type":kind})),
+        "json_schema" => {
+            let Some(schema) = value.get("json_schema").and_then(Value::as_object) else {
+                return Err(unsupported_parameter(
+                    "response_format.json_schema",
+                    "must be an object",
+                ));
+            };
+            let mut mapped = json!({"type":"json_schema"});
+            for key in ["name", "schema", "strict", "description"] {
+                if let Some(value) = schema.get(key) {
+                    mapped[key] = value.clone();
+                }
             }
+            Ok(mapped)
         }
-        _ => None,
+        other => Err(unsupported_parameter(
+            "response_format.type",
+            &format!("unknown type {other}"),
+        )),
     }
 }
-
-/// Convert one Chat Completions tool definition into the Responses shape.
-fn convert_tool(tool: &Value) -> Option<Value> {
-    let kind = tool.get("type").and_then(Value::as_str)?;
-    if kind != "function" {
-        // Only function tools have a mechanical translation.
-        return None;
+fn flatten_tool_choice(value: &Value) -> Value {
+    if value.get("type").and_then(Value::as_str) == Some("function")
+        && let Some(name) = value
+            .get("function")
+            .and_then(|function| function.get("name"))
+    {
+        return json!({"type":"function","name":name});
     }
-    let function = tool.get("function")?;
-    let name = function.get("name").and_then(Value::as_str)?;
-
-    let mut converted = json!({ "type": "function", "name": name });
-    if let Some(description) = function.get("description").and_then(Value::as_str) {
-        converted["description"] = json!(description);
+    value.clone()
+}
+fn convert_tool(tool: &Value) -> Result<Value, TranslateError> {
+    let Some(kind) = tool.get("type").and_then(Value::as_str) else {
+        return Ok(tool.clone());
+    };
+    if kind == "image_generation" {
+        return Err(TranslateError::new(
+            "image_requires_responses",
+            "image_generation tools require the native Responses API",
+        ));
+    }
+    if kind.starts_with("audio") {
+        return Err(TranslateError::new(
+            "audio_requires_responses",
+            format!("{kind} tools require the native Responses API"),
+        ));
+    }
+    if kind != "function" {
+        return Ok(tool.clone());
+    }
+    let Some(function) = tool.get("function") else {
+        return Err(unsupported_parameter(
+            "tools.function",
+            "function definition is missing",
+        ));
+    };
+    let Some(name) = function.get("name").and_then(Value::as_str) else {
+        return Err(unsupported_parameter(
+            "tools.function.name",
+            "function name is required",
+        ));
+    };
+    let mut converted = json!({"type":"function","name":name});
+    if let Some(description) = function.get("description") {
+        converted["description"] = description.clone();
     }
     if let Some(parameters) = function.get("parameters") {
         converted["parameters"] = parameters.clone();
     }
-    Some(converted)
+    if let Some(strict) = function.get("strict") {
+        converted["strict"] = strict.clone();
+    }
+    Ok(converted)
 }
 
 /// Convert one Chat Completions tool call into the Responses shape.
-///
-/// The Chat Completions shape nests the call under `function`; the Responses
-/// shape puts it on the item itself. The `call_id` is what ties the call to
-/// the tool's answer later in the conversation, so it is carried over.
-fn convert_tool_call(call: &Value) -> Option<Value> {
-    let function = call.get("function")?;
-    let name = function.get("name").and_then(Value::as_str)?;
+/// The Responses API uses call_id to match a tool result to this call.
+fn convert_tool_call(call: &Value) -> Result<Value, TranslateError> {
+    let Some(function) = call.get("function") else {
+        return Err(unsupported_parameter(
+            "tool_calls.function",
+            "function call data is missing",
+        ));
+    };
+    let Some(name) = function.get("name").and_then(Value::as_str) else {
+        return Err(unsupported_parameter(
+            "tool_calls.function.name",
+            "function name is required",
+        ));
+    };
     let arguments = function
         .get("arguments")
         .and_then(Value::as_str)
         .unwrap_or("{}");
     let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
-
-    Some(json!({
-        "type": "function_call",
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments,
-    }))
+    Ok(json!({"type":"function_call","call_id":call_id,"name":name,"arguments":arguments}))
 }
 
 /// Convert a Responses response into a Chat Completions response.
-pub fn responses_to_chat_completion(body: &[u8]) -> Result<Vec<u8>, String> {
-    let value: Value =
-        serde_json::from_slice(body).map_err(|err| format!("the response is not JSON: {err}"))?;
-
+pub fn responses_to_chat_completion(body: &[u8]) -> Result<Vec<u8>, TranslateError> {
+    let value: Value = serde_json::from_slice(body).map_err(|err| {
+        TranslateError::new(
+            "unmappable_output_item",
+            format!("the response is not JSON: {err}"),
+        )
+    })?;
     let text = response_text(&value);
+    let mut content = Value::String(text);
+    let mut parts = Vec::new();
+    if let Some(output) = value.get("output").and_then(Value::as_array) {
+        for item in output {
+            let kind = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            if kind == "image_generation_call" || kind.starts_with("audio") {
+                return Err(TranslateError::new(
+                    "unmappable_output_item",
+                    format!(
+                        "Responses output item {kind} (id {id}) has no Chat Completions equivalent"
+                    ),
+                ));
+            }
+            if kind != "message" {
+                continue;
+            }
+            for part in item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                match part.get("type").and_then(Value::as_str).unwrap_or("unknown") {
+                    "output_text" => parts.push(json!({"type":"text","text":part.get("text").and_then(Value::as_str).unwrap_or("")})),
+                    "refusal" => parts.push(json!({"type":"refusal","refusal":part.get("refusal").and_then(Value::as_str).unwrap_or("")})),
+                    other => return Err(TranslateError::new("unmappable_output_item", format!("Responses output content part {other} in item {id} has no Chat Completions equivalent"))),
+                }
+            }
+        }
+    }
+    if parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+    {
+        content = Value::Array(parts);
+    }
     let tool_calls = response_tool_calls(&value);
     let mut reason = finish_reason(&value);
     if !tool_calls.is_empty() {
-        // The model asked for a tool rather than for an answer, and that is
-        // what the finish reason says.
         reason = "tool_calls";
     }
-
-    let mut choices = vec![json!({
-        "index": 0,
-        "message": { "role": "assistant", "content": text },
-        "finish_reason": reason,
-    })];
-
-    // The tool calls, when the model asked for one.
-    //
-    // The Responses API carries a tool call as an output item; the Chat
-    // Completions shape carries it in `message.tool_calls`. Without this the
-    // client sees an empty answer where the model asked for a tool, and a
-    // client that drives tools has nothing to run.
+    let mut choices = vec![
+        json!({"index":0,"message":{"role":"assistant","content":content},"finish_reason":reason}),
+    ];
     if !tool_calls.is_empty() {
         choices[0]["message"]["tool_calls"] = Value::Array(tool_calls);
     }
-
-    // The thinking text, when the upstream sent any.
-    //
-    // x.ai's Chat Completions answer carries it in `reasoning_content`, so the
-    // same field is used here: a client that shows the thinking for one
-    // provider shows it for both.
     let reasoning = response_reasoning(&value);
     if !reasoning.is_empty() {
         choices[0]["message"]["reasoning_content"] = json!(reasoning);
     }
-
-    // A failed response carries an error rather than an answer.
-    //
-    // The Responses object always carries an `error` key, and it is `null` on
-    // success. A key that is merely *present* is not a failure.
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-        choices[0]["message"] = json!({
-            "role": "assistant",
-            "content": Value::Null,
-        });
+        choices[0]["message"] = json!({"role":"assistant","content":Value::Null});
         choices[0]["finish_reason"] = json!("error");
         let _ = error;
     }
-
-    let mut output = json!({
-        "id": chat_id(value.get("id").and_then(Value::as_str)),
-        "object": "chat.completion",
-        "created": now_unix(),
-        "model": value.get("model").and_then(Value::as_str).unwrap_or(""),
-        "choices": choices,
-    });
-
+    let mut output = json!({"id":chat_id(value.get("id").and_then(Value::as_str)),"object":"chat.completion","created":now_unix(),"model":value.get("model").and_then(Value::as_str).unwrap_or(""),"choices":choices});
     if let Some(usage) = responses_usage_to_chat(value.get("usage")) {
         output["usage"] = usage;
     }
-
-    serde_json::to_vec(&output).map_err(|err| err.to_string())
+    serde_json::to_vec(&output)
+        .map_err(|err| TranslateError::new("unmappable_output_item", err.to_string()))
 }
 
 /// The tool calls in a Responses object.
@@ -478,6 +672,9 @@ pub struct ResponsesToChatStream<R> {
     created: i64,
     usage: Option<Value>,
     tool_calls: Vec<ToolCall>,
+    emitted_answer: bool,
+    unmappable_item: Option<String>,
+    refusal_deltas: Vec<String>,
 }
 
 impl<R: Read> ResponsesToChatStream<R> {
@@ -493,6 +690,9 @@ impl<R: Read> ResponsesToChatStream<R> {
             created: now_unix(),
             usage: None,
             tool_calls: Vec::new(),
+            emitted_answer: false,
+            unmappable_item: None,
+            refusal_deltas: Vec::new(),
         }
     }
 
@@ -560,6 +760,7 @@ impl<R: Read> ResponsesToChatStream<R> {
         if let Some(call) = self.tool_calls.get_mut(index) {
             call.announced = true;
         }
+        self.emitted_answer = true;
         self.chunk(delta, Value::Null)
     }
 
@@ -605,6 +806,7 @@ impl<R: Read> ResponsesToChatStream<R> {
                 "function": { "arguments": missing },
             }],
         });
+        self.emitted_answer = true;
         self.chunk(delta, Value::Null)
     }
 
@@ -622,6 +824,30 @@ impl<R: Read> ResponsesToChatStream<R> {
             }
         }
 
+        if kind.starts_with("response.image_generation_call.") {
+            let id = event
+                .get("item_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            self.unmappable_item = Some(format!(
+                "Responses output item image_generation_call (id {id}) has no Chat Completions equivalent"
+            ));
+            return Vec::new();
+        }
+        if matches!(
+            kind,
+            "response.output_item.added" | "response.output_item.done"
+        ) && let Some(item) = event.get("item")
+        {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if item_type == "image_generation_call" || item_type.starts_with("audio") {
+                let id = item.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                self.unmappable_item = Some(format!(
+                    "Responses output item {item_type} (id {id}) has no Chat Completions equivalent"
+                ));
+                return Vec::new();
+            }
+        }
         match kind {
             "response.output_item.added" => {
                 // A tool call starts. The name and the id come with it; the
@@ -662,6 +888,7 @@ impl<R: Read> ResponsesToChatStream<R> {
                         "function": { "arguments": delta },
                     }],
                 });
+                self.emitted_answer = true;
                 self.chunk(chunk, Value::Null)
             }
             "response.function_call_arguments.done" => {
@@ -717,7 +944,43 @@ impl<R: Read> ResponsesToChatStream<R> {
                         "finish_reason": Value::Null,
                     }],
                 });
+                self.emitted_answer = true;
                 encode_event(&chunk)
+            }
+            "response.refusal.delta" => {
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                let item_id = event
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !self.refusal_deltas.contains(&item_id) {
+                    self.refusal_deltas.push(item_id);
+                }
+                self.emitted_answer = true;
+                self.chunk(json!({"refusal":delta}), Value::Null)
+            }
+            "response.refusal.done" => {
+                let item_id = event
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if self.refusal_deltas.iter().any(|id| id == item_id) {
+                    return Vec::new();
+                }
+                let refusal = event
+                    .get("refusal")
+                    .or_else(|| event.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if refusal.is_empty() {
+                    return Vec::new();
+                }
+                self.emitted_answer = true;
+                self.chunk(json!({"refusal":refusal}), Value::Null)
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 // The thinking text arrives as its own events, ahead of the
@@ -751,12 +1014,26 @@ impl<R: Read> ResponsesToChatStream<R> {
                     }
                     self.usage = responses_usage_to_chat(response.get("usage"));
                 }
+                if !self.emitted_answer
+                    && let Some(message) = self.unmappable_item.take()
+                {
+                    let chunk = json!({
+                        "id": self.id,
+                        "object": "chat.completion.chunk",
+                        "created": self.created,
+                        "model": self.model,
+                        "choices": [{"index":0,"delta":{},"finish_reason":"error"}],
+                        "error": {"message":message,"type":"server_error","code":"unmappable_output_item"},
+                    });
+                    let mut out = encode_event(&chunk);
+                    out.extend_from_slice(b"data: [DONE]\n\n");
+                    return out;
+                }
                 let finish = if kind == "response.incomplete" {
                     "length"
                 } else if self.tool_calls.is_empty() {
                     "stop"
                 } else {
-                    // The model asked for a tool rather than for an answer.
                     "tool_calls"
                 };
                 let mut chunk = json!({
@@ -1084,6 +1361,22 @@ mod tests {
     }
 
     #[test]
+    fn a_responses_shaped_token_limit_is_carried() {
+        // A client that already uses the Responses spelling must keep its
+        // limit; the field is Responses-valid, so there is nothing to rename.
+        let body = br#"{
+            "model": "gpt-6.1-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_output_tokens": 300
+        }"#;
+
+        let converted = chat_request_to_responses(body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+
+        assert_eq!(value["max_output_tokens"], 300);
+    }
+
+    #[test]
     fn the_thinking_text_is_carried_in_the_chat_completions_answer() {
         // x.ai's Chat Completions answer carries the thinking in
         // `reasoning_content`, so the same field is used here.
@@ -1168,12 +1461,13 @@ mod tests {
         let body = br#"{
             "model": "gpt-5",
             "messages": [],
-            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}, "strict": true}}]
         }"#;
         let converted = chat_request_to_responses(body).unwrap();
         let value: Value = serde_json::from_slice(&converted).unwrap();
         assert_eq!(value["tools"][0]["type"], "function");
         assert_eq!(value["tools"][0]["name"], "get_weather");
+        assert_eq!(value["tools"][0]["strict"], true);
     }
 
     #[test]
@@ -1435,5 +1729,193 @@ mod tests {
             Value::Null,
             "{value}"
         );
+    }
+
+    #[test]
+    fn documented_fixture_image_is_preserved_and_image_only_messages_survive() {
+        let body = include_str!("../../tests/fixtures/media/chat-completions-image.json");
+        let converted = chat_request_to_responses(body.as_bytes()).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(value["input"][0]["content"][0]["detail"], "high");
+        assert_eq!(
+            value["input"][0]["content"][0]["image_url"],
+            "https://example.invalid/fixture.png"
+        );
+    }
+
+    #[test]
+    fn response_format_is_mapped_to_text_format() {
+        for (input, expected) in [
+            (json!({"type":"json_object"}), json!({"type":"json_object"})),
+            (json!({"type":"text"}), json!({"type":"text"})),
+            (
+                json!({"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"},"strict":true,"description":"fixture"}}),
+                json!({"type":"json_schema","name":"answer","schema":{"type":"object"},"strict":true,"description":"fixture"}),
+            ),
+        ] {
+            let request = json!({"model":"fixture","messages":[],"response_format":input});
+            let bytes = chat_request_to_responses(&serde_json::to_vec(&request).unwrap()).unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["text"]["format"], expected);
+        }
+    }
+
+    #[test]
+    fn an_unknown_response_format_type_is_named() {
+        let request = br#"{"model":"fixture","messages":[],"response_format":{"type":"yaml"}}"#;
+        let error = chat_request_to_responses(request).unwrap_err();
+        assert_eq!(error.code(), "unsupported_parameter");
+        assert!(error.message().contains("yaml"));
+    }
+
+    #[test]
+    fn unsupported_fields_are_named_and_provider_rejected_fields_stay_stripped() {
+        for (field, value) in [("n", json!(2)), ("stop", json!(["x"])), ("seed", json!(1))] {
+            let request = json!({"model":"fixture","messages":[],(field):value});
+            let error =
+                chat_request_to_responses(&serde_json::to_vec(&request).unwrap()).unwrap_err();
+            assert_eq!(error.code(), "unsupported_parameter");
+            assert!(error.message().contains(field), "{}", error.message());
+        }
+        let request = br#"{"model":"fixture","messages":[],"temperature":0.2,"logprobs":false,"presence_penalty":0}"#;
+        let value: Value =
+            serde_json::from_slice(&chat_request_to_responses(request).unwrap()).unwrap();
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("logprobs").is_none());
+        for value in [json!(true), json!("yes")] {
+            let request = json!({"model":"fixture","messages":[],"logprobs":value});
+            let error =
+                chat_request_to_responses(&serde_json::to_vec(&request).unwrap()).unwrap_err();
+            assert_eq!(error.code(), "unsupported_parameter");
+        }
+    }
+
+    #[test]
+    fn generation_tools_require_the_native_responses_path() {
+        for (kind, code) in [
+            ("image_generation", "image_requires_responses"),
+            ("audio_generation", "audio_requires_responses"),
+        ] {
+            let request = json!({"model":"fixture","messages":[],"tools":[{"type":kind}]});
+            let error =
+                chat_request_to_responses(&serde_json::to_vec(&request).unwrap()).unwrap_err();
+            assert_eq!(error.code(), code);
+        }
+    }
+
+    #[test]
+    fn non_function_tools_are_carried_unchanged() {
+        let request = br#"{"model":"fixture","messages":[],"tools":[{"type":"web_search","search_context_size":"low"}]}"#;
+        let value: Value =
+            serde_json::from_slice(&chat_request_to_responses(request).unwrap()).unwrap();
+        assert_eq!(
+            value["tools"][0],
+            json!({"type":"web_search","search_context_size":"low"})
+        );
+    }
+
+    #[test]
+    fn refusal_fixture_is_projected_as_ordered_content_parts() {
+        let fixture = include_str!("../../tests/fixtures/media/responses-refusal.json");
+        let value: Value =
+            serde_json::from_slice(&responses_to_chat_completion(fixture.as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"][0],
+            json!({"type":"text","text":"I cannot help with that request."})
+        );
+        assert_eq!(
+            value["choices"][0]["message"]["content"][1],
+            json!({"type":"refusal","refusal":"The request is not supported."})
+        );
+    }
+
+    #[test]
+    fn image_generation_output_returns_a_named_translation_error() {
+        let fixture = include_str!("../../tests/fixtures/media/responses-image-generation.json");
+        let error = responses_to_chat_completion(fixture.as_bytes()).unwrap_err();
+        assert_eq!(error.code(), "unmappable_output_item");
+        assert!(error.message().contains("image_generation_call"));
+        assert!(error.message().contains("ig_fixture_1"));
+    }
+
+    #[test]
+    fn text_only_output_remains_a_string() {
+        let bytes = responses_to_chat_completion(br#"{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}"#).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[test]
+    fn refusal_stream_fixture_emits_refusal_deltas_once() {
+        let fixture = include_str!("../../tests/fixtures/media/responses-stream-refusal.txt");
+        let output = translate(fixture, 3);
+        assert_eq!(
+            output.matches(r#""refusal":"I cannot help""#).count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("I cannot help with that request.").count(),
+            0,
+            "{output}"
+        );
+        assert!(output.contains("data: [DONE]"), "{output}");
+    }
+
+    #[test]
+    fn refusal_done_is_emitted_when_no_delta_was_seen() {
+        let stream = concat!(
+            "data: {\"type\":\"response.refusal.done\",\"item_id\":\"m1\",\"refusal\":\"No.\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let output = translate(stream, 4096);
+        assert!(output.contains(r#""refusal":"No.""#), "{output}");
+    }
+
+    #[test]
+    fn unmappable_stream_with_no_chat_content_emits_named_error() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"audio\",\"id\":\"audio_1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let output = translate(stream, 4096);
+        assert!(output.contains(r#""finish_reason":"error""#), "{output}");
+        assert!(
+            output.contains(r#""code":"unmappable_output_item""#),
+            "{output}"
+        );
+        assert!(output.contains("audio_1"), "{output}");
+        assert!(output.contains("data: [DONE]"), "{output}");
+    }
+
+    #[test]
+    fn every_advertised_image_model_is_accepted_for_every_provider_spec() {
+        let catalogue: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/media/chatgpt-models.json"
+        ))
+        .unwrap();
+        let models = catalogue["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|model| {
+                model["input_modalities"]
+                    .as_array()
+                    .is_some_and(|modalities| modalities.iter().any(|value| value == "image"))
+            });
+        for provider in crate::provider::ProviderId::all() {
+            let _spec = crate::provider::spec_for(provider, &crate::config::Config::default());
+            for model in models.clone() {
+                let slug = model["slug"].as_str().unwrap();
+                let request = json!({"model":slug,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/image.png"}}]}]});
+                assert!(
+                    chat_request_to_responses(&serde_json::to_vec(&request).unwrap()).is_ok(),
+                    "provider {} model {slug}",
+                    provider.as_str()
+                );
+            }
+        }
     }
 }

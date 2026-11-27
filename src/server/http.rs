@@ -18,8 +18,14 @@ use std::time::{Duration, Instant};
 /// The largest request head we accept.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 
-/// The largest request body we accept.
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// The request-body cap used by default, including inline media.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The smallest useful request-body cap, so a bad value cannot disable the bound.
+pub const MIN_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// The ceiling keeps a configured cap from permitting unbounded buffering.
+pub const MAX_BODY_CEILING_BYTES: usize = 256 * 1024 * 1024;
 
 /// The largest chunk-size, trailer, or chunk-ending line we retain.
 ///
@@ -157,6 +163,8 @@ pub struct HttpServer {
     active: Arc<AtomicUsize>,
     /// The largest number of simultaneous connections.
     max_connections: usize,
+    /// The largest request body, including inline media.
+    max_body_bytes: usize,
     /// How long a kept-alive connection may sit idle.
     idle_timeout: Duration,
     /// How long a single write may stall.
@@ -171,6 +179,7 @@ impl HttpServer {
             listener,
             active: Arc::new(AtomicUsize::new(0)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
         })
@@ -186,6 +195,12 @@ impl HttpServer {
         self.max_connections = max_connections.max(1);
         self.idle_timeout = idle_timeout;
         self.write_timeout = write_timeout;
+        self
+    }
+
+    /// Set the body cap without permitting a low or unbounded value.
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> HttpServer {
+        self.max_body_bytes = max_body_bytes.clamp(MIN_BODY_LIMIT_BYTES, MAX_BODY_CEILING_BYTES);
         self
     }
 
@@ -236,8 +251,16 @@ impl HttpServer {
             let active = Arc::clone(&self.active);
             let idle_timeout = self.idle_timeout;
             let write_timeout = self.write_timeout;
+            let max_body_bytes = self.max_body_bytes;
             std::thread::spawn(move || {
-                let _ = handle_connection(stream, gate, handler, idle_timeout, write_timeout);
+                let _ = handle_connection(
+                    stream,
+                    gate,
+                    handler,
+                    idle_timeout,
+                    write_timeout,
+                    max_body_bytes,
+                );
                 // The count drops only now: the response body has been
                 // written, so a stream that was cut short by a shutdown was
                 // still counted as in flight.
@@ -278,6 +301,7 @@ fn handle_connection(
     handler: Handler,
     idle_timeout: Duration,
     write_timeout: Duration,
+    max_body_bytes: usize,
 ) -> std::io::Result<()> {
     // Small responses should go out immediately.
     let _ = stream.set_nodelay(true);
@@ -291,7 +315,7 @@ fn handle_connection(
         // is closed rather than holding a thread forever.
         let _ = writer.set_read_timeout(Some(idle_timeout));
 
-        let request = match read_request(&mut reader, &mut writer, gate.as_ref()) {
+        let request = match read_request(&mut reader, &mut writer, gate.as_ref(), max_body_bytes) {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(err) if is_idle_timeout(&err) => return Ok(()),
@@ -434,7 +458,7 @@ impl Read for SocketReader {
 enum BodyError {
     /// The connection ended or the framing was malformed.
     Io(std::io::Error),
-    /// The body is larger than [`MAX_BODY_BYTES`].
+    /// The body is larger than the configured cap.
     TooLarge,
     /// A chunked line exceeded [`MAX_LINE_BYTES`].
     Malformed,
@@ -459,6 +483,7 @@ fn read_request(
     reader: &mut SocketReader,
     writer: &mut TcpStream,
     gate: &dyn Fn(&Request) -> GateDecision,
+    max_body_bytes: usize,
 ) -> std::io::Result<Option<Request>> {
     let Some(head) = read_head(reader)? else {
         return Ok(None);
@@ -470,17 +495,17 @@ fn read_request(
         GateDecision::Refuse(refusal) => {
             write_response(writer, refusal, false)?;
             if !expects_continue(&request.headers) {
-                let _ = read_body(reader, writer, &request.headers, false);
+                let _ = read_body(reader, writer, &request.headers, false, max_body_bytes);
             }
             return Ok(None);
         }
         GateDecision::Proceed { keep_body } => keep_body,
     };
 
-    match read_body(reader, writer, &request.headers, keep_body) {
+    match read_body(reader, writer, &request.headers, keep_body, max_body_bytes) {
         Ok(body) => Ok(Some(Request { body, ..request })),
         Err(BodyError::TooLarge) => {
-            write_response(writer, payload_too_large(), false)?;
+            write_response(writer, payload_too_large(max_body_bytes), false)?;
             Ok(None)
         }
         Err(BodyError::Malformed) => {
@@ -537,12 +562,12 @@ fn malformed_body() -> Response {
 }
 
 /// The `413` body for a request that is too large.
-fn payload_too_large() -> Response {
-    let limit = MAX_BODY_BYTES / (1024 * 1024);
+fn payload_too_large(limit: usize) -> Response {
+    let mib = limit / (1024 * 1024);
     Response::json(
         413,
         format!(
-            r#"{{"error":{{"message":"the request body is larger than {limit} MiB","type":"invalid_request_error","code":"body_too_large"}}}}"#
+            r#"{{"error":{{"message":"the request body is larger than {limit} bytes ({mib} MiB); inline media such as base64 images, audio, and files counts toward this limit. Raise `server.max_body_bytes` in the configuration to allow more.","type":"invalid_request_error","code":"body_too_large"}}}}"#
         ),
     )
 }
@@ -599,6 +624,7 @@ fn read_body(
     writer: &mut TcpStream,
     headers: &[(String, String)],
     keep: bool,
+    max_body_bytes: usize,
 ) -> Result<Vec<u8>, BodyError> {
     let lookup = |name: &str| {
         headers
@@ -615,7 +641,7 @@ fn read_body(
     if let Some(encoding) = lookup("transfer-encoding")
         && encoding.to_ascii_lowercase().contains("chunked")
     {
-        return read_chunked_body(reader, keep);
+        return read_chunked_body(reader, keep, max_body_bytes);
     }
 
     let Some(length) = lookup("content-length").and_then(|value| value.parse::<usize>().ok())
@@ -623,7 +649,7 @@ fn read_body(
         return Ok(Vec::new());
     };
 
-    if length > MAX_BODY_BYTES {
+    if length > max_body_bytes {
         return Err(BodyError::TooLarge);
     }
 
@@ -650,7 +676,11 @@ fn discard(reader: &mut SocketReader, length: usize) -> std::io::Result<()> {
 }
 
 /// Read a chunked request body.
-fn read_chunked_body(reader: &mut SocketReader, keep: bool) -> Result<Vec<u8>, BodyError> {
+fn read_chunked_body(
+    reader: &mut SocketReader,
+    keep: bool,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, BodyError> {
     let mut body = Vec::new();
 
     loop {
@@ -674,11 +704,9 @@ fn read_chunked_body(reader: &mut SocketReader, keep: bool) -> Result<Vec<u8>, B
             return Ok(body);
         }
 
-        // Bound the size before using it. `MAX_BODY_BYTES - size` cannot
-        // underflow once `size` is known to fit, so a chunk header of
-        // `ffffffffffffffff` is refused instead of wrapping the sum into a
-        // huge allocation.
-        if size > MAX_BODY_BYTES || body.len() > MAX_BODY_BYTES - size {
+        // Bound the size before using it. Subtraction follows the first
+        // check, so a huge chunk header cannot wrap into an allocation.
+        if size > max_body_bytes || body.len() > max_body_bytes - size {
             return Err(BodyError::TooLarge);
         }
 
@@ -826,6 +854,62 @@ fn http_date() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let server = listener.accept().unwrap().0;
+        (client, server)
+    }
+
+    #[test]
+    fn an_oversized_body_error_names_the_configured_inline_media_limit() {
+        let response = payload_too_large(64 * 1024 * 1024);
+        assert_eq!(response.status, 413);
+        let Body::Bytes(body) = response.body else {
+            panic!("the 413 diagnostic is a complete response");
+        };
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains("the request body is larger than 67108864 bytes (64 MiB)"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "inline media such as base64 images, audio, and files counts toward this limit"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("Raise `server.max_body_bytes` in the configuration to allow more."),
+            "{body}"
+        );
+        assert!(body.contains("body_too_large"), "{body}");
+    }
+
+    #[test]
+    fn content_length_checks_use_the_configured_limit() {
+        let (mut writer, server) = tcp_pair();
+        let mut reader = SocketReader::new(server);
+        let error = read_body(
+            &mut reader,
+            &mut writer,
+            &[("content-length".to_string(), "9".to_string())],
+            true,
+            8,
+        )
+        .unwrap_err();
+        assert!(matches!(error, BodyError::TooLarge));
+    }
+
+    #[test]
+    fn chunked_checks_use_the_configured_limit() {
+        let (mut client, server) = tcp_pair();
+        client.write_all(b"9\r\n").unwrap();
+        let mut reader = SocketReader::new(server);
+        let error = read_chunked_body(&mut reader, true, 8).unwrap_err();
+        assert!(matches!(error, BodyError::TooLarge));
+    }
 
     #[test]
     fn reason_phrases_cover_the_codes_we_use() {

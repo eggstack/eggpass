@@ -1,0 +1,5 @@
+{
+  "models": [
+    { "slug": "fixture-image-model", "input_modalities": ["text", "image"] }
+  ]
+}

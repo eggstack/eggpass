@@ -1,0 +1,13 @@
+{
+  "id": "resp_fixture_image",
+  "status": "completed",
+  "model": "fixture-model",
+  "output": [
+    {
+      "type": "image_generation_call",
+      "id": "ig_fixture_1",
+      "status": "completed",
+      "result": "<redacted fixture payload>"
+    }
+  ]
+}

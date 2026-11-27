@@ -19,13 +19,42 @@ log request bodies.
    prefix in `routing.prefixes` wins. Otherwise it uses
    `routing.default_provider`.
 3. The proxy refreshes the provider's OAuth token if needed, removes client
-   credentials, and forwards the request.
+   credentials, and forwards the request. While the daemon is running, it starts
+   an independent background worker for each enabled provider (xAI/Grok and
+   OpenAI/ChatGPT). Each worker checks stored credentials immediately and then
+   once a minute, refreshing an access token when it is within five minutes of
+   expiry—even when no client traffic arrives.
 4. Chat Completions requests for ChatGPT are translated to the Responses API.
    x.ai Chat Completions requests are forwarded in their native format.
 5. The provider response is returned to the client. Streaming responses are
    forwarded incrementally.
 
 The Responses API is also available at `POST /v1/responses`.
+
+## Content shapes
+
+What is forwarded, translated, or refused depends on the provider and the
+endpoint, not only on the model.
+
+- **x.ai, both endpoints.** The request body is forwarded byte for byte, so
+  text, `image_url`, `input_audio`, and file parts reach x.ai exactly as the
+  client sent them. The answer is returned unchanged.
+- **ChatGPT, `/v1/responses`.** The request and the answer are forwarded
+  verbatim. `input_image` parts and the `image_generation` tool already work
+  on this path.
+- **ChatGPT, `/v1/chat/completions`.** The request is translated. Text,
+  `image_url` (including `detail`), `input_audio`, and file parts are mapped
+  to their Responses equivalents. A refusal and any other non-text content
+  part is returned in `content` as a part array; a text-only answer keeps the
+  string form. A part, request field, or tool with no faithful equivalent is
+  refused with a named `400` before the upstream is called — it is never
+  dropped. Image or audio generation is not expressible over Chat Completions
+  and must use `/v1/responses`.
+
+Native media endpoints, such as image generation, are declared per provider in
+the provider spec. A path is routed only after a live probe confirms the
+subscription serves it; until then it answers `404`, the same as any other
+unknown endpoint.
 
 ## Sign-in and credentials
 
@@ -77,7 +106,7 @@ Streaming responses are forwarded as chunks arrive. The proxy does not buffer
 the full answer before sending it to the client. Provider errors keep their
 status codes and error details where supported.
 
-The `eggpass usage` command first requests the running daemon's usage report and reuses its in-memory snapshot when available; the daemon refreshes on demand. A stale last-successful report is shown with a stderr warning. The CLI falls back to direct provider collection when the daemon is stopped or stale, its private runtime usage credential is missing or unreadable, or an older daemon returns `404`; after a transport failure, fallback occurs only if a state recheck confirms the daemon is stopped or stale. Other daemon errors are surfaced. Both paths query only providers enabled in configuration. ChatGPT's OAuth flow has no quota endpoint, so usage is unavailable rather than estimated; when OpenAI is enabled, the optional local Codex app-server may provide a report from a separate account.
+The `eggpass usage` command first requests the running daemon's usage report and reuses its in-memory snapshot when available; the daemon refreshes on demand. A stale last-successful report is shown with a stderr warning. The CLI falls back to direct provider collection when the daemon is stopped or stale, its private runtime usage credential is missing or unreadable, or an older daemon returns `404`; after a transport failure, fallback occurs only if a state recheck confirms the daemon is stopped or stale. Other daemon errors are surfaced. Both paths query only providers enabled in configuration. ChatGPT's OAuth flow has no quota endpoint, so usage is unavailable rather than estimated; when OpenAI is enabled, the optional local Codex app-server may provide a report from a separate account. The daemon's separate proactive token checks use a four-second OAuth deadline and retry on the next minute if a refresh fails.
 
 The authenticated `GET /v1/usage` endpoint returns the CLI-compatible JSON report. It caches one complete snapshot in memory for 10 minutes, starts at most one demand-triggered refresh, and never polls or writes usage data to disk. Its initiating request waits up to 30 seconds; if that deadline expires it gets `504` while the finite refresh continues. Concurrent requests get `202` with `Retry-After`. A refresh retries only timed-out providers, up to three times at 5/15/30-second intervals. Each xAI billing/settings request is capped at 15 seconds; OAuth refresh has a 60-second total deadline and Codex has an 8-second session deadline. Success adds age and update-time headers; after retry exhaustion, a previous successful snapshot is marked stale during a 10-minute cooldown, or `503` is returned if no good snapshot exists. A daemon restart clears the cache. The latest inference status is read afresh for every report response.
 

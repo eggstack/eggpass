@@ -1,0 +1,15 @@
+{
+  "id": "resp_fixture_refusal",
+  "status": "completed",
+  "model": "fixture-model",
+  "output": [
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        { "type": "output_text", "text": "I cannot help with that request." },
+        { "type": "refusal", "refusal": "The request is not supported." }
+      ]
+    }
+  ]
+}

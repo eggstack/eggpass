@@ -73,6 +73,18 @@ pub fn restart(context: &Context) -> Result<(), CommandError> {
     run(context, false)
 }
 
+/// Start after EggPool revocation only when another client key remains.
+///
+/// The caller must stop the daemon before revoking its credentials. If that
+/// was the only key, leave the daemon stopped instead of failing before stop.
+pub fn start_after_revoke(context: &Context) -> Result<(), CommandError> {
+    if has_a_key(&context.config.api_key, &context.paths.key_store_file())? {
+        run(context, false)
+    } else {
+        Ok(())
+    }
+}
+
 /// Start the daemon only if it is not already running.
 ///
 /// Nothing is printed: a crontab entry must not mail the user. Everything
@@ -106,13 +118,20 @@ fn require_key(context: &Context) -> Result<(), CommandError> {
 
 /// The implementation behind [`require_key`], testable without a context.
 fn ensure_a_key_exists(api_key: &str, store: &std::path::Path) -> Result<(), CommandError> {
+    if has_a_key(api_key, store)? {
+        Ok(())
+    } else {
+        Err(no_key())
+    }
+}
+
+fn has_a_key(api_key: &str, store: &std::path::Path) -> Result<bool, CommandError> {
     if !api_key.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     match crate::keys::KeyStore::open(store) {
-        Ok(keys) if !keys.is_empty() => Ok(()),
-        Ok(_) => Err(no_key()),
+        Ok(keys) => Ok(!keys.is_empty()),
         Err(err) => Err(CommandError::new(format!(
             "the key store at {} could not be read ({err}); run `eggpass key add` to issue a key",
             store.display()
@@ -188,12 +207,36 @@ fn start_daemon(context: &Context, quiet: bool) -> Result<(), CommandError> {
 
 /// Run the server in this process.
 fn serve(context: &Context) -> Result<(), CommandError> {
+    if context.config.eggpool.enabled && !crate::config::is_loopback_host(&context.config.host) {
+        return Err(CommandError::new(
+            "EggPool requires the EggPass HTTP listener to bind only to loopback",
+        ));
+    }
+
     let server = Server::bind_with_limits(
         &context.config.host,
         context.config.port,
         context.config.server,
     )
     .map_err(|err| CommandError::new(err.to_string()))?;
+
+    let mut eggpool_runtime = if context.config.eggpool.enabled {
+        Some(
+            crate::eggpool::start_runtime(
+                &context.config.eggpool,
+                context.paths.eggpool_secret_file(),
+                context.paths.eggpool_status_file(),
+                context.config.host.clone(),
+                context.config.port,
+            )
+            .map_err(CommandError::new)?,
+        )
+    } else {
+        None
+    };
+    let eggpool_enrollment = eggpool_runtime
+        .as_ref()
+        .map(crate::eggpool::TunnelRuntime::enrollment_store);
 
     // Every enabled provider gets a handle. A provider we are not signed in
     // to is still registered: it simply answers 401 when it is used.
@@ -271,6 +314,7 @@ fn serve(context: &Context) -> Result<(), CommandError> {
         port: context.config.port,
         api_key: context.config.api_key.clone(),
         usage_key: usage_key.token().to_string(),
+        eggpool_enrollment,
         keys,
         providers,
         default_provider,
@@ -299,6 +343,9 @@ fn serve(context: &Context) -> Result<(), CommandError> {
 
     server.clone().serve(server_context);
 
+    if let Some(runtime) = &mut eggpool_runtime {
+        runtime.shutdown();
+    }
     daemon::clear(&context.paths.pid_file());
     crate::logging::info("shut down");
     Ok(())
@@ -343,6 +390,24 @@ mod tests {
         store.add(None).expect("key");
 
         assert!(ensure_a_key_exists("", &path).is_ok());
+    }
+
+    #[test]
+    fn revoking_the_only_key_leaves_the_daemon_stopped() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let context = Context {
+            paths: crate::paths::Paths::in_directory(directory.path()),
+            config: crate::config::Config::default(),
+            cli: crate::cli::args::Cli {
+                command: crate::cli::args::Command::Eggpool {
+                    action: crate::cli::args::EggpoolAction::Revoke,
+                },
+                config_path: None,
+                verbose: false,
+            },
+        };
+
+        assert!(start_after_revoke(&context).is_ok());
     }
 
     #[test]

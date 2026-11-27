@@ -98,6 +98,10 @@ pub fn spec(config: &crate::config::Config) -> ProviderSpec {
         trusted_device_hosts: &["accounts.x.ai", "auth.x.ai", "x.ai"],
         catalogue: CatalogueKind::DataArray,
         native_paths: NativePaths::Both,
+        // Candidate: `POST /v1/images/generations`. It is enabled only after
+        // `scripts/probe-media-endpoints.sh` confirms the subscription serves
+        // it; until then the route stays a `404`.
+        media_paths: &[],
     }
 }
 

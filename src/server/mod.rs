@@ -11,7 +11,9 @@ pub mod guard;
 pub mod health;
 pub mod http;
 pub mod inference;
+pub mod media;
 pub mod models;
+pub mod parts;
 pub mod router;
 pub mod sse;
 pub mod translate;
@@ -29,6 +31,7 @@ mod keep_body_tests {
         assert!(!keep_body_for("/health"));
         assert!(!keep_body_for("/healthz"));
         assert!(!keep_body_for("/v1/usage"));
+        assert!(keep_body_for(crate::eggpool::ENROLLMENT_PATH));
         assert!(keep_body_for("/v1/chat/completions"));
         assert!(keep_body_for("/v1/models"));
     }
@@ -40,9 +43,11 @@ pub use http::{HttpServer, Request, Response};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::auth::refresh::TokenManager;
+use crate::auth::refresh::{TokenError, TokenManager};
 use crate::config::Routing;
 use crate::provider::{ProviderId, ProviderSpec};
 use crate::upstream::UpstreamClient;
@@ -77,6 +82,8 @@ pub struct ServerContext {
     ///
     /// This is never counted as a configured client key.
     pub usage_key: String,
+    /// The one-time EggPool enrollment callback, when the integration is enabled.
+    pub eggpool_enrollment: Option<Arc<crate::eggpool::EnrollmentStore>>,
     /// The keys `eggpass` issued to its clients.
     pub keys: Arc<crate::keys::KeyStore>,
     /// The providers that are available.
@@ -186,7 +193,8 @@ impl Server {
                 limits.max_connections,
                 Duration::from_secs(limits.idle_timeout_seconds),
                 Duration::from_secs(limits.write_timeout_seconds),
-            );
+            )
+            .with_max_body_bytes(limits.max_body_bytes);
 
         Ok(Arc::new(Server {
             http: Arc::new(http),
@@ -209,6 +217,10 @@ impl Server {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, flag.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
 
+        // Keep each signed-in provider's access token fresh even when no
+        // clients are sending requests. A failed check is retried next tick.
+        let refresh_workers = spawn_token_refresh_workers(&context);
+
         // The gate sees the request head before the body is read. A refusal
         // is written without retaining the body. Health stays unauthenticated
         // and does not retain one either: the probe does not read it.
@@ -227,6 +239,91 @@ impl Server {
         // The server waits for the in-flight connections itself, so a stream
         // that is halfway out when the signal arrives still finishes.
         Arc::clone(&self.http).serve(self.shutdown.clone(), gate, handler);
+
+        // Let an in-flight refresh finish, but don't leave a worker behind
+        // once the listener has stopped. OAuth requests have finite deadlines.
+        for (stop, _) in &refresh_workers {
+            let _ = stop.send(());
+        }
+        for (_, worker) in refresh_workers {
+            if worker.join().is_err() {
+                crate::logging::warn("a background token refresher stopped unexpectedly");
+            }
+        }
+    }
+}
+
+const TOKEN_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Start one periodic refresh worker for each provider enabled in this server.
+fn spawn_token_refresh_workers(context: &ServerContext) -> Vec<(mpsc::Sender<()>, JoinHandle<()>)> {
+    let mut workers = Vec::new();
+    for (provider, handle) in &context.providers {
+        let provider = *provider;
+        let tokens = Arc::clone(&handle.tokens);
+        let (stop, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name(format!("eggpass-{}-token-refresh", provider.as_str()))
+            .spawn(move || {
+                let mut failed = false;
+                run_refresh_worker(receiver, TOKEN_REFRESH_CHECK_INTERVAL, || {
+                    match tokens.refresh_if_needed() {
+                        Ok(()) => {
+                            if failed {
+                                crate::logging::info(&format!(
+                                    "{} background credential refresh recovered",
+                                    provider.display_name()
+                                ));
+                                failed = false;
+                            }
+                        }
+                        Err(error) => {
+                            if !failed {
+                                let reason = match error {
+                                    TokenError::NotLoggedIn => "credentials unavailable",
+                                    TokenError::Store(_) => "credential store error",
+                                    TokenError::Lock(_) => "credential refresh lock error",
+                                    TokenError::Auth(_) => "OAuth refresh error",
+                                    TokenError::NoRefreshToken => "no refresh token",
+                                };
+                                crate::logging::warn(&format!(
+                                    "{} background credential refresh failed ({reason}); will retry",
+                                    provider.display_name()
+                                ));
+                                failed = true;
+                            }
+                        }
+                    }
+                });
+            });
+
+        match worker {
+            Ok(worker) => workers.push((stop, worker)),
+            Err(_) => crate::logging::warn(&format!(
+                "could not start the {} background token refresher; request-triggered refresh remains active",
+                provider.display_name()
+            )),
+        }
+    }
+    workers
+}
+
+/// Run checks immediately, then on each interval, until the owner asks us to stop.
+fn run_refresh_worker<F>(stop: mpsc::Receiver<()>, interval: Duration, mut check: F)
+where
+    F: FnMut(),
+{
+    loop {
+        match stop.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        check();
+        match stop.recv_timeout(interval) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 
@@ -266,6 +363,32 @@ fn pre_authorize(request: &Request, context: &ServerContext) -> Option<Response>
         return Some(refusal);
     }
 
+    // Enrollment is authorized by the short-lived, one-time bearer token, not
+    // by an ordinary EggPass API key. It is accepted only on the exact callback
+    // route and only while private state says enrollment is still pending.
+    if router::route(request.path()) == router::Route::EggpoolEnrollment {
+        if request.method != "POST" {
+            return None;
+        }
+        let Some(store) = &context.eggpool_enrollment else {
+            return Some(openai_error(
+                404,
+                "unknown endpoint",
+                "invalid_request_error",
+            ));
+        };
+        let authorized = crate::eggpool::enrollment_bearer(request.header("authorization"))
+            .is_some_and(|token| store.authorizes(token));
+        if !authorized {
+            return Some(openai_error(
+                401,
+                "invalid or expired EggPool enrollment token",
+                "invalid_request_error",
+            ));
+        }
+        return None;
+    }
+
     // The health probe is never authenticated: `status` and `croncheck` use
     // it, and it carries nothing but a version string.
     //
@@ -302,14 +425,18 @@ fn pre_authorize(request: &Request, context: &ServerContext) -> Option<Response>
 }
 
 /// Route a request and produce a response.
-fn handle_request(request: Request, context: &ServerContext) -> Response {
+fn handle_request(mut request: Request, context: &ServerContext) -> Response {
     if let Some(refusal) = pre_authorize(&request, context) {
+        if router::route(request.path()) == router::Route::EggpoolEnrollment {
+            crate::eggpool::scrub_enrollment_request(&mut request);
+        }
         return refusal;
     }
 
     let path = request.path().to_string();
     let route = router::route(&path);
-    let method = request.method.as_str();
+    let method_text = request.method.clone();
+    let method = method_text.as_str();
 
     // The method is matched *after* the route, so an endpoint that exists and
     // takes a different method answers `405` rather than claiming not to
@@ -327,6 +454,19 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
             "GET" => usage::handle(context),
             _ => method_not_allowed(method, "GET"),
         },
+        router::Route::EggpoolEnrollment => match method {
+            "POST" => match &context.eggpool_enrollment {
+                Some(store) => crate::eggpool::handle_enrollment(request, store),
+                None => {
+                    crate::eggpool::scrub_enrollment_request(&mut request);
+                    openai_error(404, "unknown endpoint", "invalid_request_error")
+                }
+            },
+            _ => {
+                crate::eggpool::scrub_enrollment_request(&mut request);
+                method_not_allowed(method, "POST")
+            }
+        },
         router::Route::Models => match method {
             "GET" => models::list(&request, context),
             _ => method_not_allowed(method, "GET"),
@@ -339,11 +479,13 @@ fn handle_request(request: Request, context: &ServerContext) -> Response {
             "POST" => chat::complete(&request, context),
             _ => method_not_allowed(method, "POST"),
         },
-        router::Route::NotFound => openai_error(
-            404,
-            &format!("unknown endpoint `{path}`"),
-            "invalid_request_error",
-        ),
+        router::Route::NotFound => media::handle(&request, context).unwrap_or_else(|| {
+            openai_error(
+                404,
+                &format!("unknown endpoint `{path}`"),
+                "invalid_request_error",
+            )
+        }),
     }
 }
 
@@ -508,6 +650,41 @@ pub fn openai_error_with_code(
 }
 
 #[cfg(test)]
+mod refresh_worker_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn refresh_worker_checks_immediately_and_stops_on_request() {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&checks);
+
+        run_refresh_worker(stop_rx, Duration::from_secs(60), move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            stop_tx.send(()).unwrap();
+        });
+
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn refresh_worker_rechecks_after_the_interval() {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&checks);
+
+        run_refresh_worker(stop_rx, Duration::from_millis(1), move || {
+            if observed.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                stop_tx.send(()).unwrap();
+            }
+        });
+
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
 mod authorisation_tests {
     use super::*;
 
@@ -525,6 +702,7 @@ mod authorisation_tests {
             port: 8484,
             api_key: key.to_string(),
             usage_key: "usage-only-secret".to_string(),
+            eggpool_enrollment: None,
             keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,
@@ -572,6 +750,52 @@ mod authorisation_tests {
             headers: Vec::new(),
             body: Vec::new(),
         }
+    }
+
+    #[test]
+    fn eggpool_enrollment_uses_the_one_time_token_without_an_api_key() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state_path = directory.path().join("eggpool.json");
+        let state = serde_json::json!({
+            "version": 1,
+            "agent": "test-agent",
+            "api_key_id": 1,
+            "ca_sha256": "pin",
+            "enroll_token": "one-time-secret",
+            "expires_at": crate::timeutil::now_unix() + 60
+        });
+        std::fs::write(&state_path, state.to_string()).expect("write pending enrollment");
+        let store = Arc::new(crate::eggpool::EnrollmentStore::new(
+            state_path,
+            Vec::new(),
+            "pool.example".to_string(),
+        ));
+        let mut context = context_with_key("");
+        context.eggpool_enrollment = Some(store);
+
+        let invalid_token = request_at(
+            "POST",
+            crate::eggpool::ENROLLMENT_PATH,
+            vec![
+                ("Host", "127.0.0.1:8484"),
+                ("Authorization", "Bearer wrong"),
+            ],
+            b"{}",
+        );
+        assert_eq!(handle_request(invalid_token, &context).status, 401);
+
+        let valid_token = request_at(
+            "POST",
+            crate::eggpool::ENROLLMENT_PATH,
+            vec![
+                ("Host", "127.0.0.1:8484"),
+                ("Authorization", "Bearer one-time-secret"),
+            ],
+            b"{}",
+        );
+        // The pending token passed authorization (the body is then rejected),
+        // even though this context has no ordinary API key.
+        assert_eq!(handle_request(valid_token, &context).status, 400);
     }
 
     #[test]
@@ -842,6 +1066,7 @@ mod authorisation_tests {
             port: 8484,
             api_key: String::new(),
             usage_key: String::new(),
+            eggpool_enrollment: None,
             keys: empty_store(),
             providers: HashMap::new(),
             default_provider: ProviderId::Xai,

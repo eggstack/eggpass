@@ -28,6 +28,7 @@ body_seconds = 1800
 
 [server]
 max_connections = 256
+max_body_bytes = 33554432
 idle_timeout_seconds = 120
 write_timeout_seconds = 600
 
@@ -60,6 +61,7 @@ default_provider = "xai"
 | `allow_privileged_port` | `false` | Must be `true` to use a port below 1024. |
 | `timeouts.*` | See example | Upstream connection, whole-request, and response-body time limits in seconds. |
 | `server.*` | See example | Local connection limit and idle/write timeouts. |
+| `server.max_body_bytes` | `33554432` | Largest request body in bytes, including inline base64 media. Clamped to 1–256 MiB; a larger body answers `413 body_too_large`. |
 | `providers.*.enabled` | `true` | Disable a provider without deleting its stored credentials. Routing to a disabled provider will not serve requests. |
 | `providers.xai.upstream` | `api` | `api` uses `https://api.x.ai/v1`; `build` uses `https://cli-chat-proxy.grok.com/v1`. |
 | `routing.default_provider` | `xai` | Provider used when no model prefix matches. |
@@ -69,6 +71,12 @@ default_provider = "xai"
 For a prefix match, the longest matching prefix wins. With the defaults, names beginning with `grok-` route to xAI; names beginning with `gpt-` or `codex` route to ChatGPT. Unmatched names route to xAI. Routing is based on the model name, not the endpoint path.
 
 The advanced `[oauth.xai]` settings are `client_id`, `issuer`, `scopes`, and `referrer`. `[oauth.openai]` supports `issuer`, `scopes`, `agent_name_hint`, `resource`, and `ext_agent_host_id`. `scopes` can be a space-separated string or an array of strings. Leave these at their built-in values unless a provider requires a change. The ChatGPT host ID is generated and recorded on first sign-in if it is absent.
+
+## EggPool
+
+eggpass eggpool --control HOST:PORT --server-name NAME --ca PATH [--label NAME] enables the optional outbound EggPool reverse tunnel. control must be a bare Eggress control host and TCP port (not a URL); server_name is the TLS name checked for the control server; ca is a path to its CA PEM bundle. EggPool mode refuses to start unless host is loopback. EggPass uses a fixed loopback forwarding target equal to its configured listener address; ticket data cannot select an arbitrary target. EggPool must rewrite forwarded HTTP Host headers to 127.0.0.1 (or localhost) to pass the loopback authority guard.
+
+The config stores only non-secret fields (enabled, control, server_name, ca, and optional label). Enrollment tokens, client certificates/private keys, and status state are kept in owner-only files in the data directory. The one-line ticket printed by setup is a bearer secret: give it only to the trusted EggPool enrollment flow. See [eggpool.md](eggpool.md) for the wire contract and certificate exchange. Use eggpass eggpool --revoke to remove local state and disable the tunnel.
 
 ## Keys and network exposure
 

@@ -1,10 +1,9 @@
 //! `eggpass update`.
 //!
-//! The update itself is done by `eggup`, the eggstack family's verified
-//! updater: it fetches the release manifest, checks the SHA-256 of what it
-//! downloaded, validates it, and only then replaces the running binary. The
-//! same mechanism every other eggstack tool uses, so the behaviour is the same
-//! everywhere.
+//! Self-managed binaries use Eggup's verified manifest-driven transaction.
+//! Cargo-managed binaries are delegated to Cargo only when their recorded root
+//! and default crates.io source can be proven; the Cargo-owned executable is
+//! never replaced through Eggup.
 //!
 //! The SHA-256 check is an **integrity** check, not an authenticity check: it
 //! proves the download was not corrupted, not that it came from us. The
@@ -38,6 +37,15 @@ pub fn update(context: &Context, version: Option<String>, check: bool) -> Result
     );
     println!("  target: {}", plan.target);
     println!("  asset:  {}", plan.asset);
+    match &plan.provenance {
+        crate::update::Provenance::CargoManaged { .. } => {
+            println!("  method: Cargo-managed install")
+        }
+        crate::update::Provenance::SelfManaged { .. } => {
+            println!("  method: verified Eggup transaction")
+        }
+        crate::update::Provenance::Unprovable { .. } => {}
+    }
 
     // The daemon is deliberately not restarted: a restart cuts live streams,
     // and the user asked for an update, not an outage.

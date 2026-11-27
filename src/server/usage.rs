@@ -665,6 +665,7 @@ mod tests {
             port: 8484,
             api_key: "route-test-key".to_string(),
             usage_key: String::new(),
+            eggpool_enrollment: None,
             keys,
             providers: std::collections::HashMap::new(),
             default_provider: ProviderId::Xai,

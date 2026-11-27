@@ -132,10 +132,39 @@ curl http://127.0.0.1:8484/v1/responses \
 
 ## Thinking levels and tool calls
 
-For Chat Completions, set `reasoning_effort` to a level listed for that model
-in `/v1/models`. ChatGPT requests are translated to the Responses API. Returned
-reasoning may be available in `reasoning_content`, depending on the provider
-and model.
+Discover per-model thinking levels with the authenticated `GET /v1/models`
+request shown above. Eggpass keeps the provider's native metadata and adds a
+common, additive projection when effort levels are published:
+
+- ChatGPT native fields: `supported_reasoning_levels[].effort` and
+  `default_reasoning_level`.
+- Grok native fields: `capabilities.reasoning_effort` and
+  `capabilities.default_reasoning_effort`.
+- Eggpass's common fields: `reasoning.supported_efforts` and, only when the
+  provider supplies a default, `reasoning.default_effort`.
+
+Effort labels (including new labels) and their provider order are preserved.
+The common object is a sourced projection, not a claim of full OpenRouter
+metadata conformance. Eggpass does not infer `default_enabled` or `mandatory`;
+those behavioral properties are omitted because the supported provider
+catalogue fields do not establish them. The previous
+`capabilities.reasoning` alias is retained when no provider field already
+occupies that location.
+
+For Chat Completions, send `reasoning_effort` using a level listed for that
+model. For example:
+
+```json
+{"model":"MODEL_ID_FROM_V1_MODELS","messages":[{"role":"user","content":"Think carefully about this."}],"reasoning_effort":"high"}
+```
+
+ChatGPT requests are translated to the Responses API's `reasoning.effort`;
+Grok receives the Chat Completions effort value unchanged. Eggpass does not
+validate levels locally, so the upstream remains authoritative when a value is
+unsupported. Generic OpenAI-compatible clients may ignore custom model
+metadata or may not show a thinking-level selector; client UI support varies.
+Returned reasoning may be available in `reasoning_content`, depending on the
+provider and model.
 
 Tool calls use the Chat Completions format. The client should send the
 assistant's tool call back with the tool result and its `tool_call_id`, as

@@ -92,6 +92,26 @@ pub enum NativePaths {
     ResponsesOnly,
 }
 
+/// An endpoint a provider serves outside the two inference paths.
+///
+/// Media endpoints are declared by the provider because whether a subscription
+/// may call one is the provider's call, not ours. The list is empty until the
+/// endpoint has been confirmed against a live account; an entry that has not
+/// been probed would ship a route that answers `403` to users.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaPath {
+    /// The HTTP method the endpoint takes.
+    pub method: &'static str,
+    /// The path, including the `/v1` prefix.
+    pub path: &'static str,
+    /// The content types the endpoint answers with.
+    ///
+    /// A response outside this list is a shape the proxy does not understand,
+    /// so it is refused rather than streamed to the client under a wrong
+    /// `Content-Type`.
+    pub response_types: &'static [&'static str],
+}
+
 /// What a provider demands of a request body.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RequestPolicy {
@@ -167,6 +187,8 @@ pub struct ProviderSpec {
     pub catalogue: CatalogueKind,
     /// Which inference paths the provider serves natively.
     pub native_paths: NativePaths,
+    /// Native media endpoints, empty until each one is probe-confirmed.
+    pub media_paths: &'static [MediaPath],
 }
 
 impl ProviderSpec {
@@ -308,13 +330,10 @@ pub fn normalize_catalogue(kind: CatalogueKind, body: &[u8]) -> Vec<u8> {
 
 /// Add the alias fields a client may read, beside the upstream's own.
 ///
-/// Clients disagree about how a model describes itself. The OpenAI shape
-/// names a model and says little else; the OpenRouter shape — which most of
-/// the OpenAI-compatible ecosystem has settled on — says what the model can
-/// do, under `capabilities` and `limit`.
-///
-/// Aliases are derived from upstream data; absent facts are omitted rather
-/// than guessed. A reasoning alias may replace a colliding upstream value.
+/// Reasoning metadata is a projection of provider-published effort values,
+/// not a claim that every OpenAI-compatible client understands or displays it.
+/// The canonical top-level object follows the useful subset of the OpenRouter
+/// model metadata shape that Eggpass can source without guessing.
 fn add_aliases(entry: &mut serde_json::Map<String, Value>) {
     // The display name, under the OpenRouter spelling.
     let display_name = entry
@@ -329,7 +348,7 @@ fn add_aliases(entry: &mut serde_json::Map<String, Value>) {
 
     // The context window, under both names.
     //
-    // ChatGPT publishes it as `context_window` and x.ai as `context_length`,
+    // ChatGPT publishes it as context_window and x.ai as context_length,
     // so the merged catalogue gives both providers the same two names for it.
     let context = entry
         .get("context_window")
@@ -342,41 +361,87 @@ fn add_aliases(entry: &mut serde_json::Map<String, Value>) {
         entry.entry("context_length".to_string()).or_insert(context);
     }
 
-    // The default thinking level, under the name ChatGPT uses.
-    let default_effort = entry
-        .get("capabilities")
-        .and_then(|capabilities| capabilities.get("default_reasoning_effort"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if let Some(default) = default_effort {
-        entry
-            .entry("default_reasoning_level".to_string())
-            .or_insert_with(|| Value::String(default));
+    // Without published effort levels there is no reasoning alias. In
+    // particular, a default alone does not establish an effort selector.
+    let levels = effort_levels(entry);
+    if levels.is_empty() {
+        return;
     }
 
-    // The thinking levels, under the OpenRouter spelling.
-    let levels = effort_levels(entry);
-    if !levels.is_empty() {
-        entry.insert("reasoning".to_string(), Value::Bool(true));
+    // ChatGPT publishes a top-level default; x.ai publishes the equivalent
+    // value inside capabilities. Neither value is inferred from the levels.
+    let default_effort = entry
+        .get("default_reasoning_level")
+        .and_then(Value::as_str)
+        .filter(|effort| !effort.is_empty())
+        .or_else(|| {
+            entry
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("default_reasoning_effort"))
+                .and_then(Value::as_str)
+                .filter(|effort| !effort.is_empty())
+        })
+        .map(str::to_string);
+    if let Some(default) = default_effort.as_ref() {
+        entry
+            .entry("default_reasoning_level".to_string())
+            .or_insert_with(|| Value::String(default.clone()));
+    }
 
-        // x.ai publishes a `capabilities` block of its own, so the alias is
-        // added to it rather than over it.
-        let capabilities = entry
-            .entry("capabilities".to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if let Some(capabilities) = capabilities.as_object_mut() {
-            capabilities.insert(
-                "reasoning".to_string(),
-                serde_json::json!({ "supported": true, "effort": levels }),
-            );
+    // Replace a scalar/malformed pre-existing field, or preserve a collision
+    // with the fields owned by this projection, under reasoning.provider.
+    // Non-conflicting upstream reasoning properties remain at the same path.
+    let supported_efforts = serde_json::json!(levels.clone());
+    let native_reasoning = entry.remove("reasoning");
+    let has_collision = match native_reasoning.as_ref() {
+        Some(Value::Object(native)) => {
+            let supported_conflict = native
+                .get("supported_efforts")
+                .is_some_and(|value| value != &supported_efforts);
+            let default_conflict = match (native.get("default_effort"), default_effort.as_ref()) {
+                (Some(value), Some(default)) => value != &Value::String(default.clone()),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            supported_conflict || default_conflict
         }
+        Some(_) => true,
+        None => false,
+    };
+    let mut reasoning = match native_reasoning {
+        Some(Value::Object(native)) if !has_collision => native,
+        Some(native) => {
+            let mut reasoning = serde_json::Map::new();
+            reasoning.insert("provider".to_string(), native);
+            reasoning
+        }
+        None => serde_json::Map::new(),
+    };
+    reasoning.insert("supported_efforts".to_string(), supported_efforts);
+    if let Some(default) = default_effort {
+        reasoning.insert("default_effort".to_string(), Value::String(default));
+    }
+    entry.insert("reasoning".to_string(), Value::Object(reasoning));
+
+    // Keep Eggpass's previous capability alias for existing clients. Never
+    // replace a provider's own capabilities.reasoning or other capability
+    // fields; the canonical discovery fields are the top-level object above.
+    let capabilities = entry
+        .entry("capabilities".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(capabilities) = capabilities.as_object_mut() {
+        capabilities
+            .entry("reasoning".to_string())
+            .or_insert_with(|| serde_json::json!({ "supported": true, "effort": levels }));
     }
 }
 
 /// The thinking levels a model offers, under either provider's spelling.
 ///
-/// ChatGPT publishes them as `supported_reasoning_levels`, a list of objects;
-/// x.ai publishes them as `capabilities.reasoning_effort`, a list of strings.
+/// ChatGPT publishes them as supported_reasoning_levels, a list of objects;
+/// x.ai publishes them as capabilities.reasoning_effort, a list of strings.
+/// Malformed entries and empty labels are ignored; valid labels, including
+/// future values, are returned in the provider's original order.
 fn effort_levels(entry: &serde_json::Map<String, Value>) -> Vec<String> {
     let levels: Vec<String> = entry
         .get("supported_reasoning_levels")
@@ -385,6 +450,7 @@ fn effort_levels(entry: &serde_json::Map<String, Value>) -> Vec<String> {
             levels
                 .iter()
                 .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .filter(|effort| !effort.is_empty())
                 .map(str::to_string)
                 .collect()
         })
@@ -401,6 +467,7 @@ fn effort_levels(entry: &serde_json::Map<String, Value>) -> Vec<String> {
             levels
                 .iter()
                 .filter_map(Value::as_str)
+                .filter(|effort| !effort.is_empty())
                 .map(str::to_string)
                 .collect()
         })
@@ -529,8 +596,15 @@ mod tests {
         let model = &value["data"][0];
 
         assert_eq!(model["name"], "GPT-6.1 Sol");
-        assert_eq!(model["reasoning"], true);
+        assert_eq!(
+            model["reasoning"]["supported_efforts"],
+            serde_json::json!(["low", "high"])
+        );
+        assert!(model["reasoning"].get("default_effort").is_none());
+        assert!(model["reasoning"].get("default_enabled").is_none());
+        assert!(model["reasoning"].get("mandatory").is_none());
         assert_eq!(model["limit"]["context"], 500000);
+        // The old Eggpass alias remains available for existing clients.
         assert_eq!(model["capabilities"]["reasoning"]["supported"], true);
         assert_eq!(model["capabilities"]["reasoning"]["effort"][0], "low");
         assert_eq!(model["capabilities"]["reasoning"]["effort"][1], "high");
@@ -589,11 +663,136 @@ mod tests {
         assert_eq!(model["capabilities"]["default_reasoning_effort"], "high");
         assert_eq!(model["default_reasoning_level"], "high");
 
-        // And the OpenRouter shape is answered as well.
-        assert_eq!(model["reasoning"], true);
+        // And the canonical reasoning object is answered as well.
+        assert_eq!(
+            model["reasoning"]["supported_efforts"],
+            serde_json::json!(["low", "medium", "high", "xhigh"])
+        );
+        assert_eq!(model["reasoning"]["default_effort"], "high");
+        assert!(model["reasoning"].get("default_enabled").is_none());
+        assert!(model["reasoning"].get("mandatory").is_none());
         assert_eq!(model["capabilities"]["reasoning"]["supported"], true);
         assert_eq!(model["capabilities"]["reasoning"]["effort"][3], "xhigh");
         assert_eq!(model["limit"]["context"], 500000);
+    }
+
+    #[test]
+    fn malformed_and_future_efforts_keep_the_provider_order() {
+        let chatgpt_body = br#"{"models":[{
+            "slug":"gpt-future",
+            "visibility":"list",
+            "supported_reasoning_levels":[
+                null,
+                {"effort":7},
+                {"label":"missing-effort"},
+                {"effort":""},
+                {"effort":"future-level"},
+                {"effort":"low"}
+            ]
+        }]}"#;
+        let normalized = normalize_catalogue(CatalogueKind::SlugArray, chatgpt_body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        let model = &value["data"][0];
+        assert_eq!(
+            model["reasoning"]["supported_efforts"],
+            serde_json::json!(["future-level", "low"])
+        );
+        assert!(model["reasoning"].get("default_effort").is_none());
+        // The native field remains byte-for-byte data, including malformed
+        // entries; only the additive alias filters entries it cannot use.
+        assert_eq!(model["supported_reasoning_levels"][0], Value::Null);
+
+        let grok_body = br#"{"data":[{
+            "id":"grok-future",
+            "capabilities":{"reasoning_effort":["custom-future",null,4,"","minimal"]}
+        }]}"#;
+        let normalized = normalize_catalogue(CatalogueKind::DataArray, grok_body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        assert_eq!(
+            value["data"][0]["reasoning"]["supported_efforts"],
+            serde_json::json!(["custom-future", "minimal"])
+        );
+        assert!(
+            value["data"][0]["reasoning"]
+                .get("default_effort")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reasoning_collisions_and_native_capabilities_are_preserved() {
+        let body = br#"{"data":[{
+            "id":"grok-collision",
+            "reasoning":{"supported_efforts":["provider-only"],"default_effort":"provider-default","note":"native"},
+            "capabilities":{
+                "reasoning_effort":["low","future"],
+                "default_reasoning_effort":"future",
+                "reasoning":{"engine":"provider-engine","effort":"provider-effort"},
+                "tools":true
+            }
+        },{
+            "id":"grok-legacy-boolean",
+            "reasoning":true,
+            "capabilities":{"reasoning_effort":["future-level"]}
+        }]}"#;
+        let normalized = normalize_catalogue(CatalogueKind::DataArray, body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        let model = &value["data"][0];
+
+        assert_eq!(
+            model["reasoning"]["supported_efforts"],
+            serde_json::json!(["low", "future"])
+        );
+        assert_eq!(model["reasoning"]["default_effort"], "future");
+        assert_eq!(
+            model["reasoning"]["provider"],
+            serde_json::json!({
+                "supported_efforts":["provider-only"],
+                "default_effort":"provider-default",
+                "note":"native"
+            })
+        );
+        assert_eq!(
+            model["capabilities"]["reasoning_effort"],
+            serde_json::json!(["low", "future"])
+        );
+        assert_eq!(model["capabilities"]["default_reasoning_effort"], "future");
+        assert_eq!(
+            model["capabilities"]["reasoning"]["engine"],
+            "provider-engine"
+        );
+        assert_eq!(
+            model["capabilities"]["reasoning"]["effort"],
+            "provider-effort"
+        );
+        assert_eq!(model["capabilities"]["tools"], true);
+
+        let legacy = &value["data"][1];
+        assert_eq!(
+            legacy["reasoning"]["supported_efforts"],
+            serde_json::json!(["future-level"])
+        );
+        assert_eq!(legacy["reasoning"]["provider"], true);
+        assert!(legacy["reasoning"].get("default_effort").is_none());
+    }
+
+    #[test]
+    fn defaults_without_published_levels_do_not_create_reasoning_aliases() {
+        let body = br#"{"data":[
+            {"id":"grok-default-only","capabilities":{"default_reasoning_effort":"high"}},
+            {"id":"grok-empty","capabilities":{"reasoning_effort":[],"default_reasoning_effort":"low"}},
+            {"id":"grok-malformed","capabilities":{"reasoning_effort":[null,5,""]}}
+        ]}"#;
+        let normalized = normalize_catalogue(CatalogueKind::DataArray, body);
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        for model in value["data"].as_array().unwrap() {
+            assert!(model.get("reasoning").is_none());
+            assert!(model.get("default_reasoning_level").is_none());
+        }
+        assert_eq!(
+            value["data"][0]["capabilities"]["default_reasoning_effort"],
+            "high"
+        );
     }
 
     #[test]

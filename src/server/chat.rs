@@ -30,6 +30,9 @@ use super::{
 /// Handle `POST /v1/chat/completions` and `POST /v1/responses`.
 pub fn complete(request: &Request, context: &ServerContext) -> Response {
     let model = extract_model(&request.body);
+    if model.is_empty() {
+        return missing_model_error();
+    }
 
     // Which provider serves this model?
     let provider_id = context.provider_for(&model);
@@ -70,7 +73,12 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
         match translate::chat_request_to_responses(&request.body) {
             Ok(body) => body,
             Err(err) => {
-                return openai_error(400, &err, "invalid_request_error");
+                return openai_error_with_code(
+                    400,
+                    err.message(),
+                    "invalid_request_error",
+                    Some(err.code()),
+                );
             }
         }
     };
@@ -200,7 +208,12 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
                         Ok(bytes) => bytes,
                         Err(err) => {
                             context.record_inference(provider_id, 502);
-                            return openai_error(502, &err, "server_error");
+                            return openai_error_with_code(
+                                502,
+                                err.message(),
+                                "server_error",
+                                Some(err.code()),
+                            );
                         }
                     }
                 };
@@ -254,7 +267,12 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
             Ok(bytes) => bytes,
             Err(err) => {
                 context.record_inference(provider_id, 502);
-                return openai_error(502, &err, "server_error");
+                return openai_error_with_code(
+                    502,
+                    err.message(),
+                    "server_error",
+                    Some(err.code()),
+                );
             }
         }
     };
@@ -271,7 +289,7 @@ pub fn complete(request: &Request, context: &ServerContext) -> Response {
 /// model the provider does not serve has to be told exactly that — a blanket
 /// "server error" hides both the reason and the status, and turns a request
 /// that cannot succeed into something that looks worth retrying.
-fn upstream_error(status: u16, body: &[u8]) -> Response {
+pub(crate) fn upstream_error(status: u16, body: &[u8]) -> Response {
     let parsed: Option<Value> = serde_json::from_slice(body).ok();
     let error = parsed.as_ref().and_then(|value| value.get("error"));
 
@@ -362,6 +380,16 @@ fn apply_policy(body: &[u8], policy: &crate::provider::RequestPolicy) -> Vec<u8>
     serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
 }
 
+/// Answer before provider routing when the caller omitted a usable model.
+fn missing_model_error() -> Response {
+    openai_error_with_code(
+        400,
+        "the request body must be a JSON object with a model string",
+        "invalid_request_error",
+        Some("missing_model"),
+    )
+}
+
 /// The model a request names.
 fn extract_model(body: &[u8]) -> String {
     serde_json::from_slice::<Value>(body)
@@ -409,13 +437,16 @@ pub fn forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> 
 ///
 /// The slot has to be held for as long as the stream is running: a request
 /// that is still streaming is still in flight.
-struct ReleasingStream {
+pub(crate) struct ReleasingStream {
     inner: Box<dyn Read + Send + 'static>,
     counter: Option<Arc<AtomicUsize>>,
 }
 
 impl ReleasingStream {
-    fn new(inner: Box<dyn Read + Send + 'static>, counter: Arc<AtomicUsize>) -> ReleasingStream {
+    pub(crate) fn new(
+        inner: Box<dyn Read + Send + 'static>,
+        counter: Arc<AtomicUsize>,
+    ) -> ReleasingStream {
         ReleasingStream {
             inner,
             counter: Some(counter),
@@ -564,5 +595,31 @@ mod tests {
         let policy = crate::provider::RequestPolicy::default();
         let body = br#"{"model":"grok-4.7","temperature":0.7}"#;
         assert_eq!(apply_policy(body, &policy), body);
+    }
+    #[test]
+    fn an_unmappable_output_is_a_502_with_its_translation_code() {
+        let fixture = include_str!("../../tests/fixtures/media/responses-image-generation.json");
+        let error = translate::responses_to_chat_completion(fixture.as_bytes()).unwrap_err();
+        let response =
+            openai_error_with_code(502, error.message(), "server_error", Some(error.code()));
+        assert_eq!(response.status, 502);
+        let value: Value = serde_json::from_slice(body_bytes(&response)).unwrap();
+        assert_eq!(value["error"]["type"], "server_error");
+        assert_eq!(value["error"]["code"], "unmappable_output_item");
+    }
+
+    #[test]
+    fn a_missing_model_is_a_named_bad_request() {
+        let response = missing_model_error();
+        assert_eq!(response.status, 400);
+        let value: Value = serde_json::from_slice(body_bytes(&response)).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["code"], "missing_model");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("JSON object with a model string")
+        );
     }
 }
