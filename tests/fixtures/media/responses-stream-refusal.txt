@@ -1,0 +1,6 @@
+data: {"type":"response.refusal.delta","item_id":"msg_fixture_1","delta":"I cannot help"}
+
+data: {"type":"response.refusal.done","item_id":"msg_fixture_1","refusal":"I cannot help with that request."}
+
+data: {"type":"response.completed","response":{"id":"resp_fixture_refusal","model":"fixture-model","status":"completed"}}
+

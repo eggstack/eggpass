@@ -28,6 +28,7 @@ body_seconds = 1800
 
 [server]
 max_connections = 256
+max_body_bytes = 33554432
 idle_timeout_seconds = 120
 write_timeout_seconds = 600
 
@@ -60,6 +61,7 @@ default_provider = "xai"
 | `allow_privileged_port` | `false` | Must be `true` to use a port below 1024. |
 | `timeouts.*` | See example | Upstream connection, whole-request, and response-body time limits in seconds. |
 | `server.*` | See example | Local connection limit and idle/write timeouts. |
+| `server.max_body_bytes` | `33554432` | Largest request body in bytes, including inline base64 media. Clamped to 1–256 MiB; a larger body answers `413 body_too_large`. |
 | `providers.*.enabled` | `true` | Disable a provider without deleting its stored credentials. Routing to a disabled provider will not serve requests. |
 | `providers.xai.upstream` | `api` | `api` uses `https://api.x.ai/v1`; `build` uses `https://cli-chat-proxy.grok.com/v1`. |
 | `routing.default_provider` | `xai` | Provider used when no model prefix matches. |

@@ -195,6 +195,10 @@ pub fn spec(config: &crate::config::Config) -> ProviderSpec {
         trusted_device_hosts: &[],
         catalogue: CatalogueKind::SlugArray,
         native_paths: NativePaths::ResponsesOnly,
+        // Candidate: `POST /v1/images/generations`. It is enabled only after
+        // `scripts/probe-media-endpoints.sh` confirms the subscription serves
+        // it; until then the route stays a `404`.
+        media_paths: &[],
     }
 }
 

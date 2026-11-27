@@ -6,6 +6,34 @@ Notable changes to eggpass are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Carry non-text content through ChatGPT's Chat Completions translation:
+  `image_url` becomes `input_image` with `detail` preserved, and `input_audio`
+  and file parts are mapped to their Responses equivalents. An image-only
+  message no longer disappears.
+- Return a refusal as a non-text `content` part, in both non-streaming and
+  streaming answers, instead of an empty answer.
+- Carry request fields with a mechanical Responses equivalent, including
+  `response_format` to `text.format`, and pass Responses-native tools through.
+- Add an optional `server.max_body_bytes` setting, defaulting to 32 MiB.
+- Add probe-gated routing for native media endpoints. A route is enabled only
+  after `scripts/probe-media-endpoints.sh` confirms it, so an unprobed path
+  still answers `404`.
+
+### Changed
+
+- Refuse a part, field, or tool the translated path cannot carry with a named
+  `400` before the upstream runs, rather than dropping it silently.
+- Answer a chat or Responses request without a readable `model` with
+  `400 missing_model` instead of routing it to the default provider.
+
+### Fixed
+
+- Fail an answer or stream whose content cannot be expressed in the Chat
+  Completions shape with `unmappable_output_item` instead of empty content.
+- Name the limit and the inline-media cause in the `413` response.
+
 ## [0.1.3] - 2026-11-22
 
 ### Added

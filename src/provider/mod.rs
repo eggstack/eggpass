@@ -92,6 +92,26 @@ pub enum NativePaths {
     ResponsesOnly,
 }
 
+/// An endpoint a provider serves outside the two inference paths.
+///
+/// Media endpoints are declared by the provider because whether a subscription
+/// may call one is the provider's call, not ours. The list is empty until the
+/// endpoint has been confirmed against a live account; an entry that has not
+/// been probed would ship a route that answers `403` to users.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaPath {
+    /// The HTTP method the endpoint takes.
+    pub method: &'static str,
+    /// The path, including the `/v1` prefix.
+    pub path: &'static str,
+    /// The content types the endpoint answers with.
+    ///
+    /// A response outside this list is a shape the proxy does not understand,
+    /// so it is refused rather than streamed to the client under a wrong
+    /// `Content-Type`.
+    pub response_types: &'static [&'static str],
+}
+
 /// What a provider demands of a request body.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RequestPolicy {
@@ -167,6 +187,8 @@ pub struct ProviderSpec {
     pub catalogue: CatalogueKind,
     /// Which inference paths the provider serves natively.
     pub native_paths: NativePaths,
+    /// Native media endpoints, empty until each one is probe-confirmed.
+    pub media_paths: &'static [MediaPath],
 }
 
 impl ProviderSpec {

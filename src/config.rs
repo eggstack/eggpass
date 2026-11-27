@@ -279,6 +279,8 @@ impl Default for Timeouts {
 pub struct ServerLimits {
     /// The largest number of simultaneous connections.
     pub max_connections: usize,
+    /// The largest request body, including inline media.
+    pub max_body_bytes: usize,
     /// How long a kept-alive connection may sit idle, in seconds.
     pub idle_timeout_seconds: u64,
     /// How long a single write may stall, in seconds.
@@ -289,6 +291,7 @@ impl Default for ServerLimits {
     fn default() -> ServerLimits {
         ServerLimits {
             max_connections: crate::server::http::DEFAULT_MAX_CONNECTIONS,
+            max_body_bytes: crate::server::http::DEFAULT_MAX_BODY_BYTES,
             idle_timeout_seconds: crate::server::http::DEFAULT_IDLE_TIMEOUT.as_secs(),
             write_timeout_seconds: crate::server::http::DEFAULT_WRITE_TIMEOUT.as_secs(),
         }
@@ -421,6 +424,8 @@ body_seconds = 1800
 # The local server's limits.
 [server]
 max_connections = 256
+# Inline media counts toward this cap; the server clamps it to 1–256 MiB.
+max_body_bytes = 33554432
 idle_timeout_seconds = 120
 write_timeout_seconds = 600
 
@@ -570,6 +575,7 @@ struct RawTimeouts {
 #[derive(Debug, Deserialize, Default)]
 struct RawServer {
     max_connections: Option<usize>,
+    max_body_bytes: Option<i64>,
     idle_timeout_seconds: Option<u64>,
     write_timeout_seconds: Option<u64>,
 }
@@ -736,6 +742,13 @@ impl Config {
         if let Some(server) = raw.server {
             if let Some(max) = server.max_connections {
                 config.server.max_connections = max.max(1);
+            }
+            if let Some(bytes) = server.max_body_bytes {
+                // A bad value must not disable the body bound or permit unbounded buffering.
+                config.server.max_body_bytes = bytes.clamp(
+                    crate::server::http::MIN_BODY_LIMIT_BYTES as i64,
+                    crate::server::http::MAX_BODY_CEILING_BYTES as i64,
+                ) as usize;
             }
             if let Some(seconds) = server.idle_timeout_seconds {
                 config.server.idle_timeout_seconds = seconds;
@@ -1461,6 +1474,54 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.port, 9000);
         assert_eq!(config.upstream, Upstream::Api);
+    }
+
+    #[test]
+    fn the_body_limit_defaults_to_32_mib() {
+        let config = Config::parse("", Path::new("config.toml")).unwrap();
+        assert_eq!(config.server.max_body_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_body_limit_is_configurable_and_clamped() {
+        let inside = Config::parse(
+            "[server]\nmax_body_bytes = 67108864\n",
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        assert_eq!(inside.server.max_body_bytes, 64 * 1024 * 1024);
+
+        for value in ["0", "-1"] {
+            let below = Config::parse(
+                &format!("[server]\nmax_body_bytes = {value}\n"),
+                Path::new("config.toml"),
+            )
+            .unwrap();
+            assert_eq!(
+                below.server.max_body_bytes,
+                crate::server::http::MIN_BODY_LIMIT_BYTES
+            );
+        }
+
+        let above = Config::parse(
+            "[server]\nmax_body_bytes = 268435457\n",
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            above.server.max_body_bytes,
+            crate::server::http::MAX_BODY_CEILING_BYTES
+        );
+    }
+
+    #[test]
+    fn the_template_uses_the_default_body_limit_when_the_key_is_absent() {
+        let template_without_key = DEFAULT_CONFIG_TOML.replace("max_body_bytes = 33554432\n", "");
+        let config = Config::parse(&template_without_key, Path::new("config.toml")).unwrap();
+        assert_eq!(
+            config.server.max_body_bytes,
+            crate::server::http::DEFAULT_MAX_BODY_BYTES
+        );
     }
 
     #[test]

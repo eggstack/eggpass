@@ -31,6 +31,31 @@ log request bodies.
 
 The Responses API is also available at `POST /v1/responses`.
 
+## Content shapes
+
+What is forwarded, translated, or refused depends on the provider and the
+endpoint, not only on the model.
+
+- **x.ai, both endpoints.** The request body is forwarded byte for byte, so
+  text, `image_url`, `input_audio`, and file parts reach x.ai exactly as the
+  client sent them. The answer is returned unchanged.
+- **ChatGPT, `/v1/responses`.** The request and the answer are forwarded
+  verbatim. `input_image` parts and the `image_generation` tool already work
+  on this path.
+- **ChatGPT, `/v1/chat/completions`.** The request is translated. Text,
+  `image_url` (including `detail`), `input_audio`, and file parts are mapped
+  to their Responses equivalents. A refusal and any other non-text content
+  part is returned in `content` as a part array; a text-only answer keeps the
+  string form. A part, request field, or tool with no faithful equivalent is
+  refused with a named `400` before the upstream is called — it is never
+  dropped. Image or audio generation is not expressible over Chat Completions
+  and must use `/v1/responses`.
+
+Native media endpoints, such as image generation, are declared per provider in
+the provider spec. A path is routed only after a live probe confirms the
+subscription serves it; until then it answers `404`, the same as any other
+unknown endpoint.
+
 ## Sign-in and credentials
 
 Sign-in uses OAuth Authorization Code with PKCE. x.ai supports a device-code

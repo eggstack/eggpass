@@ -306,22 +306,15 @@ pub struct EnrollmentStore {
     path: PathBuf,
     ca_pem: Vec<u8>,
     server_name: String,
-    changed: Arc<Notify>,
     lock: Mutex<()>,
 }
 
 impl EnrollmentStore {
-    pub(crate) fn new(
-        path: PathBuf,
-        ca_pem: Vec<u8>,
-        server_name: String,
-        changed: Arc<Notify>,
-    ) -> Self {
+    pub(crate) fn new(path: PathBuf, ca_pem: Vec<u8>, server_name: String) -> Self {
         Self {
             path,
             ca_pem,
             server_name,
-            changed,
             lock: Mutex::new(()),
         }
     }
@@ -390,7 +383,11 @@ impl EnrollmentStore {
         state.client_cert_pem = Some(std::mem::take(&mut bundle.client_cert_pem));
         state.client_key_pem = Some(std::mem::take(&mut bundle.client_key_pem));
         write_secrets(&self.path, &state)?;
-        self.changed.notify_one();
+        // The supervisor is deliberately not woken here. Switching from the
+        // bootstrap tunnel to the mTLS one tears that tunnel down, and this
+        // callback's response still has to travel back through it. The
+        // supervisor observes the new pair on its next status tick instead,
+        // after the response has been written.
         Ok(())
     }
 }
@@ -528,7 +525,6 @@ pub fn start_runtime(
         secret_path.clone(),
         ca_pem,
         server_name.clone(),
-        Arc::clone(&changed),
     ));
     write_status(status_path.as_path(), settings, "starting");
     let stop = Arc::new(AtomicBool::new(false));
@@ -641,6 +637,13 @@ async fn supervise_client(
                     break;
                 }
                 _ = tick.tick() => {
+                    // Enrollment completion is observed here, never from the
+                    // callback handler: that response is travelling back
+                    // through the tunnel this branch replaces.
+                    if !has_pair && enrollment_pair_present(&secret_path) {
+                        client.shutdown();
+                        break;
+                    }
                     if pending
                         && state
                             .expires_at
@@ -942,6 +945,16 @@ fn valid_dns_host(host: &str) -> bool {
         })
 }
 
+/// Whether the private state has moved on from a pending enrollment to a
+/// complete mTLS pair. The callback response is still in flight while the
+/// handler runs, so the supervisor polls for this rather than being woken.
+fn enrollment_pair_present(path: &Path) -> bool {
+    load_secrets(path)
+        .ok()
+        .flatten()
+        .is_some_and(|state| state.client_cert_pem.is_some() && state.client_key_pem.is_some())
+}
+
 fn validate_server_name(server_name: &str) -> Result<(), String> {
     if server_name.is_empty()
         || server_name.len() > 253
@@ -1085,16 +1098,52 @@ mod tests {
         };
         write_secrets(&path, &state).expect("write state");
         state.enroll_token = None;
-        let store = EnrollmentStore::new(
-            path.clone(),
-            ca,
-            "eggpool.lan".to_string(),
-            Arc::new(Notify::new()),
-        );
+        let store = EnrollmentStore::new(path.clone(), ca, "eggpool.lan".to_string());
         assert!(store.authorizes("one-use"));
         let invalid = br#"{"client_cert_pem":"bad","client_key_pem":"bad"}"#;
         assert!(store.complete("one-use", invalid).is_err());
         assert!(store.authorizes("one-use"));
+    }
+
+    #[test]
+    fn the_mtls_switch_waits_for_a_complete_pair_on_disk() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("eggpool.json");
+        assert!(
+            !enrollment_pair_present(&path),
+            "missing state must not switch the tunnel"
+        );
+
+        let mut state = EggpoolSecrets {
+            version: 1,
+            agent: "test-agent".to_string(),
+            api_key_id: 1,
+            ca_sha256: ca_digest(&pem(&[1, 2, 3, 4])).expect("pin"),
+            enroll_token: Some("one-use".to_string()),
+            expires_at: Some(crate::timeutil::now_unix() + 600),
+            client_cert_pem: None,
+            client_key_pem: None,
+        };
+        write_secrets(&path, &state).expect("write pending state");
+        assert!(
+            !enrollment_pair_present(&path),
+            "a pending enrollment stays on the bootstrap tunnel"
+        );
+
+        state.client_cert_pem = Some(String::from_utf8(pem(&[1, 2, 3, 4])).expect("pem text"));
+        write_secrets(&path, &state).expect("write half pair");
+        assert!(
+            !enrollment_pair_present(&path),
+            "a half-written pair must not switch the tunnel"
+        );
+
+        state.client_key_pem =
+            Some("-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n".to_string());
+        write_secrets(&path, &state).expect("write complete pair");
+        assert!(
+            enrollment_pair_present(&path),
+            "the completed pair switches the tunnel"
+        );
     }
 
     #[test]

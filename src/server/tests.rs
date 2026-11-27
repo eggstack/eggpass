@@ -21,7 +21,9 @@ use crate::auth::refresh::TokenManager;
 use crate::auth::store::StoredAuth;
 use crate::config::Routing;
 use crate::paths::Paths;
-use crate::provider::{CatalogueKind, NativePaths, ProviderId, ProviderSpec, RequestPolicy};
+use crate::provider::{
+    CatalogueKind, MediaPath, NativePaths, ProviderId, ProviderSpec, RequestPolicy,
+};
 use crate::server::{ProviderHandle, Server, ServerContext};
 use crate::timeutil;
 use crate::upstream::UpstreamClient;
@@ -266,6 +268,7 @@ fn stub_spec(stub: &Stub) -> ProviderSpec {
         trusted_device_hosts: &["auth.x.ai"],
         catalogue: CatalogueKind::DataArray,
         native_paths: NativePaths::Both,
+        media_paths: &[],
     }
 }
 
@@ -303,6 +306,7 @@ fn chatgpt_stub_spec(stub: &Stub) -> ProviderSpec {
         trusted_device_hosts: &["auth.openai.com"],
         catalogue: CatalogueKind::SlugArray,
         native_paths: NativePaths::ResponsesOnly,
+        media_paths: &[],
     }
 }
 
@@ -1721,4 +1725,318 @@ fn a_native_responses_request_is_forwarded_untouched() {
         answer["output"][0]["content"][0]["text"], "responses works",
         "{answer}"
     );
+}
+
+fn media_stub_spec(stub: &Stub) -> ProviderSpec {
+    let mut spec = stub_spec(stub);
+    spec.media_paths = &[MediaPath {
+        method: "POST",
+        path: "/v1/images/generations",
+        response_types: &["application/json"],
+    }];
+    spec
+}
+
+#[test]
+fn media_route_forwards_the_exact_body_and_preserves_content_type() {
+    let upstream_body = r#"{"created":1,"data":[{"url":"https://example.invalid/synthetic.png"}]}"#;
+    let expected_response_body = upstream_body.to_string();
+    let stub = Stub::start(move |_| Reply::json(200, upstream_body));
+    let harness = harness_with_spec(&stub, "test-key", "test-token", media_stub_spec(&stub));
+    let request_body = br#"{ "model" : "grok-4.7", "prompt" : "synthetic test payload", "n" : 1 }"#;
+
+    let response = agent()
+        .post(harness.url("/images/generations?quality=low"))
+        .header("Authorization", "Bearer test-key")
+        .header("Content-Type", "application/json")
+        .send(request_body.as_slice())
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    let body = response
+        .into_body()
+        .read_to_string()
+        .expect("response body");
+    assert_eq!(body, expected_response_body);
+
+    let requests = stub.requests();
+    let forwarded = requests.first().expect("the upstream saw the request");
+    assert_eq!(forwarded.method, "POST");
+    assert_eq!(forwarded.path, "/v1/images/generations?quality=low");
+    assert_eq!(forwarded.body.as_bytes(), request_body);
+}
+
+#[test]
+fn media_path_not_enabled_by_the_spec_keeps_the_unknown_endpoint_404() {
+    let stub = Stub::start(|_| Reply::json(200, "{}"));
+    let harness = harness(&stub, "test-key", "test-token");
+    let response = agent()
+        .post(harness.url("/v1/images/generations"))
+        .header("Authorization", "Bearer test-key")
+        .header("Content-Type", "application/json")
+        .send(r#"{"model":"grok-4.7"}"#)
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 404);
+    let body = response.into_body().read_to_string().expect("error body");
+    assert!(body.contains("unknown endpoint"));
+    assert!(stub.requests().is_empty());
+}
+
+#[test]
+fn media_unrelated_unknown_paths_keep_the_404_without_a_model() {
+    let stub = Stub::start(|_| Reply::json(200, "{}"));
+    let harness = harness_with_spec(&stub, "test-key", "test-token", media_stub_spec(&stub));
+
+    let post = agent()
+        .post(harness.url("/v1/does-not-exist"))
+        .header("Authorization", "Bearer test-key")
+        .send("")
+        .expect("the proxy answers");
+    assert_eq!(post.status().as_u16(), 404);
+
+    let get = agent()
+        .get(harness.url("/v1/does-not-exist"))
+        .header("Authorization", "Bearer test-key")
+        .call()
+        .expect("the proxy answers");
+    assert_eq!(get.status().as_u16(), 404);
+    assert!(stub.requests().is_empty());
+}
+
+#[test]
+fn media_declared_path_without_a_model_answers_missing_model() {
+    let stub = Stub::start(|_| Reply::json(200, "{}"));
+    let harness = harness_with_spec(&stub, "test-key", "test-token", media_stub_spec(&stub));
+    let response = agent()
+        .post(harness.url("/v1/images/generations"))
+        .header("Authorization", "Bearer test-key")
+        .send("{}")
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 400);
+    let body = response.into_body().read_to_string().expect("error body");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json error");
+    assert_eq!(value["error"]["code"], "missing_model");
+    assert!(stub.requests().is_empty());
+}
+
+#[test]
+fn media_path_with_the_wrong_method_answers_405_and_allow() {
+    let stub = Stub::start(|_| Reply::json(200, "{}"));
+    let harness = harness_with_spec(&stub, "test-key", "test-token", media_stub_spec(&stub));
+    let body = r#"{"model":"grok-4.7"}"#;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .expect("the proxy accepts a connection");
+    write!(
+        stream,
+        "GET /v1/images/generations HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer test-key\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        harness.port,
+        body.len(),
+        body,
+    )
+    .expect("the GET body is sent");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("the response is read");
+
+    assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+    assert!(response.contains("\r\nAllow: POST\r\n"), "{response}");
+    assert!(stub.requests().is_empty());
+}
+
+#[test]
+fn media_response_with_an_unexpected_content_type_answers_502() {
+    let stub = Stub::start(|_| Reply::Body {
+        status: 200,
+        content_type: "image/png",
+        body: "synthetic image bytes".to_string(),
+    });
+    let harness = harness_with_spec(&stub, "test-key", "test-token", media_stub_spec(&stub));
+    let response = agent()
+        .post(harness.url("/v1/images/generations"))
+        .header("Authorization", "Bearer test-key")
+        .header("Content-Type", "application/json")
+        .send(r#"{"model":"grok-4.7","prompt":"synthetic"}"#)
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 502);
+    let body = response.into_body().read_to_string().expect("error body");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json error");
+    assert_eq!(value["error"]["code"], "unexpected_media_content_type");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("image/png")
+    );
+}
+
+#[test]
+fn a_chatgpt_chat_request_carries_the_image_part_upstream() {
+    // The translated path must deliver what the catalogue advertises: an
+    // image-only message becomes an `input_image` part, with the URL and
+    // `detail` the client sent, and the message item survives translation.
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/responses") {
+            Reply::json(
+                200,
+                r#"{"id":"resp_image","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"seen"}]}]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness_with_spec(
+        &stub,
+        "secret-key",
+        "chatgpt-token",
+        chatgpt_stub_spec(&stub),
+    );
+
+    let request = json!({
+        "model": "gpt-5.6-sol",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.invalid/fixture.png",
+                    "detail": "high"
+                }
+            }]
+        }]
+    });
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(request.to_string())
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_json_body(response);
+    assert_eq!(body["choices"][0]["message"]["content"], "seen", "{body}");
+
+    let requests = stub.requests();
+    let forwarded = requests.first().expect("the upstream saw the request");
+    let sent: serde_json::Value = serde_json::from_str(&forwarded.body).expect("forwarded json");
+
+    // The Chat shape is gone; the image is a Responses part.
+    assert!(sent.get("messages").is_none(), "{sent}");
+    assert_eq!(
+        sent["input"][0]["content"][0]["type"], "input_image",
+        "{sent}"
+    );
+    assert_eq!(
+        sent["input"][0]["content"][0]["image_url"], "https://example.invalid/fixture.png",
+        "{sent}"
+    );
+    assert_eq!(sent["input"][0]["content"][0]["detail"], "high", "{sent}");
+}
+
+#[test]
+fn an_xai_chat_request_is_forwarded_byte_for_byte_with_media_parts() {
+    // x.ai speaks both shapes, so its body must reach the upstream exactly as
+    // the client sent it — including an image part Chat Completions defines.
+    let stub = Stub::start(|_| {
+        Reply::json(
+            200,
+            r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+        )
+    });
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    let raw = json!({
+        "model": "grok-4.7",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.invalid/fixture.png",
+                    "detail": "high"
+                }
+            }]
+        }]
+    })
+    .to_string();
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(raw.clone())
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let requests = stub.requests();
+    let forwarded = requests.first().expect("the upstream saw the request");
+    assert_eq!(forwarded.body, raw, "the body was rewritten");
+}
+
+#[test]
+fn a_refusal_reaches_a_chat_client_as_a_content_part() {
+    // The non-streaming path returns a refusal as a part array. A refusal-only
+    // answer must not be an empty string.
+    let stub = Stub::start(|request| {
+        if request.path.starts_with("/v1/responses") {
+            Reply::json(
+                200,
+                r#"{"id":"resp_refusal","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"The request is not supported."}]}]}"#,
+            )
+        } else {
+            Reply::json(404, "{}")
+        }
+    });
+    let harness = harness_with_spec(
+        &stub,
+        "secret-key",
+        "chatgpt-token",
+        chatgpt_stub_spec(&stub),
+    );
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(
+            json!({"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hello"}]})
+                .to_string(),
+        )
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_json_body(response);
+    assert_eq!(
+        body["choices"][0]["message"]["content"][0],
+        json!({"type": "refusal", "refusal": "The request is not supported."}),
+        "{body}"
+    );
+}
+
+#[test]
+fn a_request_without_a_model_answers_missing_model() {
+    let stub = Stub::start(|_| Reply::json(200, "{}"));
+    let harness = harness(&stub, "secret-key", "grok-token");
+
+    let response = agent()
+        .post(harness.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer secret-key")
+        .header("Content-Type", "application/json")
+        .send(r#"{"messages":[]}"#)
+        .expect("the proxy answers");
+
+    assert_eq!(response.status().as_u16(), 400);
+    let body = read_json_body(response);
+    assert_eq!(body["error"]["code"], "missing_model", "{body}");
+    assert!(stub.requests().is_empty(), "the body was forwarded anyway");
 }

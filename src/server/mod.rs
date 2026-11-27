@@ -11,7 +11,9 @@ pub mod guard;
 pub mod health;
 pub mod http;
 pub mod inference;
+pub mod media;
 pub mod models;
+pub mod parts;
 pub mod router;
 pub mod sse;
 pub mod translate;
@@ -191,7 +193,8 @@ impl Server {
                 limits.max_connections,
                 Duration::from_secs(limits.idle_timeout_seconds),
                 Duration::from_secs(limits.write_timeout_seconds),
-            );
+            )
+            .with_max_body_bytes(limits.max_body_bytes);
 
         Ok(Arc::new(Server {
             http: Arc::new(http),
@@ -476,11 +479,13 @@ fn handle_request(mut request: Request, context: &ServerContext) -> Response {
             "POST" => chat::complete(&request, context),
             _ => method_not_allowed(method, "POST"),
         },
-        router::Route::NotFound => openai_error(
-            404,
-            &format!("unknown endpoint `{path}`"),
-            "invalid_request_error",
-        ),
+        router::Route::NotFound => media::handle(&request, context).unwrap_or_else(|| {
+            openai_error(
+                404,
+                &format!("unknown endpoint `{path}`"),
+                "invalid_request_error",
+            )
+        }),
     }
 }
 
@@ -764,7 +769,6 @@ mod authorisation_tests {
             state_path,
             Vec::new(),
             "pool.example".to_string(),
-            Arc::new(tokio::sync::Notify::new()),
         ));
         let mut context = context_with_key("");
         context.eggpool_enrollment = Some(store);
